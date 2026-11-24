@@ -116,7 +116,8 @@ def merge(jobs, started, expected_total=0, wall_started=None):
                 'accounts': '', 'finished': True, 'status': 'complete',
                 'incomplete': 0, 'processes': 0, 'otp_hit': 0, 'otp_fetch': 0,
                 'device_ready': 0, 'device_in_use': 0,
-                'device_registering': 0, 'register_errors': 0}
+                'device_registering': 0, 'register_errors': 0,
+                'register_error_types': {}}
     done = total = 0
     cpu = 0.0
     proc_cpu = 0.0
@@ -127,6 +128,7 @@ def merge(jobs, started, expected_total=0, wall_started=None):
     ip_calls = fetched = blocked = 0
     otp_hit = otp_fetch = 0
     device_ready = device_in_use = device_registering = register_errors = 0
+    register_error_types = {}
     finished = True
     finished_flag = True
     for job in jobs:
@@ -154,6 +156,8 @@ def merge(jobs, started, expected_total=0, wall_started=None):
         device_in_use += payload.get('device_in_use') or 0
         device_registering += payload.get('device_registering') or 0
         register_errors += payload.get('register_errors') or 0
+        for key, value in (payload.get('register_error_types') or {}).items():
+            register_error_types[key] = register_error_types.get(key, 0) + value
         ip_calls += pool.get('api_calls') or 0
         fetched += pool.get('fetched') or 0
         blocked += pool.get('blocked') or 0
@@ -192,6 +196,7 @@ def merge(jobs, started, expected_total=0, wall_started=None):
         'device_in_use': device_in_use,
         'device_registering': device_registering,
         'register_errors': register_errors,
+        'register_error_types': register_error_types,
         'recent': recent[-12:],
         'accounts': os.path.join(DATA, 'accounts-placeholder'),
         'finished': finished and finished_flag,

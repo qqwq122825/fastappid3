@@ -1063,7 +1063,11 @@ async function tick(){
     ? ' · ' + Object.entries(rk).map(([k,v]) => `${k}:${v}`).join(' ') : '';
   $('mRetry').textContent = `重试 ${num(d.retried)}${rkText}`;
   $('mDevices').textContent = `设备池 已注册 ${num(d.device_ready)} / 使用中 ${num(d.device_in_use)} / 注册中 ${num(d.device_registering)}`;
-  $('mRegErr').textContent = `注册换代理 ${num(d.register_errors)}`;
+  const re = d.register_error_types || {};
+  const reTop = Object.entries(re).sort((a,b)=>b[1]-a[1]).slice(0,2)
+    .map(([k,v])=>`${k} ${num(v)}`).join(' · ');
+  $('mRegErr').textContent = `注册换代理 ${num(d.register_errors)}`
+    + (reTop ? ` · ${reTop}` : '');
   $('mEta').textContent = d.eta == null ? '--' : `剩 ${Math.round(d.eta)} 秒`;
 
   $('stateTag').innerHTML = d.finished

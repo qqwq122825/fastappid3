@@ -365,7 +365,8 @@ def main():
                'total': len(rows), 'expected': len(rows), 'started': started,
                'recent': collections.deque(maxlen=12),
                'device_ready': set(), 'device_in_use': set(),
-               'device_registering': set(), 'register_errors': 0}
+               'device_registering': set(), 'register_errors': 0,
+               'register_error_types': {}}
     stop = threading.Event()
 
     SAMPLE_CAP = 4000          # 历史样本上限，超出只保留最近的一批
@@ -387,6 +388,7 @@ def main():
                 device_in_use = len(results['device_in_use'])
                 device_registering = len(results['device_registering'])
                 register_errors = results['register_errors']
+                register_error_types = dict(results['register_error_types'])
                 samples = results['samples']
                 if len(samples) > SAMPLE_CAP:
                     del samples[:-SAMPLE_CAP]
@@ -426,6 +428,7 @@ def main():
                 'device_in_use': device_in_use,
                 'device_registering': device_registering,
                 'register_errors': register_errors,
+                'register_error_types': register_error_types,
                 'seg': {k: (round(sorted(v)[len(v)//2],1) if v else None)
                         for k, v in (results.get('seg') or {}).items()},
                 'by_status': by_status,
@@ -506,12 +509,17 @@ def main():
         _info_cpu = _register_cpu = 0.0
         _w0 = time.perf_counter()
         info = None
+        register_failures = 0
         while not stop.is_set():
             reg_proxy, reg_exp = acquire_anisette_route()
             if args.anisette_proxy and not reg_proxy:
                 with lock:
                     results['register_errors'] += 1
-                time.sleep(0.2)
+                    kinds = results['register_error_types']
+                    kinds['no_proxy'] = kinds.get('no_proxy', 0) + 1
+                register_failures += 1
+                stop.wait(min(8.0, 0.25 * (2 ** min(register_failures, 5)))
+                          + random.uniform(0.0, 0.25))
                 continue
             try:
                 _b0 = time.thread_time()
@@ -534,13 +542,22 @@ def main():
                     results['device_ready'].add(slot)
                     results['device_in_use'].add(slot)
                 break
-            except Exception:                                  # noqa: BLE001
+            except Exception as exc:                           # noqa: BLE001
                 release_anisette_route(reg_proxy, reg_exp, False)
+                stage = str(getattr(exc, 'stage', '') or type(exc).__name__)
+                http = int(getattr(exc, 'http', 0) or 0)
+                reason = f'{stage}:HTTP{http}' if http else stage
                 with lock:
                     results['register_errors'] += 1
+                    kinds = results['register_error_types']
+                    kinds[reason] = kinds.get(reason, 0) + 1
                 if not args.anisette_proxy:
                     raise
-                time.sleep(0.05)
+                # 不设全局并发上限；每个线程独立换代理重试。但失败后必须退避，
+                # 否则数百线程会同时重建 TLS/WebSocket，吃满 CPU 并把 503 放大。
+                register_failures += 1
+                stop.wait(min(8.0, 0.25 * (2 ** min(register_failures, 5)))
+                          + random.uniform(0.0, 0.25))
         if info is None:
             return
         boot['info'] = _info_cpu
@@ -857,6 +874,7 @@ def main():
         final['device_in_use'] = len(results['device_in_use'])
         final['device_registering'] = len(results['device_registering'])
         final['register_errors'] = results['register_errors']
+        final['register_error_types'] = dict(results['register_error_types'])
         with open(args.live, 'w', encoding='utf-8') as handle:
             json.dump(final, handle, ensure_ascii=False)
     except OSError:
