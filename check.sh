@@ -33,22 +33,22 @@ if [ -z "$PY" ] || [ ! -x "$PY" ]; then
            /www/server/python_manager/versions/*/bin/python3* \
            "$(which python3)"; do
     [ -x "$c" ] || continue
-    if $c -c "import requests,gmpy2,websockets,socks" 2>/dev/null; then
+    if $c -c "import requests,gmpy2,websockets,socks,python_socks" 2>/dev/null; then
       PY="$c"; echo "  → 找到依赖齐全的解释器: $PY"; break
     fi
   done
 fi
 
 if [ -z "$PY" ]; then
-  echo "  ❌ 找不到装了 requests+gmpy2+websockets+socks 的解释器"
-  echo "     装一下: python3 -m pip install requests PySocks gmpy2==2.3.2 websockets portalocker"
+  echo "  ❌ 找不到装了 requests+gmpy2+websockets+python-socks+socks 的解释器"
+  echo "     装一下: python3 -m pip install -r requirements.txt"
   exit 1
 fi
 echo
 
 # ---------- 2. 依赖 ----------
 echo "【2】依赖检查（用 $PY）"
-for m in requests socks gmpy2 websockets portalocker; do
+for m in requests socks gmpy2 websockets python_socks portalocker; do
   if $PY -c "import $m" 2>/dev/null; then
     V=$($PY -c "import $m;print(getattr($m,'__version__','?'))" 2>/dev/null)
     printf "  ✅ %-14s %s\n" "$m" "$V"
@@ -149,6 +149,7 @@ MISSING=""
 $PY -c "import requests" 2>/dev/null || MISSING="$MISSING requests"
 $PY -c "import gmpy2" 2>/dev/null    || MISSING="$MISSING gmpy2"
 $PY -c "import websockets" 2>/dev/null || MISSING="$MISSING websockets"
+$PY -c "import python_socks" 2>/dev/null || MISSING="$MISSING python-socks"
 $PY -c "import socks" 2>/dev/null    || MISSING="$MISSING PySocks"
 
 if [ -n "$MISSING" ]; then

@@ -6,7 +6,10 @@ PySocks>=1.7.1
 gmpy2==2.3.2
 # fastcheck 协议层依赖（若直接复用 /Users/xxx/Documents/并发/fastcheck）
 portalocker>=2.7
-websockets>=12           # 12.x 用 ssl_context，15.x 用 ssl；代码已做兼容分支
+# 设备注册的 WebSocket 也必须走 SOCKS 代理。只安装 websockets
+# 本体会在 connect(proxy=...) 时反复 ImportError，所以需要 python-socks。
+websockets>=15,<18
+python-socks>=2.7,<3
 
 # 测试（可选）：pip install pytest 后可跑 pytest tests/
 # pytest>=8.0
