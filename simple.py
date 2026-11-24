@@ -454,22 +454,34 @@ def main():
                     results['ip_fail'] += 1
                 return
         # ---- 2) 设备（线程独占一个槽位）----
+        boot = {}
+        _b0 = time.thread_time()
         pool = DevicePool(args.device_root, 'https://new.ani.sidestore.io',
                           max_devices=args.slot_base + args.threads)
+        boot['pool_ctor'] = (time.thread_time() - _b0) * 1000
+        _b0 = time.thread_time()
         info = pool.info(max(args.timeout, 20), provider_direct=True)
+        boot['info'] = (time.thread_time() - _b0) * 1000
         # 注册前就把型号定下来，随 provisioning 一起提交给 anisette；
         # 之后这台设备的所有请求都必须报同一个型号。
+        _b0 = time.thread_time()
         profile = device_profile(pool, slot) if not args.no_fix_os else None
+        boot['profile'] = (time.thread_time() - _b0) * 1000
         if profile:
             info = dict(info, client_info=profile['client_info'],
                         user_agent=profile['user_agent'])
+        _b0 = time.thread_time()
+        _w0 = time.perf_counter()
         if not args.no_register:
             with register_gate:
                 pool.fetch_headers(slot, info, max(args.timeout, 40), registered=False,
                                    provider_direct=True)
+        boot['register_cpu'] = (time.thread_time() - _b0) * 1000
+        boot['register_wall'] = (time.perf_counter() - _w0) * 1000
         # ---- 2.5) 公共头客户端：建一次，之后只发 POST ----
         # anisette 走代理时用一条固定出口：Client 的 proxy 构造时定死，
         # 跟着账号换 IP 会导致连不上（连接复用在旧出口上）。
+        _b0 = time.thread_time()
         anisette_route = None
         if args.anisette_proxy:
             anisette_route = fetch_usable_ip(args.api, args.precheck_timeout)
@@ -484,6 +496,7 @@ def main():
                 proxy=anisette_route,
                 provider_direct=anisette_route is None)
             cached_client.deadline = time.monotonic() + max(args.timeout, 20)
+        boot['client_ctor'] = (time.thread_time() - _b0) * 1000
 
         def fetch_otp():
             """两条路径都必须过同一个并发闸门，否则 anisette-workers 形同虚设。
@@ -513,6 +526,10 @@ def main():
         # ---- 3) 循环验证：每 per_ip 条换 IP，每 otp_reuse 条换公共头 ----
         cached_otp = None
         otp_used = 0
+        with lock:
+            bag = results.setdefault('boot_segments', {})
+            for k, v in boot.items():
+                bag.setdefault(k, []).append(v)
         cpu_start = time.thread_time()
         mine = 0
         while not stop.is_set():
@@ -770,6 +787,16 @@ def main():
     print(f'每线程 CPU 中位 {statistics.median(results["per_thread_cpu"]):.0f} ms，'
           f'每线程条数 中位 {statistics.median(results["per_thread_count"]):.0f}')
     print(f'IP 获取失败线程 {results["ip_fail"]}')
+    boot = results.get('boot_segments') or {}
+    if boot:
+        print('线程启动分段（CPU 毫秒，中位数）:')
+        for k in ('pool_ctor', 'info', 'profile', 'client_ctor',
+                  'register_cpu', 'register_wall'):
+            vals = sorted(boot.get(k) or [])
+            if vals:
+                label = 'register_wall' if k == 'register_wall' else k
+                print(f'    {label:<16} p50={statistics.median(vals):7.2f}  '
+                      f'max={vals[-1]:8.2f}  n={len(vals)}')
     hit, fetch = results.get('otp_hit', 0), results.get('otp_fetch', 0)
     if hit or fetch:
         print(f'公共头: 复用命中 {hit} 条 · 真实拉取 {fetch} 次 · '
