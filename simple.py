@@ -285,7 +285,10 @@ def main():
     ap.add_argument('--no-client-cache', action='store_true',
                     help='关闭 Client 复用（每条都新建，用于对照）')
     ap.add_argument('--anisette-proxy', action='store_true',
-                    help='公共头也走该线程的代理 IP（分散源 IP，避免同 IP 被限流）')
+                    help='公共头也走代理（机房 IP 直连 sidestore 被墙时必须开）')
+    ap.add_argument('--anisette-timeout', type=float, default=30.0,
+                    dest='anisette_timeout',
+                    help='anisette 单次请求超时；连不上时会快速失败')
     ap.add_argument('--per-ip', type=int, default=9, help='一条 IP 跑多少条账号')
     ap.add_argument("--otp-reuse", type=int, default=15, dest="otp_reuse",
                     help='一个公共头能验多少条账号（实测 15-20 安全，0=每条都换）')
@@ -465,13 +468,21 @@ def main():
                 pool.fetch_headers(slot, info, max(args.timeout, 40), registered=False,
                                    provider_direct=True)
         # ---- 2.5) 公共头客户端：建一次，之后只发 POST ----
+        # anisette 走代理时用一条固定出口：Client 的 proxy 构造时定死，
+        # 跟着账号换 IP 会导致连不上（连接复用在旧出口上）。
+        anisette_route = None
+        if args.anisette_proxy:
+            anisette_route = fetch_usable_ip(args.api, args.precheck_timeout)
         cached_client = None
-        if not args.no_client_cache and not args.anisette_proxy:
+        if not args.no_client_cache:
             from fastcheck.protocols.anisette_v3 import Client
-            cached_client = Client('https://new.ani.sidestore.io',
-                                   timeout=max(args.timeout, 20),
-                                   store=pool.store(slot, registered=True),
-                                   client_info=dict(info), provider_direct=True)
+            cached_client = Client(
+                'https://new.ani.sidestore.io',
+                timeout=max(args.timeout, 20),
+                store=pool.store(slot, registered=True),
+                client_info=dict(info),
+                proxy=anisette_route,
+                provider_direct=anisette_route is None)
             cached_client.deadline = time.monotonic() + max(args.timeout, 20)
 
         def fetch_otp():
@@ -483,7 +494,8 @@ def main():
             """
             if cached_client is not None:
                 with anisette_gate:
-                    cached_client.deadline = time.monotonic() + max(args.timeout, 20)
+                    # anisette 超时单独控制：默认 30 秒，连不上时快速失败
+                    cached_client.deadline = time.monotonic() + max(args.anisette_timeout, 10)
                     raw = cached_client.headers()
             else:
                 with anisette_gate:

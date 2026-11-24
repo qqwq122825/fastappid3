@@ -204,7 +204,7 @@ def _live_state_uncached():
 # ---------------------------------------------------------------- 任务控制
 def start_job(accounts, threads, limit, processes=1, verify_web=False,
               per_ip=6, ip_ttl=50.0, timeout=10.0, anisette_workers=0,
-              no_register=False, retry=2, item_timeout=20.0):
+              no_register=False, retry=2, item_timeout=20.0, anisette_proxy=False):
     if is_running():
         return {'error': '已有任务在跑，先停止'}
     if STATE.get('take_pending') and STATE.get('pending_accounts'):
@@ -239,6 +239,8 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
             cmd += ['--anisette-workers', str(anisette_workers)]
         if no_register:
             cmd.append('--no-register')
+        if anisette_proxy:
+            cmd.append('--anisette-proxy')
     else:
         cmd = [PYTHON, os.path.join(HERE, 'simple.py'),
                '--accounts', accounts, '--threads', str(threads),
@@ -252,7 +254,13 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
             cmd += ['--anisette-workers', str(anisette_workers)]
         if no_register:
             cmd.append('--no-register')
-    log = open(STATE['log'], 'w', encoding='utf-8')
+        if anisette_proxy:
+            cmd.append('--anisette-proxy')
+    # 追加而不是覆盖：否则上一次的报错会被这次清空，排查时看不到
+    log = open(STATE['log'], 'a', encoding='utf-8')
+    log.write(f'\n===== 启动 {time.strftime("%F %T")} =====\n')
+    log.write(' '.join(cmd) + '\n')
+    log.flush()
     proc = subprocess.Popen(cmd, cwd=HERE, stdout=log, stderr=subprocess.STDOUT)
     STATE.update(proc=proc, accounts=accounts, threads=threads, limit=limit,
                  processes=processes, started=time.time(), pending_accounts=None)
@@ -536,7 +544,8 @@ class Handler(BaseHTTPRequestHandler):
                                    int(payload.get('anisette_workers') or 0),
                                    bool(payload.get('no_register')),
                                    int(payload.get('retry') if payload.get('retry') is not None else 2),
-                                   float(payload.get('item_timeout') or 20))
+                                   float(payload.get('item_timeout') or 20),
+                                   bool(payload.get('anisette_proxy')))
             return self._json(result)
         if self.path.startswith('/api/stop'):
             with _LOCK:
@@ -751,6 +760,7 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
       <div class="field">
         <label class="chk"><input type="checkbox" id="vweb"> GSA 判 au=repair 时用 web 复核</label>
         <label class="chk" style="margin-top:8px"><input type="checkbox" id="noreg"> 跳过设备注册检查</label>
+        <label class="chk" style="margin-top:8px"><input type="checkbox" id="asproxy"> 公共头走代理 <span style="color:var(--amber);font-size:11px">（机房 IP 直连 sidestore 超时时勾）</span></label>
       </div>
 
       <div style="display:flex;gap:10px">
@@ -948,7 +958,8 @@ async function start(){
     processes:+$('processes').value, verify_web:$('vweb').checked,
     per_ip:+$('perip').value, ip_ttl:+$('ttl').value,
     timeout:+$('timeout').value, no_register:$('noreg').checked,
-    retry:+$('retry').value, item_timeout:+$('itemto').value};
+    retry:+$('retry').value, item_timeout:+$('itemto').value,
+    anisette_proxy:$('asproxy').checked};
   $('start').disabled = true; $('hint').textContent='启动中…';
   $('hint').style.color = 'var(--dim)';
   const res = await post('/api/start', body);
