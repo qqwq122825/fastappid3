@@ -268,7 +268,16 @@ class Client:
         elif self.proxy is not None and not self.provider_direct:
             raise AnisetteError('websocket_proxy_unsupported')
         if parsed.scheme=='https':
-            options['ssl']=ssl.create_default_context()
+            # websockets 12 用 ssl_context，15+ 用 ssl；按实际签名选，避免
+            # TypeError: connect() got an unexpected keyword argument 'ssl'
+            _params = inspect.signature(connect).parameters
+            _ctx = ssl.create_default_context()
+            if 'ssl_context' in _params:
+                options['ssl_context'] = _ctx
+            elif 'ssl' in _params:
+                options['ssl'] = _ctx
+            else:
+                raise AnisetteError('websocket_ssl_unsupported')
         with phase(self.diagnostics,'anisette_ws_connect'):
             connection=connect(ws_url,**options)
         with connection as websocket:
