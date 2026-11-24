@@ -79,6 +79,7 @@ def spawn(args, jobs):
                '--out', job['out'],
                '--live', job['live'],
                '--timeout', str(args.timeout),
+               '--register-timeout', str(args.register_timeout),
                '--api', args.api]
         if args.anisette_proxy:
             cmd.append('--anisette-proxy')
@@ -225,6 +226,8 @@ def main():
     ap.add_argument('--anisette-proxy', action='store_true', dest='anisette_proxy',
                     help='公共头走代理（机房 IP 直连 sidestore 被墙时必须开）')
     ap.add_argument('--anisette-timeout', type=float, default=30.0, dest='anisette_timeout')
+    ap.add_argument('--register-timeout', type=float, default=20.0, dest='register_timeout',
+                    help='设备注册单次超时，超时后子线程换代理继续注册')
     ap.add_argument('--no-register', action='store_true', dest='no_register')
     ap.add_argument('--anisette-workers', type=int, default=0, dest='anisette_workers',
                     help='并发请求公共头上限，0=不限')

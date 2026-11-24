@@ -290,6 +290,9 @@ def main():
     ap.add_argument('--anisette-timeout', type=float, default=30.0,
                     dest='anisette_timeout',
                     help='anisette 单次请求超时；连不上时会快速失败')
+    ap.add_argument('--register-timeout', type=float, default=20.0,
+                    dest='register_timeout',
+                    help='设备注册单次超时；超时后换代理继续注册')
     ap.add_argument('--per-ip', type=int, default=9, help='一条 IP 跑多少条账号')
     ap.add_argument("--otp-reuse", type=int, default=15, dest="otp_reuse",
                     help='一个公共头能验多少条账号（实测 15-20 安全，0=每条都换）')
@@ -533,7 +536,7 @@ def main():
                     _b0 = time.thread_time()
                     with register_gate:
                         pool.fetch_headers(
-                            slot, info, max(args.timeout, 40), registered=False,
+                            slot, info, max(1.0, float(args.register_timeout)), registered=False,
                             proxy=reg_proxy, provider_direct=reg_proxy is None)
                     _register_cpu += (time.thread_time() - _b0) * 1000
                 release_anisette_route(reg_proxy, reg_exp, True)
