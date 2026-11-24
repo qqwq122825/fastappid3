@@ -556,6 +556,8 @@ def main():
                 retry_reason = ''
                 budget_hit = False
                 t_otp = time.perf_counter()
+                c0_otp = time.thread_time()
+                otp_cpu = chk_cpu = 0.0
                 try:
                     # 同一个 OTP 复用若干条：设备注册时那一次就能摊薄到 15 条上
                     if (cached_otp is None or args.otp_reuse <= 0
@@ -565,9 +567,11 @@ def main():
                     identity = cached_otp
                     otp_used += 1
                     otp_ms = (time.perf_counter() - t_otp) * 1000
+                    otp_cpu = (time.thread_time() - c0_otp) * 1000
                     # ---- 外层重试：只有链路/环境问题才换环境重来 ----
                     attempts = 0
                     t_chk = time.perf_counter()
+                    c0_chk = time.thread_time()
                     budget = max(1.0, float(args.item_timeout))
                     deadline = t0 + budget          # 从拿到这条账号开始算
                     budget_hit = False
@@ -610,13 +614,17 @@ def main():
                                 pass
                         served = max(0, served - 1)   # 重试不占 per_ip 配额
                     chk_ms = (time.perf_counter() - t_chk) * 1000
+                    chk_cpu = (time.thread_time() - c0_chk) * 1000
                 except Exception as exc:                            # noqa: BLE001
                     otp_ms = chk_ms = 0.0
+                    otp_cpu = chk_cpu = 0.0
                     result = {'status': 'error', 'kind': type(exc).__name__, 'stage': 'local'}
                 elapsed = (time.perf_counter() - t0) * 1000
                 thread_cpu = (time.thread_time() - cpu0) * 1000
+                c0_tail = time.thread_time()
                 raw_status = str(result.get('status') or 'error')
                 status = refine_status(result, result_bucket(result))
+                bucket_cpu = (time.thread_time() - c0_tail) * 1000
                 try:
                     got_http = int(result.get('http') or 0)
                 except (TypeError, ValueError):
@@ -678,7 +686,14 @@ def main():
                     results.setdefault('by_raw', {})
                     results['by_raw'][raw_status] = results['by_raw'].get(raw_status, 0) + 1
                     seg = results.setdefault('seg', {'ip': [], 'otp': [], 'chk': [],
-                                                     'gap': [], 'loop': []})
+                                                     'gap': [], 'loop': [],
+                                                     'chk_cpu': [], 'bucket_cpu': [],
+                                                     'otp_cpu': [], 'tail_cpu': []})
+                    seg['chk_cpu'].append(chk_cpu)
+                    seg['bucket_cpu'].append(bucket_cpu)
+                    seg['otp_cpu'].append(otp_cpu)
+                    seg['tail_cpu'].append(max(0.0, thread_cpu - chk_cpu
+                                               - bucket_cpu - otp_cpu))
                     seg['gap'].append(gap_ms)
                     seg['loop'].append((time.perf_counter() - t0) * 1000)
                     seg['ip'].append(ip_ms)
@@ -731,7 +746,17 @@ def main():
     results['started'] = started
     live_thread = threading.Thread(target=live_writer, name='live', daemon=True)
     live_thread.start()
-    threads = [threading.Thread(target=worker, args=(i,), name=f'w{i}', daemon=True)
+    def worker_guarded(tid):
+        try:
+            worker(tid)
+        except BaseException as exc:                               # noqa: BLE001
+            import traceback
+            with lock:
+                results.setdefault('worker_errors', []).append(
+                    f'{type(exc).__name__}: {exc}')
+            traceback.print_exc()
+
+    threads = [threading.Thread(target=worker_guarded, args=(i,), name=f'w{i}', daemon=True)
                for i in range(args.threads)]
     for thread in threads:
         thread.start()
@@ -828,8 +853,16 @@ def main():
                                  key=lambda kv: -kv[1]):
             print(f'    {key:<34} {value}')
     seg = results.get('seg') or {}
-    for name, label in (('ip', '取 IP'), ('gap', '轮间空档'), ('otp', '取公共头'),
-                        ('chk', '打 Apple')):
+    print('业务循环 CPU 拆分（毫秒，中位数）:')
+    for name, label in (('otp_cpu', '取公共头'), ('chk_cpu', '打 Apple(CPU)'),
+                        ('bucket_cpu', '分类'), ('tail_cpu', '记录/其他')):
+        vals = sorted(seg.get(name) or [])
+        if vals:
+            print(f'  {label:<14} p50={statistics.median(vals):7.2f}  '
+                  f'p90={vals[int(len(vals)*0.9)]:7.2f}  max={vals[-1]:8.2f}')
+    print()
+    for name, label in (('ip', '取 IP(墙钟)'), ('gap', '轮间空档'), ('otp', '取公共头(墙钟)'),
+                        ('chk', '打 Apple(墙钟)')):
         vals = sorted(seg.get(name) or [])
         if vals:
             n = len(vals)
