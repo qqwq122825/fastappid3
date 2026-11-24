@@ -812,6 +812,19 @@ def main():
     print(f'每线程 CPU 中位 {statistics.median(results["per_thread_cpu"]):.0f} ms，'
           f'每线程条数 中位 {statistics.median(results["per_thread_count"]):.0f}')
     print(f'IP 获取失败线程 {results["ip_fail"]}')
+    try:
+        from fastcheck.protocols.gsa_status import stage_cpu_summary
+        stages = stage_cpu_summary()
+    except Exception:
+        stages = {}
+    if stages:
+        print('gs.check 内部阶段（毫秒）:')
+        for k in ('srp_ctor', 'client_setup', 'init_dumps', 'http_init_total',
+                  'srp_challenge', 'done_dumps', 'http_complete_total'):
+            if k in stages:
+                n, med, mx = stages[k]
+                print(f'  {k:<22} p50={med:8.2f}  max={mx:8.2f}  n={n}')
+        print()
     boot = results.get('boot_segments') or {}
     if boot:
         print('线程启动分段（CPU 毫秒，中位数）:')
