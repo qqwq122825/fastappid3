@@ -908,8 +908,19 @@ $('saveApi').onclick = saveApiFn;
 loadApi();
 
 /* ---- 上传 ---- */
-$('drop').onclick = () => $('file').click();
-$('file').onchange = e => { if(e.target.files[0]) upload(e.target.files[0]); };
+const fileInput = $('file');
+$('drop').onclick = () => {
+  // 先清空，否则重复选同一个文件时浏览器不会再触发 change。
+  fileInput.value = '';
+  fileInput.click();
+};
+fileInput.addEventListener('change', async e => {
+  const file = e.target.files && e.target.files[0];
+  if(!file) return;
+  await upload(file);
+  // 上传完继续清空，下次仍可选同名文件。
+  e.target.value = '';
+});
 ['dragenter','dragover'].forEach(k=>$('drop').addEventListener(k,e=>{
   e.preventDefault(); $('drop').classList.add('on');}));
 ['dragleave','drop'].forEach(k=>$('drop').addEventListener(k,e=>{
@@ -918,14 +929,31 @@ $('drop').addEventListener('drop', e => {
   if(e.dataTransfer.files[0]) upload(e.dataTransfer.files[0]); });
 
 async function upload(file){
-  $('hint').textContent='上传中…';
-  const content = await file.text();
-  const res = await (await fetch('/api/upload',{method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({name:file.name, content})})).json();
-  if(res.error){ $('hint').textContent = res.error; return; }
-  $('hint').textContent = `已上传 ${res.name}：${num(res.total)} 条`;
-  renderAccounts(res);
+  const status = $('accInfo');
+  $('accName').textContent = file.name;
+  status.textContent = `正在读取 ${file.name}…`;
+  status.style.color = 'var(--dim)';
+  try{
+    const content = await file.text();
+    status.textContent = `正在上传 ${file.name}…`;
+    const response = await fetch('/api/upload',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name:file.name, content})});
+    const text = await response.text();
+    let res;
+    try{ res = JSON.parse(text); }
+    catch(e){ throw new Error(`服务返回 HTTP ${response.status}：${text.slice(0,120)}`); }
+    if(!response.ok || res.error) throw new Error(res.error || `HTTP ${response.status}`);
+    renderAccounts(res);
+    status.style.color = 'var(--green)';
+    $('hint').textContent = `已上传 ${res.name}：${num(res.total)} 条`;
+    $('hint').style.color = 'var(--green)';
+  }catch(e){
+    status.textContent = `上传失败：${e.message || e}`;
+    status.style.color = 'var(--red)';
+    $('hint').textContent = status.textContent;
+    $('hint').style.color = 'var(--red)';
+  }
 }
 
 function renderAccounts(a){
