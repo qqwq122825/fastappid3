@@ -276,7 +276,8 @@ def main():
     ap.add_argument('--retry', type=int, default=2, dest='retry',
                     help='外层重试：http=0 / 5xx / -22421 时换 IP 重来（0=不重试）')
     ap.add_argument('--no-register', action='store_true')
-    ap.add_argument('--register-workers', type=int, default=32, help='并发注册设备数上限')
+    ap.add_argument('--register-workers', type=int, default=0,
+                    help='并发注册设备数上限，0=每个工作线程可独立注册')
     ap.add_argument('--anisette-workers', type=int, default=0,
                     help='并发请求公共头的上限，0=不限（实测服务端扛得住）')
     ap.add_argument('--verify-web', action='store_true', dest='verify_web',
@@ -331,9 +332,10 @@ def main():
     if SRP_MATH_BACKEND != 'gmpy2':
         print('  警告：gmpy2 未生效，SRP 单次约 9.8ms 而不是 2.2ms')
 
-    register_gate = threading.Semaphore(max(4, int(args.register_workers)))
+    _rw = int(args.register_workers)
+    register_gate = threading.Semaphore(_rw if _rw > 0 else max(1, args.threads))
     _aw = int(args.anisette_workers)
-    anisette_gate = threading.Semaphore(_aw) if _aw > 0 else threading.Semaphore(10 ** 6)
+    anisette_gate = threading.Semaphore(_aw if _aw > 0 else max(1, args.threads))
     ip_pool = None
     if not args.no_ip_pool:
         from gsafast.ippool import IpPool
@@ -361,7 +363,9 @@ def main():
     results = {'done': 0, 'cpu': 0.0, 'by_status': {}, 'per_thread_cpu': [],
                'per_thread_count': [], 'samples': [], 'ip_fail': 0,
                'total': len(rows), 'expected': len(rows), 'started': started,
-               'recent': collections.deque(maxlen=12)}
+               'recent': collections.deque(maxlen=12),
+               'device_ready': set(), 'device_in_use': set(),
+               'device_registering': set(), 'register_errors': 0}
     stop = threading.Event()
 
     SAMPLE_CAP = 4000          # 历史样本上限，超出只保留最近的一批
@@ -379,6 +383,10 @@ def main():
                 by_status = dict(results['by_status'])
                 cpu = results['cpu']
                 recent = list(results['recent'])
+                device_ready = len(results['device_ready'])
+                device_in_use = len(results['device_in_use'])
+                device_registering = len(results['device_registering'])
+                register_errors = results['register_errors']
                 samples = results['samples']
                 if len(samples) > SAMPLE_CAP:
                     del samples[:-SAMPLE_CAP]
@@ -414,6 +422,10 @@ def main():
                 'writer_cpu': round(time.thread_time() - wcpu0, 2),
                 'main_cpu': round(time.thread_time() - main_cpu0, 2),
                 'otp_fetch': results.get('otp_fetch', 0),
+                'device_ready': device_ready,
+                'device_in_use': device_in_use,
+                'device_registering': device_registering,
+                'register_errors': register_errors,
                 'seg': {k: (round(sorted(v)[len(v)//2],1) if v else None)
                         for k, v in (results.get('seg') or {}).items()},
                 'by_status': by_status,
@@ -459,42 +471,94 @@ def main():
         pool = DevicePool(args.device_root, 'https://new.ani.sidestore.io',
                           max_devices=args.slot_base + args.threads)
         boot['pool_ctor'] = (time.thread_time() - _b0) * 1000
-        _b0 = time.thread_time()
-        info = pool.info(max(args.timeout, 20), provider_direct=True)
-        boot['info'] = (time.thread_time() - _b0) * 1000
         # 注册前就把型号定下来，随 provisioning 一起提交给 anisette；
         # 之后这台设备的所有请求都必须报同一个型号。
         _b0 = time.thread_time()
         profile = device_profile(pool, slot) if not args.no_fix_os else None
         boot['profile'] = (time.thread_time() - _b0) * 1000
-        if profile:
-            info = dict(info, client_info=profile['client_info'],
-                        user_agent=profile['user_agent'])
-        _b0 = time.thread_time()
+        state = pool.inspect(slot).get('state')
+        needs_registration = not args.no_register and state != 'ready'
+        if needs_registration:
+            with lock:
+                results['device_registering'].add(slot)
+
+        def acquire_anisette_route():
+            """注册/公共头都用线程自己的代理；池模式失败后可换下一条。"""
+            nonlocal proxy
+            if not args.anisette_proxy:
+                return None, 0.0
+            if ip_pool is not None:
+                return ip_pool.acquire(tid, wait=60.0)
+            if proxy is None:
+                proxy = (fetch_one_ip(args.api) if args.no_precheck
+                         else fetch_usable_ip(args.api, args.precheck_timeout))
+            return proxy, time.monotonic() + args.ip_ttl if proxy else 0.0
+
+        def release_anisette_route(route, expires, healthy):
+            nonlocal proxy
+            if ip_pool is not None:
+                ip_pool.release(tid, route, expires, healthy=healthy)
+            elif route and not healthy:
+                proxy = None
+
+        # 首次注册失败不能让整个 worker 退出。代理模式下丢弃坏出口，
+        # 换下一条继续，直到本线程的设备槽位注册成功或任务被停止。
+        _info_cpu = _register_cpu = 0.0
         _w0 = time.perf_counter()
-        if not args.no_register:
-            with register_gate:
-                pool.fetch_headers(slot, info, max(args.timeout, 40), registered=False,
-                                   provider_direct=True)
-        boot['register_cpu'] = (time.thread_time() - _b0) * 1000
+        info = None
+        while not stop.is_set():
+            reg_proxy, reg_exp = acquire_anisette_route()
+            if args.anisette_proxy and not reg_proxy:
+                with lock:
+                    results['register_errors'] += 1
+                time.sleep(0.2)
+                continue
+            try:
+                _b0 = time.thread_time()
+                info = pool.info(max(args.timeout, 20), proxy=reg_proxy,
+                                 provider_direct=reg_proxy is None)
+                _info_cpu += (time.thread_time() - _b0) * 1000
+                if profile:
+                    info = dict(info, client_info=profile['client_info'],
+                                user_agent=profile['user_agent'])
+                if needs_registration:
+                    _b0 = time.thread_time()
+                    with register_gate:
+                        pool.fetch_headers(
+                            slot, info, max(args.timeout, 40), registered=False,
+                            proxy=reg_proxy, provider_direct=reg_proxy is None)
+                    _register_cpu += (time.thread_time() - _b0) * 1000
+                release_anisette_route(reg_proxy, reg_exp, True)
+                with lock:
+                    results['device_registering'].discard(slot)
+                    results['device_ready'].add(slot)
+                    results['device_in_use'].add(slot)
+                break
+            except Exception:                                  # noqa: BLE001
+                release_anisette_route(reg_proxy, reg_exp, False)
+                with lock:
+                    results['register_errors'] += 1
+                if not args.anisette_proxy:
+                    raise
+                time.sleep(0.05)
+        if info is None:
+            return
+        boot['info'] = _info_cpu
+        boot['register_cpu'] = _register_cpu
         boot['register_wall'] = (time.perf_counter() - _w0) * 1000
         # ---- 2.5) 公共头客户端：建一次，之后只发 POST ----
-        # anisette 走代理时用一条固定出口：Client 的 proxy 构造时定死，
-        # 跟着账号换 IP 会导致连不上（连接复用在旧出口上）。
+        # 直连时复用 Client；代理模式每次刷新公共头都用当前线程正在使用的
+        # 代理，避免把一个 60 秒代理固定缓存到整个长任务。
         _b0 = time.thread_time()
-        anisette_route = None
-        if args.anisette_proxy:
-            anisette_route = fetch_usable_ip(args.api, args.precheck_timeout)
         cached_client = None
-        if not args.no_client_cache:
+        if not args.no_client_cache and not args.anisette_proxy:
             from fastcheck.protocols.anisette_v3 import Client
             cached_client = Client(
                 'https://new.ani.sidestore.io',
                 timeout=max(args.timeout, 20),
                 store=pool.store(slot, registered=True),
                 client_info=dict(info),
-                proxy=anisette_route,
-                provider_direct=anisette_route is None)
+                provider_direct=True)
             cached_client.deadline = time.monotonic() + max(args.timeout, 20)
         boot['client_ctor'] = (time.thread_time() - _b0) * 1000
 
@@ -533,7 +597,8 @@ def main():
         cpu_start = time.thread_time()
         mine = 0
         while not stop.is_set():
-            proxy, proxy_exp = None, 0.0
+            # 池模式每轮重新领一条；非池模式保留线程启动时取得的固定代理。
+            proxy_exp = 0.0
             t_ip = time.perf_counter()
             if ip_pool is not None:
                 proxy, proxy_exp = ip_pool.acquire(tid, wait=60.0)
@@ -755,6 +820,11 @@ def main():
                 results.setdefault('worker_errors', []).append(
                     f'{type(exc).__name__}: {exc}')
             traceback.print_exc()
+        finally:
+            slot = args.slot_base + tid + 1
+            with lock:
+                results['device_registering'].discard(slot)
+                results['device_in_use'].discard(slot)
 
     threads = [threading.Thread(target=worker_guarded, args=(i,), name=f'w{i}', daemon=True)
                for i in range(args.threads)]
@@ -783,6 +853,10 @@ def main():
         final['done'] = done_now
         final['incomplete'] = results['incomplete']
         final['elapsed'] = round(wall, 1)
+        final['device_ready'] = len(results['device_ready'])
+        final['device_in_use'] = len(results['device_in_use'])
+        final['device_registering'] = len(results['device_registering'])
+        final['register_errors'] = results['register_errors']
         with open(args.live, 'w', encoding='utf-8') as handle:
             json.dump(final, handle, ensure_ascii=False)
     except OSError:

@@ -114,7 +114,9 @@ def merge(jobs, started, expected_total=0, wall_started=None):
                 'cpu_per_account': 0, 'ip_fail': 0, 'ip_pool': {},
                 'by_status': {}, 'p50': None, 'p90': None, 'recent': [],
                 'accounts': '', 'finished': True, 'status': 'complete',
-                'incomplete': 0, 'processes': 0, 'otp_hit': 0, 'otp_fetch': 0}
+                'incomplete': 0, 'processes': 0, 'otp_hit': 0, 'otp_fetch': 0,
+                'device_ready': 0, 'device_in_use': 0,
+                'device_registering': 0, 'register_errors': 0}
     done = total = 0
     cpu = 0.0
     proc_cpu = 0.0
@@ -124,6 +126,7 @@ def merge(jobs, started, expected_total=0, wall_started=None):
     p50s, p90s = [], []
     ip_calls = fetched = blocked = 0
     otp_hit = otp_fetch = 0
+    device_ready = device_in_use = device_registering = register_errors = 0
     finished = True
     finished_flag = True
     for job in jobs:
@@ -147,6 +150,10 @@ def merge(jobs, started, expected_total=0, wall_started=None):
         pool = payload.get('ip_pool') or {}
         otp_hit += payload.get('otp_hit') or 0
         otp_fetch += payload.get('otp_fetch') or 0
+        device_ready += payload.get('device_ready') or 0
+        device_in_use += payload.get('device_in_use') or 0
+        device_registering += payload.get('device_registering') or 0
+        register_errors += payload.get('register_errors') or 0
         ip_calls += pool.get('api_calls') or 0
         fetched += pool.get('fetched') or 0
         blocked += pool.get('blocked') or 0
@@ -179,6 +186,10 @@ def merge(jobs, started, expected_total=0, wall_started=None):
         'proc_cpu_cores': round(proc_cpu / elapsed, 3) if elapsed else 0,
         'incomplete': incomplete,
         'otp_hit': otp_hit, 'otp_fetch': otp_fetch,
+        'device_ready': device_ready,
+        'device_in_use': device_in_use,
+        'device_registering': device_registering,
+        'register_errors': register_errors,
         'recent': recent[-12:],
         'accounts': os.path.join(DATA, 'accounts-placeholder'),
         'finished': finished and finished_flag,
