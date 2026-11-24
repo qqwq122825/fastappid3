@@ -170,7 +170,9 @@ def merge(jobs, started, expected_total=0, wall_started=None):
         'rate': round(done / elapsed, 2) if elapsed else 0,
         'per_hour': round(done / elapsed * 3600) if elapsed else 0,
         'eta': round((total - done) / (done / elapsed), 0) if done and elapsed else None,
-        'threads': (jobs[0].get('threads', 0) * len(jobs)) if jobs else 0,
+        # 页面会再显示“每进程线程 × 进程数”，这里必须保留每进程口径，
+        # 不能提前乘一次，否则 2×400 会被误显示成 800×2。
+        'threads': jobs[0].get('threads', 0) if jobs else 0,
         'backend': 'gmpy2',
         'cpu_seconds': round(cpu, 2),
         'cpu_cores': round(cpu / elapsed, 3) if elapsed else 0,
