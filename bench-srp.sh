@@ -5,18 +5,19 @@
 cd "$(dirname "$0")" || exit 1
 
 WPID=$(pgrep -f "web\.py.*--port" | head -1)
-if [ -n "$WPID" ]; then
-  PY=$(readlink -f /proc/$WPID/exe 2>/dev/null || true)
+PY=""
+# /proc/<pid>/exe resolves a venv symlink to the system binary and therefore
+# loses the venv site-packages. Prefer argv[0] and the project venv first.
+if [ -n "$WPID" ] && [ -r "/proc/$WPID/cmdline" ]; then
+  CMDPY=$(tr '\0' '\n' < "/proc/$WPID/cmdline" | head -1)
 fi
-if [ -z "$PY" ] || [ ! -x "$PY" ]; then
-  for c in .venv/bin/python \
-           /www/server/pyporject_evn/versions/*/bin/python3* \
-           /www/server/python_manager/versions/*/bin/python3* \
-           "$(command -v python3)"; do
-    [ -x "$c" ] || continue
-    if $c -c "import gmpy2" 2>/dev/null; then PY="$c"; break; fi
-  done
-fi
+for c in "$CMDPY" .venv/bin/python \
+         /www/server/pyporject_evn/versions/*/bin/python3* \
+         /www/server/python_manager/versions/*/bin/python3* \
+         "$(command -v python3)"; do
+  [ -x "$c" ] || continue
+  if "$c" -c "import gmpy2" 2>/dev/null; then PY="$c"; break; fi
+done
 [ -x "$PY" ] || { echo "找不到装了 gmpy2 的解释器"; exit 1; }
 
 echo "解释器: $PY"

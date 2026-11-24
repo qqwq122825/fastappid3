@@ -13,10 +13,14 @@ echo "【1】web.py 进程与解释器"
 WEBPID=$(pgrep -f "web\.py.*--port" | head -1)
 PY=""
 if [ -n "$WEBPID" ]; then
-  PY=$(readlink -f /proc/$WEBPID/exe 2>/dev/null || readlink /proc/$WEBPID/exe 2>/dev/null)
-  [ -z "$PY" ] && PY=$(ps -o comm= -p "$WEBPID" 2>/dev/null)
+  if [ -r "/proc/$WEBPID/cmdline" ]; then
+    CMDPY=$(tr '\0' '\n' < "/proc/$WEBPID/cmdline" | head -1)
+  fi
+  if [ -x "$CMDPY" ] && "$CMDPY" -c "import requests,gmpy2,websockets,socks,python_socks" 2>/dev/null; then
+    PY="$CMDPY"
+  fi
   echo "  ✅ web.py 在跑  pid=$WEBPID"
-  echo "  解释器: ${PY:-未知}"
+  echo "  解释器: ${PY:-${CMDPY:-未知}}"
   if [ -r /proc/$WEBPID/cmdline ]; then
     tr '\0' ' ' < /proc/$WEBPID/cmdline | sed 's/^/  命令: /'; echo
   else
@@ -31,7 +35,7 @@ if [ -z "$PY" ] || [ ! -x "$PY" ]; then
   for c in .venv/bin/python \
            /www/server/pyporject_evn/versions/*/bin/python3* \
            /www/server/python_manager/versions/*/bin/python3* \
-           "$(which python3)"; do
+           "$(command -v python3)"; do
     [ -x "$c" ] || continue
     if $c -c "import requests,gmpy2,websockets,socks,python_socks" 2>/dev/null; then
       PY="$c"; echo "  → 找到依赖齐全的解释器: $PY"; break
