@@ -118,7 +118,8 @@ def merge(jobs, started, expected_total=0, wall_started=None):
                 'incomplete': 0, 'processes': 0, 'otp_hit': 0, 'otp_fetch': 0,
                 'device_ready': 0, 'device_in_use': 0,
                 'device_registering': 0, 'register_errors': 0,
-                'register_error_types': {}}
+                'register_error_types': {}, 'retried': 0,
+                'by_retry': {}, 'budget_hit': 0}
     done = total = 0
     cpu = 0.0
     proc_cpu = 0.0
@@ -128,6 +129,8 @@ def merge(jobs, started, expected_total=0, wall_started=None):
     p50s, p90s = [], []
     ip_calls = fetched = blocked = 0
     otp_hit = otp_fetch = 0
+    retried = budget_hit = 0
+    by_retry = {}
     device_ready = device_in_use = device_registering = register_errors = 0
     register_error_types = {}
     finished = True
@@ -153,6 +156,10 @@ def merge(jobs, started, expected_total=0, wall_started=None):
         pool = payload.get('ip_pool') or {}
         otp_hit += payload.get('otp_hit') or 0
         otp_fetch += payload.get('otp_fetch') or 0
+        retried += payload.get('retried') or 0
+        budget_hit += payload.get('budget_hit') or 0
+        for key, value in (payload.get('by_retry') or {}).items():
+            by_retry[key] = by_retry.get(key, 0) + value
         device_ready += payload.get('device_ready') or 0
         device_in_use += payload.get('device_in_use') or 0
         device_registering += payload.get('device_registering') or 0
@@ -193,6 +200,7 @@ def merge(jobs, started, expected_total=0, wall_started=None):
         'proc_cpu_cores': round(proc_cpu / elapsed, 3) if elapsed else 0,
         'incomplete': incomplete,
         'otp_hit': otp_hit, 'otp_fetch': otp_fetch,
+        'retried': retried, 'by_retry': by_retry, 'budget_hit': budget_hit,
         'device_ready': device_ready,
         'device_in_use': device_in_use,
         'device_registering': device_registering,

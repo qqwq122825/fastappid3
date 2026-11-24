@@ -190,6 +190,44 @@ def retry_kind(result, bucket):
     return RETRY_NONE, ''
 
 
+def local_exception_result(exc):
+    """Turn a caught local exception into a safe, classifiable result.
+
+    Network exception messages can contain proxy credentials or request data, so
+    only exception class names are persisted.  Transport failures are explicit
+    timeouts and therefore enter the normal retry path; programming errors stay
+    undetermined but retain a useful class name instead of becoming a blank row.
+    """
+    pending, seen, names = [exc], set(), []
+    while pending and len(seen) < 12:
+        value = pending.pop()
+        if not isinstance(value, BaseException) or id(value) in seen:
+            continue
+        seen.add(id(value))
+        names.append(type(value).__name__)
+        pending.extend((value.__cause__, value.__context__))
+        pending.extend(arg for arg in value.args if isinstance(arg, BaseException))
+        reason = getattr(value, 'reason', None)
+        if isinstance(reason, BaseException):
+            pending.append(reason)
+    names = names or ['Exception']
+    joined = ' '.join(names).casefold()
+    transient = any(token in joined for token in (
+        'timeout', 'connection', 'proxy', 'socket', 'ssl', 'tls', 'urlerror',
+        'remote', 'eof', 'brokenpipe', 'network', 'websocket', 'http',
+    ))
+    result = {
+        'status': 'timeout' if transient else 'error',
+        'kind': names[0],
+        'stage': 'local',
+        'detail': ('本地链路异常: ' if transient else '本地程序异常: ')
+                  + ' <- '.join(names[:4]),
+    }
+    if transient:
+        result['http'] = 0
+    return result
+
+
 def classify_web(web):
     """web(idmsa) 的 detail 是中文，不能走英文关键词匹配，直接看 ec。"""
     try:
@@ -610,6 +648,7 @@ def main():
         # ---- 3) 循环验证：每 per_ip 条换 IP，每 otp_reuse 条换公共头 ----
         cached_otp = None
         otp_used = 0
+        local_retries = {}
         with lock:
             bag = results.setdefault('boot_segments', {})
             for k, v in boot.items():
@@ -635,6 +674,8 @@ def main():
                 if not my_tasks:
                     break
                 email, password = my_tasks.pop()
+                task_key = (email, password)
+                local_retry_count = local_retries.get(task_key, 0)
                 t0 = time.perf_counter()
                 cpu0 = time.thread_time()
                 attempts = 0
@@ -703,7 +744,33 @@ def main():
                 except Exception as exc:                            # noqa: BLE001
                     otp_ms = chk_ms = 0.0
                     otp_cpu = chk_cpu = 0.0
-                    result = {'status': 'error', 'kind': type(exc).__name__, 'stage': 'local'}
+                    result = local_exception_result(exc)
+                    previous = local_retries.get(task_key, 0)
+                    attempts = 1
+                    # 公共头/代理等本地链路异常以前会直接吞成“其他”。现在
+                    # 清掉可能损坏的公共头，换出口后把同一账号放回本线程，
+                    # 最多按 --retry 重试；程序错误仍保留为可诊断的“其他”。
+                    if (result.get('status') == 'timeout' and previous < args.retry
+                            and not stop.is_set()):
+                        local_retries[task_key] = previous + 1
+                        cached_otp = None
+                        otp_used = 0
+                        replacement = proxy
+                        if ip_pool is not None:
+                            ip_pool.release(tid, proxy, proxy_exp, healthy=False)
+                            replacement, proxy_exp = ip_pool.acquire(tid, wait=20.0)
+                        elif args.api:
+                            replacement = (fetch_one_ip(args.api) if args.no_precheck
+                                           else fetch_usable_ip(args.api, args.precheck_timeout))
+                        if replacement is not None:
+                            proxy = replacement
+                            my_tasks.append((email, password))
+                            continue
+                    local_retries.pop(task_key, None)
+                if local_retry_count:
+                    attempts += local_retry_count
+                    retry_reason = retry_reason or 'local_http=0'
+                    local_retries.pop(task_key, None)
                 elapsed = (time.perf_counter() - t0) * 1000
                 thread_cpu = (time.thread_time() - cpu0) * 1000
                 c0_tail = time.thread_time()
