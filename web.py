@@ -19,7 +19,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HERE = os.path.dirname(os.path.abspath(__file__))
 LIVE = os.path.join(HERE, 'data', 'live.json')
 UPLOAD_DIR = os.path.join(HERE, 'data', 'uploads')
-DEFAULT_ACCOUNTS = '/Users/xxx/Downloads/2026-11-23_全部结果.txt'
+DEFAULT_ACCOUNTS = os.path.join(HERE, 'data', 'accounts.txt')
+ACCOUNT_STATE = os.path.join(HERE, 'data', 'current-accounts.json')
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -94,6 +95,53 @@ STATE = {
 _ACCOUNT_CACHE = {}
 _LOCK = threading.Lock()
 PASSWORD = 'mtx123'          # 默认密码，--password 或 GSA_PASSWORD 可改
+
+
+def _persistent_account_path(path):
+    """只接受服务器 data/accounts.txt 或 data/uploads/ 里的文件。"""
+    if not path:
+        return None
+    real = os.path.realpath(str(path))
+    uploads = os.path.realpath(UPLOAD_DIR)
+    try:
+        in_uploads = os.path.commonpath((real, uploads)) == uploads
+    except ValueError:
+        in_uploads = False
+    if real == os.path.realpath(DEFAULT_ACCOUNTS) or in_uploads:
+        return real
+    return None
+
+
+def _remember_accounts(path):
+    """记住最后一次上传，web 服务重启后仍能找到。"""
+    path = _persistent_account_path(path)
+    if not path or not os.path.isfile(path):
+        return
+    os.makedirs(os.path.dirname(ACCOUNT_STATE), exist_ok=True)
+    tmp = ACCOUNT_STATE + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as handle:
+        json.dump({'accounts': path}, handle, ensure_ascii=False)
+    os.replace(tmp, ACCOUNT_STATE)
+
+
+def _startup_accounts():
+    """优先恢复记住的文件，其次选 uploads 里最新的文件。"""
+    try:
+        with open(ACCOUNT_STATE, encoding='utf-8') as handle:
+            saved = json.load(handle).get('accounts')
+        saved = _persistent_account_path(saved)
+        if saved and os.path.isfile(saved):
+            return saved
+    except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        files = [os.path.join(UPLOAD_DIR, name) for name in os.listdir(UPLOAD_DIR)]
+        files = [path for path in files if os.path.isfile(path)]
+        if files:
+            return max(files, key=os.path.getmtime)
+    except OSError:
+        pass
+    return DEFAULT_ACCOUNTS
 
 
 def _cookie_token():
@@ -565,6 +613,7 @@ class Handler(BaseHTTPRequestHandler):
         # 不改 STATE['accounts']：正在跑的任务还在用旧文件，页面不能把新文件显示成当前
         STATE['pending_accounts'] = path
         STATE['take_pending'] = True
+        _remember_accounts(path)
         _ACCOUNT_CACHE.clear()
         info = analyse_accounts(path)
         info['uploaded'] = True
@@ -1209,10 +1258,11 @@ def main():
     ap.add_argument('--host', default='0.0.0.0', help='监听地址，默认对外')
     ap.add_argument('--password', default=os.environ.get('GSA_PASSWORD', 'mtx123'),
                     help='控制台密码，默认 mtx123')
-    ap.add_argument('--accounts', default=DEFAULT_ACCOUNTS)
+    ap.add_argument('--accounts', default=None,
+                    help='账号文件；不传时自动恢复最后一次上传')
     ap.add_argument('--python', default=PYTHON)
     args = ap.parse_args()
-    STATE['accounts'] = args.accounts
+    STATE['accounts'] = args.accounts or _startup_accounts()
     PYTHON = args.python
     if not os.path.exists(PYTHON):
         print(f'警告: 找不到解释器 {PYTHON}')
