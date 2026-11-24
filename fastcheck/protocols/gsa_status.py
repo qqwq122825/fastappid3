@@ -116,7 +116,8 @@ def _mock_verdict(email: str, stage: str) -> dict:
 # --------------------------------------------------------------------------- #
 def _fetch_anisette(url: str, timeout: float = 8.0) -> dict:
     req = urllib.request.Request(url.rstrip("/") + "/", headers={"User-Agent": "anisette"})
-    ctx = ssl.create_default_context()
+    from .apple_trust import gsa_context
+    ctx = gsa_context()          # 复用进程级单例，避免重复扫 CA（Linux 上一次 24-28ms）
     # 明确禁用系统代理：注入服务器是直连的，若系统代理配置了却没启动
     # （很常见：Clash 关了但 IE 代理还留着），urllib 会连 127.0.0.1 直接失败。
     opener = urllib.request.build_opener(

@@ -274,7 +274,8 @@ class Client:
             #   17.x+     两者都不显式声明，走 **kwargs 透传给 create_connection
             # 按签名判断，**kwargs 存在时按底层习惯用 ssl。
             _params = inspect.signature(connect).parameters
-            _ctx = ssl.create_default_context()
+            from .apple_trust import gsa_context
+            _ctx = gsa_context()     # 进程级单例
             if 'ssl_context' in _params:
                 options['ssl_context'] = _ctx
             elif 'ssl' in _params:
