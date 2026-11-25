@@ -547,6 +547,9 @@ class Handler(BaseHTTPRequestHandler):
         if length > 64 * 1024 * 1024:          # 上传上限 64MB
             return self._json({'error': '上传内容过大（上限 64MB）'})
         raw = self.rfile.read(length) if length else b'{}'
+        if len(raw) != length:
+            return self._json({'error':
+                f'上传中断：应收到 {length} 字节，实际收到 {len(raw)} 字节，请重试'})
 
         # 文件上传直接发送原始字节，避免浏览器先把大文件读成字符串、再做一遍
         # JSON 转义和复制。保留下面的 JSON 分支以兼容旧页面。
