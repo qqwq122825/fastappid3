@@ -145,6 +145,9 @@ async def run(args) -> int:
     rows = full[start_at:start_at + args.limit] if args.limit else full[start_at:]
     concurrency = max(1, min(args.threads, len(rows) or 1))
     mock = os.environ.get('FASTCHECK_MOCK') == '1'
+    device_pool = None if mock else DevicePool(
+        args.device_root, 'https://new.ani.sidestore.io',
+        max_devices=args.slot_base + concurrency, in_memory=True)
     os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
     os.makedirs(os.path.dirname(args.live) or '.', exist_ok=True)
 
@@ -236,14 +239,10 @@ async def run(args) -> int:
             return {'pool': None, 'info': _mock_identity(), 'profile': None,
                     'slot': args.slot_base + tid + 1}
         slot = args.slot_base + tid + 1
-        pool = DevicePool(args.device_root, 'https://new.ani.sidestore.io',
-                          max_devices=args.slot_base + concurrency)
+        pool = device_pool
         profile = device_profile(pool, slot)
-        info = pool.info(max(args.timeout, 20),
-                         proxy=route if args.anisette_proxy else None,
-                         provider_direct=not args.anisette_proxy)
-        info = dict(info, client_info=profile['client_info'],
-                    user_agent=profile['user_agent'])
+        info = {'client_info': profile['client_info'],
+                'user_agent': profile['user_agent']}
         ready = pool.inspect(slot).get('state') == 'ready'
         if _needs_device_registration(ready, args.no_register):
             loop.call_soon_threadsafe(state['device_registering'].add, slot)

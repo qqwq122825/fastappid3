@@ -4,7 +4,7 @@ import time
 import unittest
 from pathlib import Path
 
-from fastcheck.devices import count_registered_devices
+from fastcheck.devices import DevicePool as PersistentDevicePool, count_registered_devices
 from fastcheck.status import result_bucket
 from run_mp import merge
 from simple import (finalize_retry_exhausted, local_exception_result, retry_kind,
@@ -103,6 +103,31 @@ def test_registered_devices_are_persisted_total_not_live_workers(tmp_path=None):
     assert result["device_in_use"] == 2      # 使用中则是各进程之和
 
 
+def test_memory_device_store_loads_once_and_writes_through(tmp_path=None):
+    if tmp_path is None:
+        with tempfile.TemporaryDirectory() as directory:
+            return test_memory_device_store_loads_once_and_writes_through(Path(directory))
+    import base64
+    origin = 'https://new.ani.sidestore.io'
+    pool = PersistentDevicePool(tmp_path, origin, max_devices=1, in_memory=True)
+    store = pool.store(1)
+    with store.lock(1):
+        state = store.load()
+        state['adi_pb'] = base64.b64encode(b'registered').decode()
+        store.save(state)
+    persisted = store.path
+    assert persisted.exists()
+
+    # Removing the persisted copy proves the registered wrapper reads the
+    # shared process memory rather than reopening the slot file.
+    persisted.unlink()
+    registered = pool.store(1, registered=True)
+    with registered.lock(1):
+        loaded = registered.load()
+    assert loaded == state
+    assert not list(registered.path.parent.glob('*.lock'))
+
+
 class ErrorReportingTest(unittest.TestCase):
     def test_account_information_retry_exhaustion(self):
         test_account_information_incorrect_retries_then_becomes_wrong_password()
@@ -121,6 +146,9 @@ class ErrorReportingTest(unittest.TestCase):
 
     def test_registered_device_metrics(self):
         test_registered_devices_are_persisted_total_not_live_workers()
+
+    def test_memory_device_store(self):
+        test_memory_device_store_loads_once_and_writes_through()
 
 
 if __name__ == "__main__":

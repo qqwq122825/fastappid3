@@ -11,7 +11,7 @@ from fastcheck.protocols import gsa_async
 from fastcheck.status import result_bucket
 from gsafast.ippool import IpPool
 from simple_async import _attempt_slice
-from simple import _new_state_lock
+from simple import _new_state_lock, _shared_device_info
 
 
 class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
@@ -76,6 +76,24 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         gate.release()
         self.assertTrue(gate.acquire(blocking=False))
         gate.release()
+
+    def test_device_info_avoids_file_lock_stampede(self):
+        from unittest.mock import Mock
+        gate = threading.Lock()
+        pool = Mock()
+        profile = {'client_info': 'fixture-client', 'user_agent': 'fixture-agent'}
+        self.assertEqual(profile, _shared_device_info(
+            pool, profile, {}, gate, 20, provider_direct=True))
+        pool.info.assert_not_called()
+
+        pool.info.return_value = dict(profile)
+        cache = {}
+        first = _shared_device_info(pool, None, cache, gate, 20,
+                                    provider_direct=True)
+        second = _shared_device_info(pool, None, cache, gate, 20,
+                                     provider_direct=True)
+        self.assertEqual(first, second)
+        pool.info.assert_called_once_with(20, proxy=None, provider_direct=True)
 
     def test_multi_process_uses_thread_worker(self):
         import run_mp

@@ -48,6 +48,26 @@ def _new_state_lock():
     return threading.Semaphore(1)
 
 
+def _shared_device_info(pool, profile, cache, gate, timeout, *, proxy=None,
+                        provider_direct=False):
+    """Return process-local client info without a file-lock stampede.
+
+    The normal fixed device profile already contains both fields required by
+    anisette, so it does not need ``DevicePool.info()`` at all.  In the
+    ``--no-fix-os`` path, exactly one worker populates the process cache and the
+    remaining workers reuse it instead of queueing on ``.info.lock``.
+    """
+    if profile:
+        return {'client_info': profile['client_info'],
+                'user_agent': profile['user_agent']}
+    with gate:
+        if cache:
+            return dict(cache)
+        value = pool.info(timeout, proxy=proxy, provider_direct=provider_direct)
+        cache.update(value)
+        return dict(value)
+
+
 def load_accounts(path, limit, shuffle=True):
     rows = [l.strip() for l in open(path, encoding='utf-8', errors='replace')
             if l.strip() and '----' in l]
@@ -385,6 +405,12 @@ def main():
     from fastcheck.protocols.srp_auth import SRP_MATH_BACKEND
     from fastcheck.status import result_bucket
 
+    # One process owns one in-memory device registry.  Slot state is loaded
+    # once and registration writes through to disk only when it changes.
+    device_pool = DevicePool(
+        args.device_root, 'https://new.ani.sidestore.io',
+        max_devices=args.slot_base + args.threads, in_memory=True)
+
     os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
     if args.offset or args.limit:
         # 先全部读出来再切，保证多进程切分不重叠
@@ -423,6 +449,8 @@ def main():
     lock = _new_state_lock()
     sink_lock = threading.Lock()       # 结果落盘不占用状态锁
     budget_lock = threading.Lock()     # 预算日志有独立的 I/O 锁
+    info_gate = threading.Lock()       # 全进程只获取一次 anisette 客户端信息
+    info_cache = {}
     sink = open(args.out, 'w', encoding='utf-8')
     write_buffer = []          # 攒够再落盘，避免每条都 fsync
     # 预算耗尽专用日志：每条 budget_hit 一行，含 OTP/每跳耗时拆解，方便单独分析
@@ -548,8 +576,7 @@ def main():
         # ---- 2) 设备（线程独占一个槽位）----
         boot = {}
         _b0 = time.thread_time()
-        pool = DevicePool(args.device_root, 'https://new.ani.sidestore.io',
-                          max_devices=args.slot_base + args.threads)
+        pool = device_pool
         boot['pool_ctor'] = (time.thread_time() - _b0) * 1000
         # 注册前就把型号定下来，随 provisioning 一起提交给 anisette；
         # 之后这台设备的所有请求都必须报同一个型号。
@@ -600,12 +627,11 @@ def main():
                 continue
             try:
                 _b0 = time.thread_time()
-                info = pool.info(max(args.timeout, 20), proxy=reg_proxy,
-                                 provider_direct=reg_proxy is None)
+                info = _shared_device_info(
+                    pool, profile, info_cache, info_gate,
+                    max(args.timeout, 20), proxy=reg_proxy,
+                    provider_direct=reg_proxy is None)
                 _info_cpu += (time.thread_time() - _b0) * 1000
-                if profile:
-                    info = dict(info, client_info=profile['client_info'],
-                                user_agent=profile['user_agent'])
                 if needs_registration:
                     _b0 = time.thread_time()
                     with register_gate:
