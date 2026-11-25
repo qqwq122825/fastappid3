@@ -7,9 +7,8 @@ from pathlib import Path
 from fastcheck.devices import DevicePool as PersistentDevicePool, count_registered_devices
 from fastcheck.protocols import gsa_status
 from fastcheck.status import result_bucket
-from simple import (claim_google_probe_slot, finalize_retry_exhausted,
-                    is_google_probe_candidate, local_exception_result,
-                    local_exception_used_proxy, probe_google, retry_kind,
+from simple import (finalize_retry_exhausted, local_exception_result,
+                    local_exception_used_proxy, retry_kind,
                     wait_for_proxy_when_tasks_remain)
 from run_mp import merge
 
@@ -21,54 +20,6 @@ def test_transport_exception_becomes_retryable_timeout():
     assert result_bucket(result) == "timeout"
     assert "TimeoutError" in result["detail"]
     assert "secret proxy URL" not in result["detail"]
-
-
-def test_google_probe_uses_exact_proxy_endpoint_without_logging_credentials():
-    calls = {}
-
-    class Response:
-        status_code = 204
-        def close(self):
-            calls['response_closed'] = True
-
-    class Session:
-        trust_env = True
-        def get(self, url, **kwargs):
-            calls.update(url=url, **kwargs)
-            return Response()
-        def close(self):
-            calls['session_closed'] = True
-
-    proxy = 'socks5h://user:secret@147.182.194.69:8563'
-    result = probe_google(proxy, timeout=3, session_factory=Session)
-    assert result['google_ok'] is True
-    assert result['google_http'] == 204
-    assert calls['proxies'] == {'http': proxy, 'https': proxy}
-    assert calls['timeout'] == (3.0, 3.0)
-    assert calls['response_closed'] and calls['session_closed']
-    assert 'secret' not in json.dumps(result)
-
-
-def test_google_probe_candidate_is_only_init_read_timeout_for_gsa():
-    matching = {
-        'http': 0, 'kind': 'network',
-        'detail': "init 超时：ReadTimeout: SOCKSHTTPSConnectionPool(host='gsa.apple.com')",
-    }
-    assert is_google_probe_candidate(matching, 'timeout') is True
-    assert is_google_probe_candidate(
-        {**matching, 'detail': matching['detail'].replace(
-            'ReadTimeout', 'ConnectTimeout')}, 'timeout') is False
-    assert is_google_probe_candidate(
-        {**matching, 'detail': matching['detail'].replace(
-            'init 超时', 'complete 超时')}, 'timeout') is False
-    assert is_google_probe_candidate(matching, 'wrong_password') is False
-    state = {}
-    lock = __import__('threading').Lock()
-    claimed = [claim_google_probe_slot(
-        state, lock, matching, 'timeout', limit=50) for _ in range(55)]
-    assert claimed[:3] == [1, 2, 3]
-    assert claimed[49] == 50
-    assert claimed[50:] == [None] * 5
 
 
 def test_requests_timeout_uses_independent_connect_and_read_limits():
@@ -213,12 +164,6 @@ def test_memory_device_store_loads_once_and_writes_through(tmp_path=None):
 
 
 class ErrorReportingTest(unittest.TestCase):
-    def test_google_timeout_probe(self):
-        test_google_probe_uses_exact_proxy_endpoint_without_logging_credentials()
-
-    def test_google_probe_candidate_filter(self):
-        test_google_probe_candidate_is_only_init_read_timeout_for_gsa()
-
     def test_requests_total_timeout(self):
         test_requests_timeout_uses_independent_connect_and_read_limits()
 
