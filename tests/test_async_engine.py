@@ -169,12 +169,19 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
             root = Path(directory)
             live_file = root / 'live.json'
             result_file = root / 'run.jsonl'
-            live_file.write_text(json.dumps({'done': 0, 'total': 10}))
+            accounts = root / 'accounts.txt'
+            accounts.write_text(''.join(
+                f'user{i}@example.invalid----fixture\n' for i in range(10)))
+            live_file.write_text(json.dumps({'done': 0}))
             os.utime(live_file, (1, 1))
-            result_file.write_text('{}\n{}\n{}\n')
-            record = {'pid': 123, 'started_at': 1,
+            result_file.write_text(''.join(json.dumps({
+                'email': f'user{i}@example.invalid',
+                'status': 'wrong_password' if i < 2 else 'locked'}) + '\n'
+                for i in range(3)))
+            record = {'pid': 123, 'started_at': 1, 'threads': 2,
+                      'processes': 1, 'limit': 0, 'accounts': str(accounts),
                       'run_out': str(result_file)}
-            state = dict(web.STATE, accounts='fixture.txt')
+            state = dict(web.STATE, accounts=str(accounts), total=0)
             with patch.object(web, 'LIVE', str(live_file)), \
                  patch.object(web, 'STATE', state), \
                  patch.object(web, '_active_task_record', return_value=record), \
@@ -183,6 +190,12 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(3, result['done'])
             self.assertEqual(0.3, result['rate'])
             self.assertEqual(1080, result['per_hour'])
+            self.assertEqual(10, result['total'])
+            self.assertEqual(2, result['threads'])
+            self.assertEqual(1, result['processes'])
+            self.assertEqual({'wrong_password': 2, 'locked': 1},
+                             result['by_status'])
+            self.assertEqual(3, len(result['recent']))
             self.assertTrue(result['live_fallback'])
             self.assertTrue(result['running'])
             self.assertEqual(123, result['pid'])

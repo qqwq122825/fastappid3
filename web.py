@@ -97,6 +97,8 @@ STATE = {
     'take_pending': False,
     'run_out': '',          # 本轮结果文件（每次任务独立，避免和历史混在一起）
     'started_at': 0.0,      # 本轮开始的 epoch 秒
+    'total': 0,             # 本轮预期总数，live.json 尚未生成时也可用
+    'processes': 1,
 }
 _ACCOUNT_CACHE = {}
 _LOCK = threading.Lock()
@@ -314,7 +316,8 @@ def _active_task_record():
     if expected and actual and expected != actual:
         _clear_task_record()
         return None
-    for key in ('accounts', 'threads', 'limit', 'processes', 'started', 'started_at', 'run_out'):
+    for key in ('accounts', 'threads', 'limit', 'total', 'processes',
+                'started', 'started_at', 'run_out'):
         if key in record:
             STATE[key] = record[key]
     return record
@@ -326,40 +329,76 @@ def _running_pid():
 
 
 _LIVE_CACHE = {'at': 0.0, 'data': None}
-_RESULT_PROGRESS = {'key': None, 'offset': 0, 'done': 0}
+_RESULT_PROGRESS = {'key': None, 'offset': 0, 'done': 0, 'tail': b'',
+                    'by_status': {}, 'recent': collections.deque(maxlen=12)}
 _RESULT_PROGRESS_LOCK = threading.Lock()
 
 
 def _result_progress(path):
-    """增量统计 JSONL 已落盘行数。
+    """增量统计 JSONL，并保留状态分布与最近结果。
 
     高并发工作线程可能让 live writer 长时间抢不到状态锁；结果文件
     仍在持续追加。这里只读上次 offset 之后的字节，避免每次刷新都重扫
     整个大文件。
     """
     if not path:
-        return 0
+        return {'done': 0, 'by_status': {}, 'recent': []}
     try:
         stat = os.stat(path)
         key = (os.path.realpath(path), stat.st_dev, stat.st_ino)
     except OSError:
-        return 0
+        return {'done': 0, 'by_status': {}, 'recent': []}
     with _RESULT_PROGRESS_LOCK:
         if (_RESULT_PROGRESS['key'] != key
                 or stat.st_size < _RESULT_PROGRESS['offset']):
-            _RESULT_PROGRESS.update(key=key, offset=0, done=0)
+            _RESULT_PROGRESS.update(key=key, offset=0, done=0, tail=b'',
+                                    by_status={},
+                                    recent=collections.deque(maxlen=12))
         try:
             with open(path, 'rb') as handle:
                 handle.seek(_RESULT_PROGRESS['offset'])
+                data = _RESULT_PROGRESS['tail']
                 while True:
                     chunk = handle.read(1024 * 1024)
                     if not chunk:
                         break
-                    _RESULT_PROGRESS['done'] += chunk.count(b'\n')
+                    data += chunk
+                    lines = data.split(b'\n')
+                    data = lines.pop()
+                    for raw in lines:
+                        if not raw.strip():
+                            continue
+                        try:
+                            row = json.loads(raw.decode('utf-8', 'replace'))
+                        except (ValueError, TypeError):
+                            continue
+                        if not isinstance(row, dict):
+                            continue
+                        _RESULT_PROGRESS['done'] += 1
+                        status = str(row.get('status') or 'unknown')
+                        by_status = _RESULT_PROGRESS['by_status']
+                        by_status[status] = by_status.get(status, 0) + 1
+                        _RESULT_PROGRESS['recent'].append(row)
                 _RESULT_PROGRESS['offset'] = handle.tell()
+                _RESULT_PROGRESS['tail'] = data
         except OSError:
             pass
-        return _RESULT_PROGRESS['done']
+        return {'done': _RESULT_PROGRESS['done'],
+                'by_status': dict(_RESULT_PROGRESS['by_status']),
+                'recent': list(_RESULT_PROGRESS['recent'])}
+
+
+def _expected_total(record):
+    total = int(record.get('total') or STATE.get('total') or 0)
+    if total:
+        return total
+    accounts = record.get('accounts') or STATE.get('accounts')
+    analysed = analyse_accounts(accounts)
+    available = (max(0, int(analysed.get('total') or 0)
+                     - int(analysed.get('format_error') or 0))
+                 if isinstance(analysed, dict) else 0)
+    limit = int(record.get('limit') or STATE.get('limit') or 0)
+    return min(limit, available) if limit else available
 
 
 def live_state():
@@ -388,8 +427,9 @@ def _live_state_uncached():
     except OSError:
         stale = True
     if running and stale:
-        done = max(int(live.get('done') or 0),
-                   _result_progress(record.get('run_out') or STATE.get('run_out')))
+        progress = _result_progress(record.get('run_out') or STATE.get('run_out'))
+        live_done = int(live.get('done') or 0)
+        done = max(live_done, int(progress['done']))
         started_at = float(record.get('started_at') or STATE.get('started_at')
                            or time.time())
         elapsed = max(float(live.get('elapsed') or 0),
@@ -398,7 +438,21 @@ def _live_state_uncached():
         live.update(done=done, elapsed=round(elapsed, 1),
                     rate=round(rate, 2), per_hour=round(rate * 3600),
                     live_fallback=True)
-        total = int(live.get('total') or 0)
+        if int(progress['done']) >= live_done:
+            live['by_status'] = progress['by_status']
+            live['recent'] = progress['recent']
+        total = max(int(live.get('total') or 0), _expected_total(record), done)
+        live.update(total=total,
+                    threads=int(record.get('threads') or STATE.get('threads') or 0),
+                    processes=int(record.get('processes') or STATE.get('processes') or 1),
+                    started=time.strftime('%H:%M:%S', time.localtime(started_at)),
+                    engine=live.get('engine') or 'threading')
+        if not live.get('backend'):
+            try:
+                from fastcheck.protocols.srp_auth import SRP_MATH_BACKEND
+                live['backend'] = SRP_MATH_BACKEND
+            except ImportError:
+                pass
         if total and done:
             live['eta'] = round(max(0, total - done) / rate, 0)
     live['running'] = running
@@ -422,6 +476,10 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
         return {'error': f'账号文件不存在: {accounts}'}
     threads = max(1, min(int(threads or 0), MAX_THREADS))
     limit = max(0, int(limit or 0))
+    account_info = analyse_accounts(accounts)
+    account_total = max(0, int(account_info.get('total') or 0)
+                        - int(account_info.get('format_error') or 0))
+    total = min(limit, account_total) if limit else account_total
     os.makedirs(os.path.dirname(LIVE), exist_ok=True)
     try:
         os.remove(LIVE)
@@ -479,20 +537,21 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
     proc = subprocess.Popen(cmd, cwd=HERE, stdout=log, stderr=subprocess.STDOUT,
                             start_new_session=True)
     STATE.update(proc=proc, accounts=accounts, threads=threads, limit=limit,
-                 processes=processes, started=time.time(), pending_accounts=None)
+                 total=total, processes=processes, started=time.time(),
+                 pending_accounts=None)
     try:
         pgid = os.getpgid(proc.pid)
     except OSError:
         pgid = proc.pid
     _write_task_record({
         'pid': proc.pid, 'pgid': pgid, 'pid_start': _pid_start_token(proc.pid),
-        'accounts': accounts, 'threads': threads, 'limit': limit,
+        'accounts': accounts, 'threads': threads, 'limit': limit, 'total': total,
         'processes': processes, 'started': STATE['started'],
         'started_at': STATE['started_at'], 'run_out': STATE['run_out'],
     })
     total_threads = threads * processes
     return {'ok': True, 'pid': proc.pid, 'threads': threads, 'processes': processes,
-            'limit': limit, 'total_threads': total_threads,
+            'limit': limit, 'total': total, 'total_threads': total_threads,
             'warmup_hint': (f'已启动 {processes} 进程 × {threads} 线程 = {total_threads} 并发；'
                             f'首轮注册设备约 {max(4, total_threads // 16)} 秒后才会有速度')}
 
@@ -1442,8 +1501,10 @@ async function tick(){
     return;
   }
   const by = d.by_status || {};
-  setStat('sTotal', d.total); setStat('sDone', d.done);
-  setStat('sLeft', Math.max(0, (d.total||0)-(d.done||0)));
+  const done = Number(d.done) || 0;
+  const total = Math.max(Number(d.total) || 0, done);
+  setStat('sTotal', total); setStat('sDone', done);
+  setStat('sLeft', Math.max(0, total-done));
   $('sRate').textContent = (d.rate||0).toFixed(1);
   setStat('sWrong', by.wrong_password); setStat('sLock', by.locked);
   setStat('s2fa', by.need_2fa); setStat('sNF', by.not_found);
@@ -1451,17 +1512,19 @@ async function tick(){
   setStat('sTO', by.timeout);
   setStat('sOther', (by.undetermined||0)+(by.error||0));
 
-  const pct = d.total ? d.done/d.total*100 : 0;
+  const pct = total ? done/total*100 : 0;
   $('bar').style.width = pct.toFixed(1)+'%';
-  $('pText').textContent = `${num(d.done)} / ${num(d.total)}`;
+  $('pText').textContent = `${num(done)} / ${num(total)}`;
   $('pPct').textContent = pct.toFixed(1)+'%';
   $('pSpeed').textContent = `${num(d.per_hour)} 条/小时`;
 
   $('started').textContent = d.started || '--';
   $('backend').textContent = [d.backend, d.engine].filter(Boolean).join('·') || '--';
   $('backend').style.color = d.backend==='gmpy2' ? 'var(--green)' : 'var(--red)';
-  $('mThreads').textContent = d.processes>1
-    ? `${d.threads} 线程 × ${d.processes} 进程` : `${d.threads} 线程`;
+  const threads = Number(d.threads) || Number($('threads').value) || 0;
+  const processes = Number(d.processes) || Number($('processes').value) || 1;
+  $('mThreads').textContent = processes>1
+    ? `${threads} 线程 × ${processes} 进程` : `${threads} 线程`;
   const procCores = d.proc_cpu_cores ?? d.cpu_cores ?? 0;
   $('mCpu').textContent = `CPU ${procCores.toFixed(2)} 核`
     + (d.cpu_per_account ? ` · ${d.cpu_per_account.toFixed(1)} ms/条` : '');
@@ -1479,9 +1542,11 @@ async function tick(){
     + (reTop ? ` · ${reTop}` : '');
   $('mEta').textContent = d.eta == null ? '--' : `剩 ${Math.round(d.eta)} 秒`;
 
-  $('stateTag').innerHTML = d.finished
-    ? `<span class="dot" style="background:var(--green)"></span>${d.status==='complete'?'已完成':'部分完成'}`
-    : '<span class="dot" style="background:var(--blue)"></span>运行中';
+  $('stateTag').innerHTML = d.running
+    ? '<span class="dot" style="background:var(--blue)"></span>运行中'
+    : d.finished
+      ? `<span class="dot" style="background:var(--green)"></span>${d.status==='complete'?'已完成':'部分完成'}`
+      : '<span class="dot" style="background:#9ca3af"></span>已停止';
   // 只有确认状态后才改按钮；fetch 失败时保持原样，避免永久 disabled
   if(typeof d.running === 'boolean'){
     $('start').disabled = d.running;
