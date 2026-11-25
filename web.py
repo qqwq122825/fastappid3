@@ -236,9 +236,36 @@ def _pid_start_token(pid):
 def _group_alive(pgid):
     try:
         os.killpg(int(pgid), 0)
-        return True
     except (OSError, ValueError):
         return False
+    # killpg(..., 0) also succeeds while the group only contains zombies.
+    # A persisted task has no Popen handle after the web controller restarts,
+    # so waiting for init to reap those zombies made Stop block for the whole
+    # grace period.  Linux /proc lets us distinguish a live member from Z.
+    if os.path.isdir('/proc'):
+        return _linux_group_has_live_member(pgid)
+    return True
+
+
+def _linux_group_has_live_member(pgid, proc_root='/proc'):
+    try:
+        entries = os.listdir(proc_root)
+    except OSError:
+        return True
+    for name in entries:
+        if not name.isdigit():
+            continue
+        try:
+            with open(os.path.join(proc_root, name, 'stat'),
+                      encoding='utf-8') as handle:
+                raw = handle.read()
+            fields = raw.rsplit(') ', 1)[1].split()
+            state, group = fields[0], int(fields[2])
+        except (OSError, ValueError, IndexError):
+            continue
+        if group == int(pgid) and state != 'Z':
+            return True
+    return False
 
 
 def _read_task_record():
@@ -480,7 +507,9 @@ def stop_job():
     except ProcessLookupError:
         pass
     proc = STATE.get('proc')
-    deadline = time.monotonic() + 8.0
+    # SIGTERM normally ends the worker immediately.  Two seconds is enough for
+    # buffers/final state, while keeping the Stop request responsive.
+    deadline = time.monotonic() + 2.0
     while _group_alive(pgid) and time.monotonic() < deadline:
         if proc is not None:
             proc.poll()  # reap the direct child so a zombie cannot keep the group "alive"
@@ -493,7 +522,7 @@ def stop_job():
             pass
     if proc is not None:
         try:
-            proc.wait(timeout=1)
+            proc.wait(timeout=0.5)
         except subprocess.TimeoutExpired:
             pass
     stopped = not _group_alive(pgid)
@@ -1356,9 +1385,12 @@ async function start(){
 }
 async function stop(){
   $('stop').disabled = true;
+  $('hint').textContent = '正在停止…';
+  $('hint').style.color = 'var(--dim)';
   const res = await post('/api/stop');
   $('hint').textContent = res.error ? ('✕ ' + res.error) : '已停止';
   $('hint').style.color = res.error ? 'var(--red)' : 'var(--dim)';
+  await tick();
 }
 $('start').onclick = start;
 $('stop').onclick = stop;

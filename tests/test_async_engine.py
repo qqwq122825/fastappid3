@@ -123,6 +123,21 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         killpg.assert_called_once_with(654, web.signal.SIGTERM)
         clear.assert_called_once_with()
 
+    def test_linux_group_check_ignores_zombies(self):
+        from pathlib import Path
+        import web
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            zombie = root / '101'
+            live = root / '102'
+            zombie.mkdir()
+            live.mkdir()
+            zombie.joinpath('stat').write_text('101 (worker) Z 1 654 0 0')
+            live.joinpath('stat').write_text('102 (worker) S 1 654 0 0')
+            self.assertTrue(web._linux_group_has_live_member(654, directory))
+            live.joinpath('stat').unlink()
+            self.assertFalse(web._linux_group_has_live_member(654, directory))
+
     def test_result_filter_scans_beyond_old_four_megabyte_tail(self):
         from pathlib import Path
         from unittest.mock import patch
