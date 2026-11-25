@@ -24,6 +24,35 @@ from simple import (device_profile, load_accounts, local_exception_result,
                     proxy_api_default, refine_status, retry_kind)
 
 
+_SECRET_RE = None
+
+
+def _redact(text):
+    """抹掉日志里可能出现的代理地址与凭据。
+
+    requests/aiohttp 的异常消息常带完整 URL：
+      socks5h://user:pass@1.2.3.4:1080
+      http://api.host/iplist?custom=1&password=xxx
+    这些会原样进 worker_errors → live.json → 页面/日志文件。
+    """
+    global _SECRET_RE
+    import re as _re
+    if _SECRET_RE is None:
+        _SECRET_RE = _re.compile(
+            r'(?i)(?:'
+            r'\b(?:socks5h?|https?|socks4)://[^/@\s]+@'
+            r'|\b(?:password|passwd|pwd|token|secret|key|custom)=[^&\s\'",;]+'
+            r')')
+    text = str(text)
+    # URL 里的 user:pass@ 整体替换；查询参数只换值
+    text = _SECRET_RE.sub(
+        lambda m: ('socks5h://***@' if m.group(0).lower().startswith('socks5')
+                   else 'http://***@' if m.group(0).lower().startswith(('http', 'socks4'))
+                   else m.group(0).split('=')[0] + '=***'),
+        text)
+    return text[:400]
+
+
 def parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="asyncio GSA checker")
     ap.add_argument('--accounts', required=True)
@@ -255,6 +284,7 @@ async def run(args) -> int:
                     state['register_errors'] += 1
                     name = type(exc).__name__
                     state['register_error_types'][name] = state['register_error_types'].get(name, 0) + 1
+                    state.setdefault('register_last_error', _redact(exc))
                     if ip_pool:
                         ip_pool.release(tid, route, expires, healthy=False)
                     route, expires = await acquire_ip(tid, 20)
@@ -364,7 +394,8 @@ async def run(args) -> int:
                 queue.task_done()
                 served += 1
         except BaseException as exc:  # noqa: BLE001
-            state['worker_errors'].append(f'{type(exc).__name__}: {exc}')
+            state['worker_errors'].append(
+                f'{type(exc).__name__}: {_redact(exc)}')
         finally:
             state['device_in_use'].discard(slot)
             state['device_registering'].discard(slot)
@@ -407,8 +438,12 @@ async def run(args) -> int:
             'register_error_types': dict(state['register_error_types']),
             'worker_errors': list(state['worker_errors'][-8:]),
             'runtime_threads': threading.active_count(),
-            'finished': bool(final and done == len(rows)),
-            'status': 'complete' if final and done == len(rows) else 'running',
+            'finished': bool(final and (done == len(rows) or stop.is_set()
+                                        or state['worker_errors'])),
+            'status': ('complete' if final and done == len(rows)
+                       else 'failed' if final and state['worker_errors']
+                       else 'stopped' if final and stop.is_set()
+                       else 'running'),
             'incomplete': max(0, len(rows) - done) if final else 0,
         }
         return payload
@@ -427,29 +462,66 @@ async def run(args) -> int:
     writer_task = asyncio.create_task(live_writer(), name='live-writer')
     workers = [asyncio.create_task(worker(tid), name=f'worker-{tid}')
                for tid in range(concurrency)]
-    await asyncio.gather(*workers)
-    stop.set()
-    writer_task.cancel()
-    await asyncio.gather(writer_task, return_exceptions=True)
-    if write_buffer:
-        sink.write('\n'.join(write_buffer) + '\n')
-    sink.close()
-    payload = await make_payload(True)
-    tmp = args.live + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as handle:
-        json.dump(payload, handle, ensure_ascii=False)
-    os.replace(tmp, args.live)
-    if ip_pool:
-        await loop.run_in_executor(io_pool, ip_pool.stop)
-    io_pool.shutdown(wait=True, cancel_futures=True)
-    cpu_pool.shutdown(wait=True, cancel_futures=True)
-    emit_event('run_stopped', done=state['done'], total=len(rows))
-    event_sink.close()
+    payload = None
+    try:
+        await asyncio.gather(*workers)
+    finally:
+        # 无论 workers 是正常结束、抛异常还是被取消，收尾都要走完
+        stop.set()
+        writer_task.cancel()
+        try:
+            await asyncio.gather(writer_task, return_exceptions=True)
+        except BaseException:                                      # noqa: BLE001
+            pass
+        # 先把缓冲写盘，再关文件——顺序不能反
+        try:
+            if write_buffer:
+                sink.write('\n'.join(write_buffer) + '\n')
+                write_buffer.clear()
+        except BaseException as exc:                               # noqa: BLE001
+            state['worker_errors'].append(f'flush: {_redact(exc)}')
+        finally:
+            try:
+                sink.close()
+            except BaseException:                                  # noqa: BLE001
+                pass
+        # 最终状态：即使 make_payload 失败也要落一份可读的状态
+        try:
+            payload = await make_payload(True)
+        except BaseException as exc:                               # noqa: BLE001
+            state['worker_errors'].append(f'final-state: {_redact(exc)}')
+            payload = {'done': state['done'], 'total': len(rows),
+                       'status': 'failed', 'finished': True,
+                       'worker_errors': list(state['worker_errors'][-8:]),
+                       'rate': 0, 'per_hour': 0, 'cpu_cores': 0}
+        try:
+            tmp = args.live + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as handle:
+                json.dump(payload, handle, ensure_ascii=False)
+            os.replace(tmp, args.live)
+        except BaseException as exc:                               # noqa: BLE001
+            state['worker_errors'].append(f'live-write: {_redact(exc)}')
+        if ip_pool:
+            try:
+                await loop.run_in_executor(io_pool, ip_pool.stop)
+            except BaseException:                                  # noqa: BLE001
+                pass
+        for pool in (io_pool, cpu_pool):
+            try:
+                pool.shutdown(wait=True, cancel_futures=True)
+            except BaseException:                                  # noqa: BLE001
+                pass
+        try:
+            emit_event('run_stopped', done=state['done'], total=len(rows))
+            event_sink.close()
+        except BaseException:                                      # noqa: BLE001
+            pass
+
     print(f"完成 {payload['done']}/{payload['total']} | {payload['rate']} 条/秒 | "
           f"{payload['per_hour']/10000:.1f} 万/小时 | CPU {payload['cpu_cores']} 核")
-    if payload['worker_errors']:
+    if payload.get('worker_errors'):
         print('worker errors:', payload['worker_errors'])
-    return 0 if payload['finished'] else 2
+    return 0 if payload.get('finished') and payload['done'] == payload['total'] else 2
 
 
 def main() -> int:

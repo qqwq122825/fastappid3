@@ -108,9 +108,16 @@ class AsyncGsaSession:
                     GSA_URL, data=body, headers=headers, timeout=client_timeout,
                     allow_redirects=False) as response:
                 code = response.status
-                raw = await response.read()
-                if len(raw) > 2 * 1024 * 1024:
-                    return AsyncOutcome(None, "response exceeds 2 MiB", "protocol", code)
+                # 边读边累计，超过 2 MiB 立即中断：先 read() 再判断挡不住内存
+                limit = 2 * 1024 * 1024
+                chunks, size = [], 0
+                async for chunk in response.content.iter_chunked(64 * 1024):
+                    size += len(chunk)
+                    if size > limit:
+                        return AsyncOutcome(None, "response exceeds 2 MiB",
+                                            "protocol", code)
+                    chunks.append(chunk)
+                raw = b''.join(chunks)
         except Exception as exc:  # noqa: BLE001
             kind, detail = sync._classify_transport(exc, self.proxy, redactions=[
                 cpd.get(key) for key in ("X-Apple-I-MD", "X-Apple-I-MD-M",

