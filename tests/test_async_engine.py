@@ -112,6 +112,29 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         killpg.assert_called_once_with(654, web.signal.SIGTERM)
         clear.assert_called_once_with()
 
+    def test_result_filter_scans_beyond_old_four_megabyte_tail(self):
+        from pathlib import Path
+        from unittest.mock import patch
+        import web
+        with tempfile.TemporaryDirectory() as directory:
+            result_file = Path(directory) / 'run.jsonl'
+            with result_file.open('w', encoding='utf-8') as handle:
+                handle.write(json.dumps({
+                    'email': 'first@example.invalid',
+                    'status': 'undetermined',
+                    'detail': 'fixture'}) + '\n')
+                for index in range(50000):
+                    handle.write(json.dumps({
+                        'email': f'user{index}@example.invalid',
+                        'status': 'wrong_password',
+                        'detail': 'x' * 100}) + '\n')
+            self.assertGreater(result_file.stat().st_size, 4 * 1024 * 1024)
+            state = dict(web.STATE, run_out=str(result_file), started_at=1)
+            with patch.object(web, 'STATE', state):
+                result = object.__new__(web.Handler)._results('other', 100)
+            self.assertEqual(1, result['total'])
+            self.assertEqual('first@example.invalid', result['rows'][0]['email'])
+
     def test_transport_http_zero_is_classified_as_timeout(self):
         row = gsa_async._result(
             'error', 'init timeout', time.time(), kind='network', http=0)

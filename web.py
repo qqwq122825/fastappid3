@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import gzip
 import json
 import os
@@ -554,7 +555,12 @@ class Handler(BaseHTTPRequestHandler):
         else:
             # 多进程：只读本轮开始后写过的 mp-p*.jsonl
             paths = sorted(_glob.glob(os.path.join(HERE, 'data', 'mp-p*.jsonl')))
-        out, seen = [], set()
+        # Scan the complete current-run file.  The previous 4 MiB tail read
+        # made the cumulative counters disagree with filtered rows once an
+        # uncommon result (for example ``undetermined``) scrolled out of the
+        # tail.  Keep only the newest requested rows in memory while counting
+        # every matching result.
+        out, seen, total = collections.deque(maxlen=limit), set(), 0
         if True:
             for path in paths:
                 try:
@@ -563,41 +569,39 @@ class Handler(BaseHTTPRequestHandler):
                 except OSError:
                     continue
                 try:
-                    with open(path, 'rb') as handle:
-                        handle.seek(0, os.SEEK_END)
-                        size = handle.tell()
-                        handle.seek(max(0, size - 4 * 1024 * 1024))
-                        chunk = handle.read().decode('utf-8', errors='replace')
+                    handle = open(path, encoding='utf-8', errors='replace')
                 except OSError:
                     continue
-                for line in chunk.splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        r = json.loads(line)
-                    except ValueError:
-                        continue
-                    st = str(r.get('status') or '')
-                    if want == 'other':
-                        if st not in ('undetermined', 'error'):
+                with handle:
+                    for line in handle:
+                        line = line.strip()
+                        if not line:
                             continue
-                    elif want not in ('', 'all') and st != want:
-                        continue
-                    key = (r.get('email'), st)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    out.append({'email': r.get('email'), 'status': st,
-                                'attempts': r.get('attempts'),
-                                'http': r.get('http'), 'ec': r.get('ec'),
-                                'ms': r.get('ms'), 'slot': r.get('slot'),
-                                'cpu': r.get('thread_cpu_ms'),
-                                'detail': r.get('detail')})
-        out.reverse()                      # 新的在前
+                        try:
+                            r = json.loads(line)
+                        except ValueError:
+                            continue
+                        st = str(r.get('status') or '')
+                        if want == 'other':
+                            if st not in ('undetermined', 'error'):
+                                continue
+                        elif want not in ('', 'all') and st != want:
+                            continue
+                        key = (r.get('email'), st)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        total += 1
+                        out.append({'email': r.get('email'), 'status': st,
+                                    'attempts': r.get('attempts'),
+                                    'http': r.get('http'), 'ec': r.get('ec'),
+                                    'ms': r.get('ms'), 'slot': r.get('slot'),
+                                    'cpu': r.get('thread_cpu_ms'),
+                                    'detail': r.get('detail')})
+        rows = list(reversed(out))          # 新的在前
         scoped = bool(own and os.path.exists(own)) or bool(cutoff)
-        return {'total': len(out) if scoped else 0,
-                'rows': out[:limit] if scoped else [],
+        return {'total': total if scoped else 0,
+                'rows': rows if scoped else [],
                 'status': want, 'scoped': scoped}
 
     def _export(self, want, fmt):
