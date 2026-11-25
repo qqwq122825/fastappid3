@@ -11,7 +11,7 @@ from fastcheck.protocols import gsa_async
 from fastcheck.status import result_bucket
 from gsafast.ippool import IpPool
 from simple_async import _attempt_slice
-from simple import _new_state_lock, _shared_device_info
+from simple import _new_state_lock, _proxy_host, _shared_device_info
 
 
 class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
@@ -124,15 +124,15 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
             task = json.loads((root / 'data' / 'task-process.json').read_text())
             self.assertEqual(123, task['pid'])
 
-    def test_worker_priority_and_live_polling_protect_console(self):
-        from unittest.mock import patch
+    def test_live_polling_does_not_overlap(self):
         import web
-        with patch.object(web.os, 'setpriority') as setpriority:
-            self.assertTrue(web._lower_task_priority(123, 10))
-        setpriority.assert_called_once_with(web.os.PRIO_PROCESS, 123, 10)
         self.assertIn('if(TICK_RUNNING) return', web.PAGE)
         self.assertIn('controller.abort(), 4000', web.PAGE)
         self.assertNotIn('fetch(\'/api/live?t=\'+Date.now())).json()', web.PAGE)
+
+    def test_missing_proxy_is_safe_to_record(self):
+        self.assertEqual('', _proxy_host(None))
+        self.assertEqual('127.0.0.1', _proxy_host('http://127.0.0.1:8080'))
 
     def test_cpu_display_distinguishes_current_from_average(self):
         import web

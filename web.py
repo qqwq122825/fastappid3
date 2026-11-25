@@ -328,23 +328,6 @@ def _running_pid():
     return int(record['pid']) if record else None
 
 
-def _lower_task_priority(pid, niceness=10):
-    """Keep a high-concurrency worker from starving the web console.
-
-    ``setpriority`` runs in the parent after ``Popen`` and is therefore safe in
-    this threaded HTTP server (unlike ``preexec_fn``).  Worker children inherit
-    the lower scheduling priority.  Unsupported platforms simply keep their
-    default priority.
-    """
-    if os.name != 'posix' or not hasattr(os, 'setpriority'):
-        return False
-    try:
-        os.setpriority(os.PRIO_PROCESS, int(pid), int(niceness))
-        return True
-    except (OSError, ValueError):
-        return False
-
-
 _PROCESS_CPU = {'pid': None, 'at': None, 'seconds': None, 'cores': None}
 _PROCESS_CPU_LOCK = threading.Lock()
 
@@ -614,7 +597,6 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
     # inherit it, so Stop can terminate the whole tree with one signal.
     proc = subprocess.Popen(cmd, cwd=HERE, stdout=log, stderr=subprocess.STDOUT,
                             start_new_session=True)
-    _lower_task_priority(proc.pid)
     STATE.update(proc=proc, accounts=accounts, threads=threads, limit=limit,
                  total=total, processes=processes, started=time.time(),
                  pending_accounts=None)

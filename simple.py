@@ -68,6 +68,11 @@ def _shared_device_info(pool, profile, cache, gate, timeout, *, proxy=None,
         return dict(value)
 
 
+def _proxy_host(proxy):
+    """Return a display-only proxy host; an exhausted pool may yield None."""
+    return str(proxy).split('//')[-1].split(':')[0] if proxy else ''
+
+
 def load_accounts(path, limit, shuffle=True):
     rows = [l.strip() for l in open(path, encoding='utf-8', errors='replace')
             if l.strip() and '----' in l]
@@ -898,7 +903,7 @@ def main():
                     web_method = classify_web_method(web)
                 row = {'tid': tid, 'slot': slot, 'email': email,
                        'raw_status': raw_status,
-                       'proxy': proxy.split('//')[-1].split(':')[0],
+                       'proxy': _proxy_host(proxy),
                        'status': status, 'final': final_status,
                        'overridden': overridden,
                        'ec': result.get('apple_ec'),
