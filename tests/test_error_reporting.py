@@ -264,6 +264,7 @@ def test_worker_slot_pool_uses_least_used_idle_then_allocates_when_busy(tmp_path
     second.close()
     fourth = pool.acquire_worker_slot()
     fourth_slot = fourth.slot
+    pool.consume_worker_slot(fourth_slot)
     fourth.close()
     fifth = pool.acquire_worker_slot()
     try:
@@ -274,6 +275,41 @@ def test_worker_slot_pool_uses_least_used_idle_then_allocates_when_busy(tmp_path
     finally:
         fifth.close()
         third.close()
+
+
+def test_worker_device_is_destroyed_after_completed_account_limit(tmp_path=None):
+    if tmp_path is None:
+        with tempfile.TemporaryDirectory() as directory:
+            return test_worker_device_is_destroyed_after_completed_account_limit(Path(directory))
+    import base64
+    import hashlib
+    origin = 'https://new.ani.sidestore.io'
+    key = hashlib.sha256(origin.encode()).hexdigest()[:24]
+    directory = tmp_path / key / 'devices' / '01'
+    directory.mkdir(parents=True)
+    state = {
+        'identifier': base64.b64encode(b'1' * 16).decode(),
+        'adi_pb': base64.b64encode(b'registered').decode(),
+    }
+    (directory / f'{key}.json').write_text(
+        json.dumps({'schema': 2, 'origin': origin, 'state': state}),
+        encoding='utf-8')
+    pool = PersistentDevicePool(
+        tmp_path, origin, max_devices=2, in_memory=True, worker_use_limit=2)
+    assert pool.configure_worker_slots([1], new_slot_start=2) == 1
+    lease = pool.acquire_ready_worker_slot()
+    assert pool.consume_worker_slot(lease.slot) is False
+    assert directory.exists()
+    assert pool.consume_worker_slot(lease.slot) is True
+    assert not directory.exists()
+    lease.close()
+    assert pool.acquire_ready_worker_slot() is None
+    replacement = pool.reserve_new_worker_slot()
+    try:
+        assert replacement.slot == 2 and not replacement.ready
+        assert pool.worker_slots_retired == 1
+    finally:
+        replacement.close()
 
 
 def test_multiprocess_device_assignment_is_even_and_disjoint():
@@ -371,6 +407,9 @@ class ErrorReportingTest(unittest.TestCase):
 
     def test_least_used_worker_device_pool(self):
         test_worker_slot_pool_uses_least_used_idle_then_allocates_when_busy()
+
+    def test_worker_device_usage_limit(self):
+        test_worker_device_is_destroyed_after_completed_account_limit()
 
     def test_multiprocess_device_assignment(self):
         test_multiprocess_device_assignment_is_even_and_disjoint()

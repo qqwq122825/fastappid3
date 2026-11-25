@@ -541,6 +541,9 @@ def main():
     ap.add_argument('--register-timeout', type=float, default=20.0,
                     dest='register_timeout',
                     help='设备初始化总超时；预算内退避重试，耗尽后账号记为超时')
+    ap.add_argument('--device-max-uses', type=int, default=100,
+                    dest='device_max_uses',
+                    help='每台设备最多完成多少条账号；达到后销毁并注册新设备，0=不限')
     ap.add_argument('--per-ip', type=int, default=1,
                     help='一条 IP 跑多少条账号（1=每个任务换新 IP，走 IP 池 rotate）')
     ap.add_argument("--otp-reuse", type=int, default=15, dest="otp_reuse",
@@ -587,7 +590,8 @@ def main():
     device_pool = DevicePool(
         args.device_root, 'https://new.ani.sidestore.io',
         max_devices=max(args.slot_base + args.threads, new_slot_start,
-                        *(assigned_slots or [1])), in_memory=True)
+                        *(assigned_slots or [1])), in_memory=True,
+        worker_use_limit=args.device_max_uses)
     loaded_devices = device_pool.configure_worker_slots(
         assigned_slots, new_slot_start=new_slot_start,
         new_slot_step=args.new_slot_step)
@@ -669,7 +673,7 @@ def main():
                'recent': collections.deque(maxlen=12),
                'device_ready': set(), 'device_in_use': set(),
                'device_registering': set(), 'register_errors': 0,
-               'register_error_types': {}}
+               'register_error_types': {}, 'device_retired': 0}
     stop = threading.Event()
 
     SAMPLE_CAP = 4000          # 历史样本上限，超出只保留最近的一批
@@ -738,6 +742,7 @@ def main():
                 'device_registered': device_registered,
                 'device_in_use': device_in_use,
                 'device_registering': device_registering,
+                'device_retired': results.get('device_retired', 0),
                 'register_errors': register_errors,
                 'register_error_types': register_error_types,
                 'seg': {k: (round(sorted(v)[len(v)//2],1) if v else None)
@@ -984,6 +989,7 @@ def main():
                 bag.setdefault(k, []).append(v)
         cpu_start = time.thread_time()
         mine = 0
+        device_exhausted = False
         while not stop.is_set():
             # 池模式每轮重新领一条；非池模式保留线程启动时取得的固定代理。
             proxy_exp = 0.0
@@ -1354,8 +1360,18 @@ def main():
                         sink.flush()
                 served += 1
                 mine += 1
+                if pool.consume_worker_slot(slot, args.device_max_uses):
+                    # The just-finished account is the final allowed use.
+                    # Discard the slot-bound public header before this worker
+                    # starts a fresh device session.
+                    device_headers.invalidate(slot)
+                    with lock:
+                        results['device_retired'] += 1
+                        results['device_ready'].discard(slot)
+                        results['device_in_use'].discard(slot)
+                    device_exhausted = True
                 t_prev_end = time.perf_counter()
-                if proxy_failed:
+                if proxy_failed or device_exhausted:
                     break
             if ip_pool is not None:
                 ip_pool.release(
@@ -1365,24 +1381,19 @@ def main():
                 if not retry_tasks and pending_task_count() <= 0:
                     break
                 stop.wait(0.5 + random.uniform(0.0, 0.5))
+            if device_exhausted:
+                break
         with lock:
             spent = (time.thread_time() - cpu_start) * 1000
             results['per_thread_cpu'].append(round(spent, 1))
             results['per_thread_count'].append(mine)
+        return 'rotate' if device_exhausted else None
 
     results['started'] = started
     live_thread = threading.Thread(target=live_writer, name='live', daemon=True)
     live_thread.start()
     def worker_guarded(tid):
-        try:
-            worker(tid)
-        except BaseException as exc:                               # noqa: BLE001
-            import traceback
-            with lock:
-                results.setdefault('worker_errors', []).append(
-                    f'{type(exc).__name__}: {exc}')
-            traceback.print_exc()
-        finally:
+        def release_session():
             with lock:
                 slot_lease = worker_leases.pop(tid, None)
                 had_registration_permit = tid in worker_registration_permits
@@ -1396,6 +1407,20 @@ def main():
                     results['device_in_use'].discard(slot)
             if slot_lease is not None:
                 slot_lease.close()
+        while not stop.is_set() and pending_task_count() > 0:
+            try:
+                outcome = worker(tid)
+            except BaseException as exc:                           # noqa: BLE001
+                import traceback
+                with lock:
+                    results.setdefault('worker_errors', []).append(
+                        f'{type(exc).__name__}: {exc}')
+                traceback.print_exc()
+                release_session()
+                break
+            release_session()
+            if outcome != 'rotate':
+                break
 
     threads = [threading.Thread(target=worker_guarded, args=(i,), name=f'w{i}', daemon=True)
                for i in range(active_workers)]

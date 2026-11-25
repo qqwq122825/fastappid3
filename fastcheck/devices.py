@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import random
+import shutil
 import tempfile
 import threading
 import time
@@ -219,7 +220,7 @@ class RetryPolicy:
 class DevicePool:
     def __init__(self, root, origin, *, client_factory=Client, policy=None,
                  clock=time.time, sleeper=time.sleep, max_devices=5,
-                 in_memory=False):
+                 in_memory=False, worker_use_limit=0):
         parsed = urlsplit(origin)
         if (not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment
                 or any(ord(c) < 32 for c in origin)
@@ -245,6 +246,8 @@ class DevicePool:
         self._worker_slots_ready = set()
         self._worker_slots_in_use = set()
         self._worker_slot_uses = {}
+        self.worker_use_limit = max(0, int(worker_use_limit or 0))
+        self._worker_slots_retired = 0
         self._worker_new_slot = max_devices + 1
         self._worker_new_step = 1
 
@@ -288,7 +291,8 @@ class DevicePool:
             self._worker_slots = assigned
             self._worker_slots_ready.clear()
             self._worker_slots_in_use.clear()
-            self._worker_slot_uses = {slot: 0 for slot in assigned}
+            self._worker_slot_uses = {
+                slot: self._load_worker_slot_uses(slot) for slot in assigned}
             self._worker_new_slot = start
             self._worker_new_step = step
             self.max_devices = max(self.max_devices, start, *(assigned or [1]))
@@ -315,7 +319,6 @@ class DevicePool:
                 value for value in idle
                 if self._worker_slot_uses.get(value, 0) == least])
             self._worker_slots_in_use.add(slot)
-            self._worker_slot_uses[slot] = self._worker_slot_uses.get(slot, 0) + 1
         return WorkerSlotLease(slot, True, self)
 
     def reserve_new_worker_slot(self):
@@ -325,7 +328,7 @@ class DevicePool:
             self._worker_new_slot += self._worker_new_step
             self.max_devices = max(self.max_devices, slot)
             self._worker_slots.append(slot)
-            self._worker_slot_uses[slot] = 1
+            self._worker_slot_uses[slot] = 0
             self._worker_slots_in_use.add(slot)
         return WorkerSlotLease(slot, False, self)
 
@@ -343,8 +346,61 @@ class DevicePool:
         return lease if lease is not None else self.reserve_new_worker_slot()
 
     def release_worker_slot(self, slot):
+        value = int(slot)
         with self._worker_slots_lock:
-            self._worker_slots_in_use.discard(int(slot))
+            self._worker_slots_in_use.discard(value)
+            uses = self._worker_slot_uses.get(value)
+            keep = value in self._worker_slots_ready and uses is not None
+        if keep:
+            self._save_worker_slot_uses(value, uses)
+
+    def _worker_usage_path(self, slot):
+        return self.slot_directory(int(slot)) / '.use-count.json'
+
+    def _load_worker_slot_uses(self, slot):
+        try:
+            payload = read_json(self._worker_usage_path(slot), {}) or {}
+            return max(0, int(payload.get('uses') or 0))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return 0
+
+    def _save_worker_slot_uses(self, slot, uses):
+        try:
+            save_json(self._worker_usage_path(slot), {'uses': max(0, int(uses))})
+        except OSError:
+            # Usage persistence is advisory.  A disk problem must not hide an
+            # authentication result or strand the worker lease.
+            pass
+
+    def consume_worker_slot(self, slot, limit=None):
+        """Count one completed account and retire the identity at its limit.
+
+        A worker owns the slot exclusively while this runs.  Retiring removes
+        it from the ready set before deleting its persisted identity, so no
+        sibling thread can observe or borrow a half-deleted device.
+        """
+        value = int(slot)
+        cap = self.worker_use_limit if limit is None else max(0, int(limit or 0))
+        with self._worker_slots_lock:
+            if value not in self._worker_slots_in_use:
+                return False
+            uses = self._worker_slot_uses.get(value, 0) + 1
+            self._worker_slot_uses[value] = uses
+            if not cap or uses < cap:
+                return False
+            self._worker_slots_ready.discard(value)
+            self._worker_slots = [slot for slot in self._worker_slots if slot != value]
+            self._worker_slot_uses.pop(value, None)
+            self._worker_slots_retired += 1
+        with self._memory_states_lock:
+            self._memory_states.pop(value, None)
+        shutil.rmtree(self.slot_directory(value), ignore_errors=True)
+        return True
+
+    @property
+    def worker_slots_retired(self):
+        with self._worker_slots_lock:
+            return self._worker_slots_retired
 
     def health(self):
         with file_lease(self.base / ".health.lock", wait=2):

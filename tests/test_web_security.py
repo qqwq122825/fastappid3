@@ -396,6 +396,10 @@ new vm.Script(input.source, {filename: 'web-inline.js'}).runInContext(context);
 
     def test_page_exposes_clear_devices_control(self):
         self.assertIn('id="clearDevices"', web.PAGE)
+
+    def test_page_exposes_device_usage_limit(self):
+        self.assertIn('id="deviceMaxUses"', web.PAGE)
+        self.assertIn('device_max_uses:+', web.PAGE)
         self.assertIn('class="device-maintenance"', web.PAGE)
         self.assertIn('class="btn danger-outline"', web.PAGE)
         self.assertIn('class="task-actions"', web.PAGE)

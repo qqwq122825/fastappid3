@@ -628,7 +628,8 @@ def _live_state_uncached():
 # ---------------------------------------------------------------- 任务控制
 def start_job(accounts, threads, limit, processes=1, verify_web=False,
               per_ip=6, ip_ttl=50.0, timeout=25.0, anisette_workers=0,
-              no_register=False, retry=2, item_timeout=40.0, anisette_proxy=False):
+              no_register=False, retry=2, item_timeout=40.0, anisette_proxy=False,
+              device_max_uses=100):
     if is_running():
         return {'error': '已有任务在跑，先停止'}
     if STATE.get('take_pending') and STATE.get('pending_accounts'):
@@ -662,7 +663,8 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
             cmd.append('--verify-web')
         cmd += ['--per-ip', str(per_ip), '--ip-ttl', str(ip_ttl),
                 '--timeout', str(timeout), '--retry', str(retry),
-                '--item-timeout', str(item_timeout)]
+                '--item-timeout', str(item_timeout),
+                '--device-max-uses', str(max(0, int(device_max_uses or 0)))]
         # run_mp 不接受 --out，子进程文件名由它自己生成（mp-p*.jsonl）
         if anisette_workers:
             cmd += ['--anisette-workers', str(anisette_workers)]
@@ -677,7 +679,8 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
                '--out', run_out,
                '--per-ip', str(per_ip), '--ip-ttl', str(ip_ttl),
                '--timeout', str(timeout), '--retry', str(retry),
-               '--item-timeout', str(item_timeout)]
+               '--item-timeout', str(item_timeout),
+               '--device-max-uses', str(max(0, int(device_max_uses or 0)))]
         if verify_web:
             cmd.append('--verify-web')
         if anisette_workers:
@@ -1199,7 +1202,9 @@ class Handler(BaseHTTPRequestHandler):
                                    bool(payload.get('no_register')),
                                    int(payload.get('retry') if payload.get('retry') is not None else 2),
                                    float(payload.get('item_timeout') or 40),
-                                   bool(payload.get('anisette_proxy')))
+                                   bool(payload.get('anisette_proxy')),
+                                   int(payload.get('device_max_uses')
+                                       if payload.get('device_max_uses') is not None else 100))
             return self._json(result)
         if self.path.startswith('/api/stop'):
             with _LOCK:
@@ -1422,6 +1427,10 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
         </div>
         <div class="hint" style="margin-top:4px">
           单条超时 = 这条账号的总预算（含所有重试），超了直接判超时，不再磕
+        </div>
+        <div style="margin-top:10px">
+          <input type="number" id="deviceMaxUses" value="100" min="0" max="100000">
+          <div class="hint">设备使用上限（完成 100 条后自动销毁并换新；0 = 不限）</div>
         </div>
       </div>
 
@@ -1726,7 +1735,8 @@ async function start(){
     per_ip:+$('perip').value, ip_ttl:+$('ttl').value,
     timeout:+$('timeout').value, no_register:$('noreg').checked,
     retry:+$('retry').value, item_timeout:+$('itemto').value,
-    anisette_proxy:$('asproxy').checked};
+    anisette_proxy:$('asproxy').checked,
+    device_max_uses:+$('deviceMaxUses').value};
   $('start').disabled = true; $('hint').textContent='启动中…';
   $('hint').style.color = 'var(--dim)';
   const res = await post('/api/start', body);
