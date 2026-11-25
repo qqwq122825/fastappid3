@@ -265,6 +265,36 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(expected, web.read_live())
         state.assert_called_once_with()
 
+    def test_fresh_live_state_never_regresses_behind_result_file(self):
+        from pathlib import Path
+        from unittest.mock import patch
+        import web
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            live_file = root / 'live.json'
+            result_file = root / 'run.jsonl'
+            accounts = root / 'accounts.txt'
+            accounts.write_text(''.join(
+                f'user{i}@example.invalid----fixture\n' for i in range(3)))
+            live_file.write_text(json.dumps({
+                'done': 1, 'total': 3,
+                'by_status': {'wrong_password': 1}}))
+            result_file.write_text(''.join(json.dumps({
+                'email': f'user{i}@example.invalid',
+                'status': 'wrong_password'}) + '\n' for i in range(3)))
+            record = {'pid': 123, 'started_at': time.time(), 'threads': 2,
+                      'processes': 1, 'total': 3, 'accounts': str(accounts),
+                      'run_out': str(result_file)}
+            state = dict(web.STATE, accounts=str(accounts), total=3)
+            with patch.object(web, 'LIVE', str(live_file)), \
+                 patch.object(web, 'STATE', state), \
+                 patch.object(web, '_active_task_record', return_value=record), \
+                 patch.object(web, '_process_cpu_now', return_value=None):
+                result = web._live_state_uncached()
+            self.assertEqual(3, result['done'])
+            self.assertEqual({'wrong_password': 3}, result['by_status'])
+            self.assertFalse(result.get('live_fallback', False))
+
     def test_result_table_formats_duration_as_seconds(self):
         import web
         self.assertIn('耗时（秒）', web.PAGE)

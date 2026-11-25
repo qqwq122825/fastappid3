@@ -791,8 +791,14 @@ def main():
                             budget_hit = True
                             retry_reason = 'budget'
                             break
-                        # gs.check 内部有 init + complete 两跳，每跳都要受剩余预算约束
-                        per_hop = max(2.0, min(float(args.timeout), remain / 2))
+                        # gs.check 内部有 init + complete 两跳，每跳读超时 per_hop，
+                        # 一次 check 最多 2×per_hop。之前 per_hop=min(timeout, remain/2)
+                        # 会让慢代理一次就吃满 2×10s≈整个 20s 预算，重试根本没机会跑。
+                        # 改成按「剩余尝试次数 × 2 跳」均分，慢代理只吃掉它该得的那份。
+                        total_attempts = max(1, int(args.retry) + 1)
+                        attempts_left = max(1, total_attempts - (attempts - 1))
+                        per_hop = max(1.0, min(float(args.timeout),
+                                                remain / (2.0 * attempts_left)))
                         _a0 = time.perf_counter()
                         result = gs.check(email, password, proxy,
                                           timeout=per_hop,

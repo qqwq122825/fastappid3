@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from fastcheck.devices import DevicePool as PersistentDevicePool, count_registered_devices
+from fastcheck.protocols import gsa_status
 from fastcheck.status import result_bucket
 from run_mp import merge
 from simple import (finalize_retry_exhausted, local_exception_result, retry_kind,
@@ -18,6 +19,17 @@ def test_transport_exception_becomes_retryable_timeout():
     assert result_bucket(result) == "timeout"
     assert "TimeoutError" in result["detail"]
     assert "secret proxy URL" not in result["detail"]
+
+
+def test_requests_timeout_is_one_total_wall_clock_budget():
+    timeout = gsa_status._requests_timeout(3.25)
+    assert timeout.total == 3.25
+    assert timeout.connect_timeout == 3.25
+    assert timeout.read_timeout == 3.25
+
+    capped = gsa_status._requests_timeout(20)
+    assert capped.total == 20
+    assert capped.connect_timeout == gsa_status._CONNECT_TIMEOUT_CAP
 
 
 def test_programming_exception_remains_visible_undetermined():
@@ -129,6 +141,9 @@ def test_memory_device_store_loads_once_and_writes_through(tmp_path=None):
 
 
 class ErrorReportingTest(unittest.TestCase):
+    def test_requests_total_timeout(self):
+        test_requests_timeout_is_one_total_wall_clock_budget()
+
     def test_account_information_retry_exhaustion(self):
         test_account_information_incorrect_retries_then_becomes_wrong_password()
 

@@ -36,9 +36,11 @@ from .timing import emit, phase
 
 try:                                   # optional: nicer pooling/proxy behaviour
     import requests                    # type: ignore
+    from requests.adapters import TimeoutSauce  # type: ignore
     _HAS_REQUESTS = True
 except Exception:                      # pragma: no cover - fallback path
     requests = None                    # type: ignore
+    TimeoutSauce = None                # type: ignore
     _HAS_REQUESTS = False
 
 
@@ -95,6 +97,19 @@ MOCK_RESULTS = ("valid", "wrong_password", "wrong_password", "security_lock",
 
 MOCK_CN = {"valid": "有效", "wrong_password": "密码错误",
            "security_lock": "安全锁定", "locked": "已锁定", "error": "请求失败"}
+
+
+def _requests_timeout(timeout: float):
+    """Build one wall-clock budget for connect, TLS and response reading.
+
+    A scalar requests timeout is applied independently to connect and read.
+    With a SOCKS proxy that allowed one POST to consume almost twice the value,
+    and GSA performs two POSTs per check.  urllib3's total timeout subtracts the
+    connect/TLS duration from the remaining read allowance instead.
+    """
+    seconds = max(0.001, float(timeout))
+    connect = min(_CONNECT_TIMEOUT_CAP, seconds)
+    return TimeoutSauce(total=seconds, connect=connect, read=seconds)
 
 
 def mock_enabled() -> bool:
@@ -436,11 +451,10 @@ class _Session:
                 context = trace.request(request_phase) if trace else nullcontext()
                 with context:
                     kwargs = {"stream": True} if trace else {}
-                    # Concretely: connect+TLS through the proxy may fail long
-                    # before the response body is due, so bound them separately.
-                    budget = timeout
-                    if isinstance(timeout, (int, float)) and timeout > _CONNECT_TIMEOUT_CAP:
-                        budget = (_CONNECT_TIMEOUT_CAP, timeout)
+                    # Use a true total wall-clock allowance.  Passing a scalar
+                    # here gives connect and read a full allowance each, so a
+                    # slow SOCKS exit can overrun the caller's item deadline.
+                    budget = _requests_timeout(timeout)
                     with self._impl.post(GSA_URL, data=body, headers=headers, timeout=budget,
                                          allow_redirects=False, **kwargs) as resp:
                         code = resp.status_code

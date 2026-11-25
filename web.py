@@ -483,8 +483,9 @@ def _live_state_uncached():
         stale = time.time() - os.path.getmtime(LIVE) > 3.0
     except OSError:
         stale = True
+    progress = (_result_progress(record.get('run_out') or STATE.get('run_out'))
+                if running else None)
     if running and stale:
-        progress = _result_progress(record.get('run_out') or STATE.get('run_out'))
         live_done = int(live.get('done') or 0)
         done = max(live_done, int(progress['done']))
         started_at = float(record.get('started_at') or STATE.get('started_at')
@@ -512,6 +513,15 @@ def _live_state_uncached():
                 pass
         if total and done:
             live['eta'] = round(max(0, total - done) / rate, 0)
+    # Even while live.json is fresh, never let it move the browser behind rows
+    # already persisted in the current result file.  A starved live writer can
+    # resume with an older snapshot after the fallback has advanced farther.
+    if running and int(progress['done']) > int(live.get('done') or 0):
+        live['done'] = int(progress['done'])
+        live['by_status'] = progress['by_status']
+        live['recent'] = progress['recent']
+        live['total'] = max(int(live.get('total') or 0),
+                            _expected_total(record), int(progress['done']))
     live['running'] = running
     live['pid'] = int(record['pid']) if running else None
     if running:
