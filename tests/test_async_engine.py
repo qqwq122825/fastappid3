@@ -77,6 +77,18 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(200, small.refill_batch)
         self.assertEqual(50, small.low_water)
 
+    def test_bad_proxy_is_discarded_without_quarantine(self):
+        pool = IpPool('http://invalid/{num}', threads=1)
+        now = time.monotonic()
+        proxy = 'socks5h://127.0.0.1:9000'
+        first = pool._accept([proxy], now=now)
+        self.assertEqual(1, len(first))
+        self.assertEqual('discarded', pool.release(
+            0, first[0][0], first[0][1], healthy=False))
+        self.assertEqual(1, len(pool._accept([proxy], now=now + 0.1)))
+        self.assertEqual(1, pool.stats['discarded'])
+        self.assertNotIn('quarantined', pool.stats)
+
     def test_live_state_lock_uses_waiter_queue(self):
         gate = _new_state_lock()
         self.assertIsInstance(gate, threading.Semaphore)

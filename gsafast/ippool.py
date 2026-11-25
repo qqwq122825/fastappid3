@@ -22,7 +22,7 @@ class IpPool:
     def __init__(self, api, *, threads=1000, ttl=50.0, per_ip=9,
                  batch=1000, refill_interval=2.0, log=None,
                  initial_max=1000, refill_batch=None, low_water=None,
-                 lease_margin=8.0, quarantine=120.0, gateway_limit=0,
+                 lease_margin=8.0, gateway_limit=0,
                  rotate=False):
         self.api = api
         self.threads = max(1, int(threads))
@@ -44,7 +44,6 @@ class IpPool:
         self.high_water = min(self.initial_max,
                               self.low_water + self.refill_batch)
         self.lease_margin = max(1.0, min(self.ttl - 1.0, float(lease_margin)))
-        self.quarantine = max(self.ttl, float(quarantine))
         # 实测：同一入口网关（如 137.184.119.209 的 400 个端口）同时建 400 连接
         # 成功率 100%，且每个端口背后是独立出口 IP。所以网关并发不是瓶颈，
         # 0 表示不限制；需要限流时显式传正数。
@@ -58,7 +57,6 @@ class IpPool:
         self._local = {tid: collections.deque() for tid in range(self.threads)}
         self._shared = queue.SimpleQueue()      # C 实现，正常路径几乎不用
         self._seen = {}                         # proxy -> expires_at，仅用于去重/观测
-        self._bad_until = {}                    # Apple/连接失败出口隔离到期时间
         self._seen_lock = threading.Lock()
         self._gateway_active = collections.Counter()
         self._gateway_lock = threading.Lock()
@@ -73,8 +71,7 @@ class IpPool:
                       'duplicate': 0, 'expired': 0, 'discarded': 0,
                       'local_hit': 0, 'shared_hit': 0, 'blocked': 0,
                       'refill_calls': 0, 'low_water_hits': 0,
-                      'near_expiry': 0, 'quarantined': 0,
-                      'quarantine_reject': 0, 'gateway_limited': 0,
+                      'near_expiry': 0, 'gateway_limited': 0,
                       'blocked_seconds': 0.0, 'last_fetch_ms': 0.0}
 
     # ---------------------------------------------------------------- 拉取
@@ -117,12 +114,6 @@ class IpPool:
         fresh = []
         with self._seen_lock:
             for proxy in values:
-                bad_until = self._bad_until.get(proxy, 0.0)
-                if bad_until > now:
-                    self.stats['quarantine_reject'] += 1
-                    continue
-                if bad_until:
-                    self._bad_until.pop(proxy, None)
                 if proxy in self._seen and self._seen[proxy] > now:
                     self.stats['duplicate'] += 1
                     continue
@@ -328,13 +319,10 @@ class IpPool:
         if not healthy or expires_at - now <= self.lease_margin:
             self.stats['discarded'] += 1
             with self._seen_lock:
-                if not healthy:
-                    until = now + self.quarantine
-                    self._bad_until[proxy] = until
-                    self._seen[proxy] = until
-                    self.stats['quarantined'] += 1
-                else:
-                    self._seen.pop(proxy, None)
+                # Failure means immediate discard, not quarantine.  If the
+                # supplier later returns the same endpoint it is eligible
+                # again like any other fresh item.
+                self._seen.pop(proxy, None)
             return 'discarded'
         bucket = None if self.rotate else self._local.get(tid)
         if bucket is not None:
@@ -350,8 +338,6 @@ class IpPool:
         now = time.monotonic()
         with self._seen_lock:
             tracked = sum(1 for exp in self._seen.values() if exp > now)
-            quarantined_now = sum(1 for exp in self._bad_until.values()
-                                  if exp > now)
         with self._gateway_lock:
             active_gateways = dict(self._gateway_active)
         local = self._live_local()
@@ -364,7 +350,6 @@ class IpPool:
                 'low_water': self.low_water, 'high_water': self.high_water,
                 'refill_batch': self.refill_batch,
                 'lease_margin': self.lease_margin,
-                'quarantined_now': quarantined_now,
                 'gateway_limit': self.gateway_limit,
                 'gateway_active': active_gateways,
                 'supplier_alive': bool(self._thread and self._thread.is_alive()),
