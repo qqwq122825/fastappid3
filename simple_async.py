@@ -58,6 +58,8 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument('--accounts', required=True)
     ap.add_argument('--api', default=proxy_api_default())
     ap.add_argument('--device-root', default='./data/devices-simple')
+    ap.add_argument('--stagger', type=float, default=2.0,
+                    help='协程启动错峰窗口（秒）：把 N 个协程的首次建连摊到该时间窗内')
     ap.add_argument('--threads', type=int, default=200,
                     help='兼容旧参数：现在表示每进程并发协程数')
     ap.add_argument('--limit', type=int, default=0)
@@ -179,6 +181,7 @@ async def run(args) -> int:
         ip_pool.start()
         print(f'异步 IP 池预热 {warmed} 条')
 
+    assign: dict[int, str] = {}            # tid -> 入口地址（核对 1:1 分发）
     queue = asyncio.Queue()
     for row in rows:
         queue.put_nowait(row)
@@ -301,6 +304,9 @@ async def run(args) -> int:
 
     async def worker(tid: int):
         slot = args.slot_base + tid + 1
+        # 错峰启动：同时建 N 个 TCP 会被供应商 reset（实测 500→85%、1000→35%）
+        if args.stagger and concurrency > 0:
+            await asyncio.sleep((tid / max(1, concurrency)) * args.stagger)
         route = expires = None
         transport = None
         context = None
@@ -326,6 +332,7 @@ async def run(args) -> int:
             if context is None:
                 return
             state['device_in_use'].add(slot)
+            assign[tid] = route            # 记录本协程分到的入口，收尾时校验唯一性
             served = 0
             try:
                 transport = gs.AsyncGsaSession(route)
@@ -586,6 +593,10 @@ async def run(args) -> int:
         except BaseException:                                      # noqa: BLE001
             pass
 
+    if assign:
+        uniq = len(set(assign.values()))
+        print(f'IP 分发: {len(assign)} 个协程拿到 {uniq} 个唯一入口'
+              + ('  ✅ 1:1' if uniq == len(assign) else f'  ⚠ 有 {len(assign)-uniq} 个重复'))
     print(f"完成 {payload['done']}/{payload['total']} | {payload['rate']} 条/秒 | "
           f"{payload['per_hour']/10000:.1f} 万/小时 | CPU {payload['cpu_cores']} 核")
     if payload.get('worker_errors'):
