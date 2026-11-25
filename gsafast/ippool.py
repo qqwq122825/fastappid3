@@ -21,7 +21,7 @@ from urllib.parse import urlsplit
 class IpPool:
     def __init__(self, api, *, threads=1000, ttl=50.0, per_ip=9,
                  batch=1000, refill_interval=2.0, log=None,
-                 initial_max=1000, refill_batch=200, low_water=200,
+                 initial_max=1000, refill_batch=None, low_water=None,
                  lease_margin=8.0, quarantine=120.0, gateway_limit=0,
                  rotate=False):
         self.api = api
@@ -31,6 +31,14 @@ class IpPool:
         self.batch = max(1, int(batch))
         self.interval = max(0.5, float(refill_interval))
         self.initial_max = max(1, int(initial_max))
+        # A fixed 200-item refill cannot sustain 1000 workers once retries
+        # start rotating bad exits: the supplier empties faster than it can
+        # replenish and all workers sleep in acquire().  Scale both watermarks
+        # with concurrency while retaining small batches for small jobs.
+        if refill_batch is None:
+            refill_batch = min(self.initial_max, max(200, self.threads))
+        if low_water is None:
+            low_water = min(self.initial_max - 1, max(50, self.threads // 2))
         self.refill_batch = max(1, min(self.batch, int(refill_batch)))
         self.low_water = max(0, min(self.initial_max - 1, int(low_water)))
         self.high_water = min(self.initial_max,

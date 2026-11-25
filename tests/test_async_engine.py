@@ -68,6 +68,15 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((None, 0.0), pool.acquire_nowait(0))
         self.assertEqual(before, pool.stats['blocked'])
 
+    def test_ip_pool_refill_scales_with_concurrency(self):
+        large = IpPool('http://invalid/{num}', threads=1000)
+        self.assertEqual(1000, large.refill_batch)
+        self.assertEqual(500, large.low_water)
+        self.assertEqual(1000, large.high_water)
+        small = IpPool('http://invalid/{num}', threads=100)
+        self.assertEqual(200, small.refill_batch)
+        self.assertEqual(50, small.low_water)
+
     def test_live_state_lock_uses_waiter_queue(self):
         gate = _new_state_lock()
         self.assertIsInstance(gate, threading.Semaphore)
