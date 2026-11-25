@@ -199,14 +199,13 @@ def analyse_accounts(path):
 
 
 def read_live():
-    try:
-        with open(LIVE, encoding='utf-8') as handle:
-            payload = json.load(handle)
-    except (OSError, ValueError):
-        return {'error': 'live.json 还没生成，先点「开始」', 'running': is_running()}
-    payload['running'] = is_running()
-    payload['accounts'] = STATE['accounts']
-    return payload
+    """Return the same resilient state used by the controller internals.
+
+    The browser polls ``/api/live``.  Keeping a second implementation here
+    bypassed the stale-live JSONL fallback and made the page look empty while
+    the task was still producing results.
+    """
+    return live_state()
 
 
 def _path_allowed(path):
@@ -363,8 +362,9 @@ def _live_state_uncached():
         stale = True
     if running and stale:
         done = max(int(live.get('done') or 0),
-                   _result_progress(record.get('run_out')))
-        started_at = float(record.get('started_at') or time.time())
+                   _result_progress(record.get('run_out') or STATE.get('run_out')))
+        started_at = float(record.get('started_at') or STATE.get('started_at')
+                           or time.time())
         elapsed = max(float(live.get('elapsed') or 0),
                       time.time() - started_at, 0.001)
         rate = done / elapsed

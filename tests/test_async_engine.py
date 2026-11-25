@@ -172,6 +172,14 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(result['running'])
             self.assertEqual(123, result['pid'])
 
+    def test_browser_live_endpoint_uses_resilient_state(self):
+        from unittest.mock import patch
+        import web
+        expected = {'running': True, 'done': 7, 'live_fallback': True}
+        with patch.object(web, 'live_state', return_value=expected) as state:
+            self.assertIs(expected, web.read_live())
+        state.assert_called_once_with()
+
     def test_result_table_formats_duration_as_seconds(self):
         import web
         self.assertIn('耗时（秒）', web.PAGE)
