@@ -135,6 +135,13 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(1, result['total'])
             self.assertEqual('first@example.invalid', result['rows'][0]['email'])
 
+    def test_result_table_formats_duration_as_seconds(self):
+        import web
+        self.assertIn('耗时（秒）', web.PAGE)
+        self.assertEqual(2, web.PAGE.count(
+            "const seconds = r.ms == null ? '--' : (Number(r.ms) / 1000).toFixed(2);"))
+        self.assertEqual(2, web.PAGE.count('${seconds}</td>'))
+
     def test_transport_http_zero_is_classified_as_timeout(self):
         row = gsa_async._result(
             'error', 'init timeout', time.time(), kind='network', http=0)

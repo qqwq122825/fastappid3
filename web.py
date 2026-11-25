@@ -1086,7 +1086,7 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
         <table class="tbl">
           <thead><tr>
             <th style="width:52px">#</th><th>账号</th><th style="width:110px">状态</th>
-            <th style="width:80px">耗时</th><th style="width:80px">CPU</th>
+            <th style="width:80px">耗时（秒）</th><th style="width:80px">CPU</th>
             <th style="width:60px">设备</th><th style="width:70px">HTTP</th>
             <th style="width:80px">业务码</th>
             <th>原因（Apple 原文）</th>
@@ -1397,11 +1397,12 @@ function rowHtml(r, idx){
   const st = r.status || 'unknown';
   const att = (r.attempts && r.attempts > 1)
     ? ` <span class="badge b-blue" style="font-size:10px">×${r.attempts}</span>` : '';
+  const seconds = r.ms == null ? '--' : (Number(r.ms) / 1000).toFixed(2);
   return `<tr>
     <td class="mono">${idx}</td>
     <td>${(r.email||'').slice(0,32)||'--'}</td>
     <td><span class="badge ${cls(st)}">${st}</span>${att}</td>
-    <td class="mono">${r.ms ?? '--'}</td>
+    <td class="mono">${seconds}</td>
     <td class="mono">${r.cpu ?? r.thread_cpu_ms ?? '--'}</td>
     <td class="mono">${r.slot ?? '--'}</td>
     <td class="mono">${r.http ?? '--'}</td>
@@ -1446,11 +1447,12 @@ function renderRowsOld(){
     const st = r.status || 'unknown';
     const att = (r.attempts && r.attempts > 1)
       ? ` <span class="badge b-blue" style="font-size:10px">×${r.attempts}</span>` : '';
+    const seconds = r.ms == null ? '--' : (Number(r.ms) / 1000).toFixed(2);
     return `<tr>
       <td class="mono">${(d.done-rec.length+i+1)}</td>
       <td>${(r.email||'').slice(0,32)||'--'}</td>
       <td><span class="badge ${cls(st)}">${st}</span>${att}</td>
-      <td class="mono">${r.ms ?? '--'}</td>
+      <td class="mono">${seconds}</td>
       <td class="mono">${r.thread_cpu_ms ?? '--'}</td>
       <td class="mono">${r.slot ?? '--'}</td>
       <td class="mono">${r.http ?? '--'}</td>
