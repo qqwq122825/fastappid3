@@ -298,8 +298,12 @@ def test_worker_device_is_destroyed_after_completed_account_limit(tmp_path=None)
         tmp_path, origin, max_devices=2, in_memory=True, worker_use_limit=2)
     assert pool.configure_worker_slots([1], new_slot_start=2) == 1
     lease = pool.acquire_ready_worker_slot()
+    first_meta = pool.worker_slot_result_metadata(lease.slot)
+    assert first_meta == {'device_id': 'MTExMTEx', 'device_uses': 1}
     assert pool.consume_worker_slot(lease.slot) is False
     assert directory.exists()
+    final_meta = pool.worker_slot_result_metadata(lease.slot)
+    assert final_meta == {'device_id': 'MTExMTEx', 'device_uses': 2}
     assert pool.consume_worker_slot(lease.slot) is True
     assert not directory.exists()
     lease.close()

@@ -972,6 +972,9 @@ class Handler(BaseHTTPRequestHandler):
                                     'attempts': r.get('attempts'),
                                     'http': r.get('http'), 'ec': r.get('ec'),
                                     'ms': r.get('ms'), 'slot': r.get('slot'),
+                                    'device_id': r.get('device_id'),
+                                    'device_uses': r.get('device_uses'),
+                                    'device_limit': r.get('device_limit'),
                                     'cpu': r.get('thread_cpu_ms'),
                                     'detail': r.get('detail'),
                                     'web_status': r.get('web_status'),
@@ -1034,10 +1037,11 @@ class Handler(BaseHTTPRequestHandler):
             import csv as _csv, io as _io
             buf = _io.StringIO()
             w = _csv.writer(buf)
-            w.writerow(['email', 'status', 'attempts', 'http', 'ec', 'ms', 'detail'])
+            fields = ('email', 'status', 'attempts', 'http', 'ec', 'ms',
+                      'slot', 'device_id', 'device_uses', 'device_limit', 'detail')
+            w.writerow(fields)
             for r in rows:
-                w.writerow([r.get(k, '') for k in
-                            ('email', 'status', 'attempts', 'http', 'ec', 'ms', 'detail')])
+                w.writerow([r.get(k, '') for k in fields])
             out = buf.getvalue()
             ctype, name = 'text/csv; charset=utf-8', 'export.csv'
         else:
@@ -1523,11 +1527,12 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
           <thead><tr>
             <th style="width:52px">#</th><th>账号</th><th style="width:110px">状态</th>
             <th style="width:80px">耗时（秒）</th><th style="width:80px">CPU</th>
-            <th style="width:60px">设备</th><th style="width:70px">HTTP</th>
+            <th style="width:60px">设备</th><th style="width:82px">设备ID</th>
+            <th style="width:72px">使用</th><th style="width:70px">HTTP</th>
             <th style="width:80px">业务码</th><th style="width:190px">Web复核</th>
             <th>原因（Apple 原文）</th>
           </tr></thead>
-          <tbody id="rows"><tr><td colspan="9" style="text-align:center;color:#9ca3af;padding:24px">
+          <tbody id="rows"><tr><td colspan="12" style="text-align:center;color:#9ca3af;padding:24px">
             还没有结果</td></tr></tbody>
         </table>
       </div>
@@ -1965,6 +1970,11 @@ function rowHtml(r, idx){
   const att = (r.attempts && r.attempts > 1)
     ? ` <span class="badge b-blue" style="font-size:10px">×${esc(r.attempts)}</span>` : '';
   const seconds = r.ms == null ? '--' : (Number(r.ms) / 1000).toFixed(2);
+  const deviceUses = Number(r.device_uses);
+  const deviceLimit = Number(r.device_limit);
+  const deviceOver = deviceLimit > 0 && deviceUses > deviceLimit;
+  const deviceUseText = Number.isFinite(deviceUses) && deviceUses > 0
+    ? `${deviceUses}${deviceLimit > 0 ? '/'+deviceLimit : ''}` : '--';
   return `<tr>
     <td class="mono">${esc(idx)}</td>
     <td>${esc(String(r.email||'').slice(0,32)||'--')}</td>
@@ -1972,6 +1982,9 @@ function rowHtml(r, idx){
     <td class="mono">${seconds}</td>
     <td class="mono">${esc(r.cpu ?? r.thread_cpu_ms ?? '--')}</td>
     <td class="mono">${esc(r.slot ?? '--')}</td>
+    <td class="mono">${esc(r.device_id || '--')}</td>
+    <td class="mono" style="${deviceOver?'color:var(--red);font-weight:700':''}">
+      ${deviceOver?'⚠ ':''}${esc(deviceUseText)}</td>
     <td class="mono">${esc(r.http ?? '--')}</td>
     <td class="mono">${esc(r.ec ?? '--')}</td>
     <td style="font-size:11px">${webReviewHtml(r)}</td>
@@ -2003,7 +2016,7 @@ function renderRows(){
   const base = useHist ? (HIST ? HIST.rows.length : 0)
                        : ((LAST && LAST.done) || 0);
   $('rows').innerHTML = rec.length ? rec.map((r,i)=>rowHtml(r, base - i)).join('')
-    : `<tr><td colspan="10" style="text-align:center;color:#9ca3af;padding:24px">
+    : `<tr><td colspan="12" style="text-align:center;color:#9ca3af;padding:24px">
         ${useHist ? '这个分类下还没有记录' : '还没有结果'}</td></tr>`;
 }
 

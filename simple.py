@@ -1256,7 +1256,10 @@ def main():
                     # 结果只做细分，不覆盖 GSA 结论。
                     final_status = refine_repair_web_status(status, web, web_trace)
                     overridden = final_status != status
+                device_meta = pool.worker_slot_result_metadata(slot)
                 row = {'tid': tid, 'slot': slot, 'email': email,
+                       **device_meta,
+                       'device_limit': max(0, int(args.device_max_uses or 0)),
                        'raw_status': raw_status,
                        'proxy': _proxy_host(proxy),
                        'status': final_status, 'gsa_status': status,

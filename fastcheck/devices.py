@@ -372,6 +372,28 @@ class DevicePool:
             # authentication result or strand the worker lease.
             pass
 
+    def worker_slot_result_metadata(self, slot):
+        """Return the short identity tag and count for the next result row.
+
+        The worker owns this slot exclusively, so ``uses + 1`` is the count
+        that will be committed immediately after the account result is
+        written.  Only a short Base64 prefix is exposed to the dashboard.
+        """
+        value = int(slot)
+        with self._worker_slots_lock:
+            uses = self._worker_slot_uses.get(value, 0) + 1
+        tag = ''
+        try:
+            state = self.store(value).load()
+            identifier = str(state.get('identifier') or '')
+            decoded = base64.b64decode(identifier, validate=True)
+            if len(decoded) == 16:
+                tag = identifier.rstrip('=')[:8]
+        except (OSError, ValueError, KeyError, TypeError, AnisetteError,
+                PoolError, json.JSONDecodeError):
+            pass
+        return {'device_id': tag, 'device_uses': uses}
+
     def consume_worker_slot(self, slot, limit=None):
         """Count one completed account and retire the identity at its limit.
 

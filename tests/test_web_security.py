@@ -406,6 +406,13 @@ new vm.Script(input.source, {filename: 'web-inline.js'}).runInContext(context);
         self.assertIn("post('/api/clear-devices')", web.PAGE)
         self.assertIn('确定清空所有已注册设备', web.PAGE)
 
+    def test_result_rows_show_device_identity_and_usage(self):
+        self.assertIn('>设备ID</th>', web.PAGE)
+        self.assertIn('>使用</th>', web.PAGE)
+        self.assertIn("r.device_id || '--'", web.PAGE)
+        self.assertIn('deviceUses > deviceLimit', web.PAGE)
+        self.assertIn("deviceOver?'⚠ '", web.PAGE)
+
     def test_valid_results_have_summary_counter_and_filter(self):
         self.assertIn('id="sValid"', web.PAGE)
         self.assertIn('<option value="valid">密码正确</option>', web.PAGE)
