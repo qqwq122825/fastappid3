@@ -1294,6 +1294,7 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
         <div class="meta" style="display:flex;justify-content:space-between;
              padding:10px 0 2px;border-top:1px solid var(--line);font-size:12px;color:var(--dim)">
           <span id="mDevices">设备池 已注册 -- / 使用中 -- / 注册中 --</span>
+          <span id="mIpPool">IP池 库存 -- / 低水位 -- / 目标 --</span>
           <span id="mRegErr">注册换代理 --</span>
         </div>
       </div>
@@ -1614,6 +1615,22 @@ async function tick(){
     ? ' · ' + Object.entries(rk).map(([k,v]) => `${k}:${v}`).join(' ') : '';
   $('mRetry').textContent = `重试 ${num(d.retried)}${rkText}`;
   $('mDevices').textContent = `设备池 已注册 ${num(d.device_registered ?? d.device_ready)} / 使用中 ${num(d.device_in_use)} / 注册中 ${num(d.device_registering)}`;
+  const pool = d.ip_pool || {};
+  const poolAvailable = pool.available == null ? null : Number(pool.available);
+  const poolLow = pool.low_water == null ? null : Number(pool.low_water);
+  const poolHigh = pool.high_water == null ? null : Number(pool.high_water);
+  const poolState = !d.running
+    ? (d.finished ? '任务结束' : '待启动')
+    : pool.supplier_alive === false
+      ? '供应中断'
+      : poolAvailable != null && poolLow != null && poolAvailable < poolLow
+        ? '补货中' : '正常';
+  $('mIpPool').textContent = `IP池 库存 ${poolAvailable == null ? '--' : num(poolAvailable)}`
+    + ` / 低水位 ${poolLow == null ? '--' : num(poolLow)}`
+    + ` / 目标 ${poolHigh == null ? '--' : num(poolHigh)} · ${poolState}`;
+  $('mIpPool').style.color = poolState === '供应中断' ? 'var(--red)'
+    : poolState === '补货中' ? 'var(--amber)'
+    : poolState === '正常' ? 'var(--green)' : 'var(--dim)';
   const re = d.register_error_types || {};
   const reTop = Object.entries(re).sort((a,b)=>b[1]-a[1]).slice(0,2)
     .map(([k,v])=>`${k} ${num(v)}`).join(' · ');

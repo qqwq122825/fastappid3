@@ -298,6 +298,13 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
     def test_result_table_formats_duration_as_seconds(self):
         import web
         self.assertIn('耗时（秒）', web.PAGE)
+
+    def test_ip_pool_inventory_is_visible_in_progress_panel(self):
+        import web
+        self.assertIn('id="mIpPool"', web.PAGE)
+        self.assertIn('IP池 库存', web.PAGE)
+        self.assertIn("pool.available", web.PAGE)
+        self.assertIn("'补货中'", web.PAGE)
         self.assertEqual(2, web.PAGE.count(
             "const seconds = r.ms == null ? '--' : (Number(r.ms) / 1000).toFixed(2);"))
         self.assertEqual(2, web.PAGE.count('${seconds}</td>'))
