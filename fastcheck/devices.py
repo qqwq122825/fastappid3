@@ -31,6 +31,20 @@ class PoolError(Exception):
     """Safe, credential-free error for display."""
 
 
+class WorkerSlotLease:
+    """A process-local, thread-lifetime claim on one device slot."""
+
+    def __init__(self, slot, ready, pool):
+        self.slot = int(slot)
+        self.ready = bool(ready)
+        self._pool = pool
+
+    def close(self):
+        pool, self._pool = self._pool, None
+        if pool is not None:
+            pool.release_worker_slot(self.slot)
+
+
 def private_directory(path):
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     path.chmod(0o700)
@@ -150,8 +164,8 @@ class MemoryStore:
         self.backing.state = state
 
 
-def count_registered_devices(root, origin):
-    """Return the number of persisted, fully registered device identities.
+def registered_device_slots(root, origin):
+    """Return sorted persisted slot numbers with complete registration state.
 
     Device registration state is written atomically by ``StateStore``.  Reading
     the small JSON envelopes directly is much cheaper than constructing a
@@ -161,8 +175,8 @@ def count_registered_devices(root, origin):
     key = hashlib.sha256(origin.encode()).hexdigest()[:24]
     devices = Path(root) / key / "devices"
     if not devices.is_dir():
-        return 0
-    total = 0
+        return []
+    slots = []
     for path in devices.glob(f"*/{key}.json"):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -172,13 +186,23 @@ def count_registered_devices(root, origin):
             identifier = base64.b64decode(state.get("identifier", ""), validate=True)
             adi_pb = base64.b64decode(state["adi_pb"], validate=True)
             if len(identifier) == 16 and adi_pb:
-                total += 1
+                try:
+                    slot = int(path.parent.name)
+                except (TypeError, ValueError):
+                    continue
+                if slot > 0:
+                    slots.append(slot)
         except (OSError, ValueError, TypeError, KeyError):
             # A concurrently replaced, truncated, or invalid state is not a
             # registered device.  The next live refresh will count it once the
             # atomic write has completed.
             continue
-    return total
+    return sorted(set(slots))
+
+
+def count_registered_devices(root, origin):
+    """Return the number of persisted, fully registered device identities."""
+    return len(registered_device_slots(root, origin))
 
 
 @dataclass(frozen=True)
@@ -216,6 +240,13 @@ class DevicePool:
         self.in_memory = bool(in_memory)
         self._memory_states = {}
         self._memory_states_lock = threading.Lock()
+        self._worker_slots_lock = threading.Lock()
+        self._worker_slots = []
+        self._worker_slots_ready = set()
+        self._worker_slots_in_use = set()
+        self._worker_slot_uses = {}
+        self._worker_new_slot = max_devices + 1
+        self._worker_new_step = 1
 
     def slot_directory(self, slot):
         if type(slot) is not int or not 1 <= slot <= self.max_devices:
@@ -245,6 +276,75 @@ class DevicePool:
                     "device_id": str(uuid.UUID(bytes=identifier))}
         except (OSError, ValueError, KeyError, TypeError, AnisetteError):
             return {"slot": slot, "state": "invalid"}
+
+    def configure_worker_slots(self, slots, *, new_slot_start=0, new_slot_step=1):
+        """Load only this process's assigned devices into its memory pool."""
+        assigned = sorted({int(slot) for slot in slots if int(slot) > 0})
+        step = max(1, int(new_slot_step or 1))
+        start = int(new_slot_start or 0)
+        if start <= 0:
+            start = max(assigned or [self.max_devices]) + 1
+        with self._worker_slots_lock:
+            self._worker_slots = assigned
+            self._worker_slots_ready.clear()
+            self._worker_slots_in_use.clear()
+            self._worker_slot_uses = {slot: 0 for slot in assigned}
+            self._worker_new_slot = start
+            self._worker_new_step = step
+            self.max_devices = max(self.max_devices, start, *(assigned or [1]))
+        # Preload registration state once.  No other process owns these slots,
+        # so the in-memory copy remains authoritative for this process.
+        ready = []
+        for slot in assigned:
+            if self.inspect(slot).get("state") == "ready":
+                ready.append(slot)
+        with self._worker_slots_lock:
+            self._worker_slots = ready
+            self._worker_slots_ready = set(ready)
+        return len(ready)
+
+    def acquire_ready_worker_slot(self):
+        """Lease the least-used idle *registered* local device, if available."""
+        with self._worker_slots_lock:
+            idle = [slot for slot in self._worker_slots_ready
+                    if slot not in self._worker_slots_in_use]
+            if not idle:
+                return None
+            least = min(self._worker_slot_uses.get(slot, 0) for slot in idle)
+            slot = random.choice([
+                value for value in idle
+                if self._worker_slot_uses.get(value, 0) == least])
+            self._worker_slots_in_use.add(slot)
+            self._worker_slot_uses[slot] = self._worker_slot_uses.get(slot, 0) + 1
+        return WorkerSlotLease(slot, True, self)
+
+    def reserve_new_worker_slot(self):
+        """Reserve one unregistered slot for a bounded registration worker."""
+        with self._worker_slots_lock:
+            slot = self._worker_new_slot
+            self._worker_new_slot += self._worker_new_step
+            self.max_devices = max(self.max_devices, slot)
+            self._worker_slots.append(slot)
+            self._worker_slot_uses[slot] = 1
+            self._worker_slots_in_use.add(slot)
+        return WorkerSlotLease(slot, False, self)
+
+    def mark_worker_slot_ready(self, slot):
+        """Publish a newly registered slot to waiters in this process."""
+        value = int(slot)
+        with self._worker_slots_lock:
+            if value not in self._worker_slots:
+                self._worker_slots.append(value)
+            self._worker_slots_ready.add(value)
+
+    def acquire_worker_slot(self, preferred=1):
+        """Compatibility wrapper: ready device first, otherwise a new slot."""
+        lease = self.acquire_ready_worker_slot()
+        return lease if lease is not None else self.reserve_new_worker_slot()
+
+    def release_worker_slot(self, slot):
+        with self._worker_slots_lock:
+            self._worker_slots_in_use.discard(int(slot))
 
     def health(self):
         with file_lease(self.base / ".health.lock", wait=2):

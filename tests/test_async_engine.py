@@ -242,6 +242,65 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(1, result['total'])
             self.assertEqual('first@example.invalid', result['rows'][0]['email'])
 
+    def test_need_mac_is_grouped_into_other_results(self):
+        from pathlib import Path
+        from unittest.mock import patch
+        import web
+        with tempfile.TemporaryDirectory() as directory:
+            result_file = Path(directory) / 'run.jsonl'
+            result_file.write_text(json.dumps({
+                'email': 'device@example.invalid',
+                'status': 'need_mac',
+                'detail': 'fixture'}) + '\n', encoding='utf-8')
+            state = dict(web.STATE, run_out=str(result_file), started_at=1)
+            with patch.object(web, 'STATE', state):
+                result = object.__new__(web.Handler)._results('other', 100)
+            self.assertEqual(1, result['total'])
+            self.assertEqual('need_mac', result['rows'][0]['status'])
+
+    def test_filtered_results_preserve_web_review_fields(self):
+        from pathlib import Path
+        from unittest.mock import patch
+        import web
+        with tempfile.TemporaryDirectory() as directory:
+            result_file = Path(directory) / 'run.jsonl'
+            result_file.write_text(json.dumps({
+                'email': 'repair@example.invalid', 'status': 'need_2fa',
+                'detail': 'au=repair', 'web_status': 'web_timeout',
+                'web_ec': None, 'web_detail': 'fixture review',
+                'web_method': 'repair_unspecified', 'web_auth_type': 'hsa2',
+                'web_attempts': 2, 'web_proxy_rotations': 1,
+                'web_rotation_exhausted': False, 'web_ms': 1234.5}) + '\n',
+                encoding='utf-8')
+            state = dict(web.STATE, run_out=str(result_file), started_at=1)
+            with patch.object(web, 'STATE', state):
+                result = object.__new__(web.Handler)._results('need_2fa', 100)
+            row = result['rows'][0]
+            self.assertEqual('web_timeout', row['web_status'])
+            self.assertEqual('fixture review', row['web_detail'])
+            self.assertEqual('repair_unspecified', row['web_method'])
+            self.assertEqual('hsa2', row['web_auth_type'])
+            self.assertEqual(2, row['web_attempts'])
+            self.assertEqual(1, row['web_proxy_rotations'])
+            self.assertEqual(1234.5, row['web_ms'])
+
+    def test_result_search_scans_current_run_by_account(self):
+        from pathlib import Path
+        from unittest.mock import patch
+        import web
+        with tempfile.TemporaryDirectory() as directory:
+            result_file = Path(directory) / 'run.jsonl'
+            result_file.write_text('\n'.join((
+                json.dumps({'email':'alpha@example.com','status':'locked'}),
+                json.dumps({'email':'Needle.User@example.com','status':'wrong_password'}),
+            )) + '\n', encoding='utf-8')
+            state = dict(web.STATE, run_out=str(result_file), started_at=1)
+            with patch.object(web, 'STATE', state):
+                result = object.__new__(web.Handler)._results('all', 100, 'needle.user')
+            self.assertEqual(1, result['total'])
+            self.assertEqual('Needle.User@example.com', result['rows'][0]['email'])
+            self.assertEqual('needle.user', result['query'])
+
     def test_stale_live_state_uses_incremental_result_progress(self):
         from pathlib import Path
         from unittest.mock import patch
@@ -328,10 +387,37 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('id="mIpPool"', web.PAGE)
         self.assertIn('IP池 库存', web.PAGE)
         self.assertIn("pool.available", web.PAGE)
+        self.assertIn('pool.by_process', web.PAGE)
+        self.assertIn('`P${p.process} `', web.PAGE)
+        self.assertIn('· 合计 ', web.PAGE)
         self.assertIn("'补货中'", web.PAGE)
         self.assertEqual(2, web.PAGE.count(
             "const seconds = r.ms == null ? '--' : (Number(r.ms) / 1000).toFixed(2);"))
         self.assertEqual(2, web.PAGE.count('${seconds}</td>'))
+
+    def test_result_search_control_queries_backend(self):
+        import web
+        self.assertIn('id="resultSearch"', web.PAGE)
+        self.assertIn('placeholder="搜索账号"', web.PAGE)
+        self.assertIn('&query=${encodeURIComponent(query)}', web.PAGE)
+
+    def test_web_fills_old_multiprocess_ip_pool_from_child_live_files(self):
+        from pathlib import Path
+        import web
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for index, available in enumerate((500, 480)):
+                (root / f'live-p{index}.json').write_text(json.dumps({
+                    'ip_pool': {'available': available, 'low_water': 250,
+                                'high_water': 750, 'supplier_alive': True},
+                }), encoding='utf-8')
+            value = web._multiprocess_ip_pool(
+                {'processes': 2, 'ip_pool': {'processes': 2}}, directory)
+            self.assertEqual(980, value['ip_pool']['available'])
+            self.assertEqual(500, value['ip_pool']['low_water'])
+            self.assertEqual(1500, value['ip_pool']['high_water'])
+            self.assertEqual([500, 480], [
+                row['available'] for row in value['ip_pool']['by_process']])
 
     def test_transport_http_zero_is_classified_as_timeout(self):
         row = gsa_async._result(

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import collections
 import gzip
+import hashlib
 import json
 import os
 import re
@@ -516,6 +517,47 @@ def live_state():
     return data
 
 
+def _multiprocess_ip_pool(live, data_dir=None):
+    """为旧版 run_mp 汇总补齐每个子进程的 IP 池快照。"""
+    live = dict(live) if isinstance(live, dict) else {}
+    processes = max(1, int(live.get('processes') or 1))
+    if processes <= 1:
+        return live
+    pool = dict(live.get('ip_pool') or {})
+    rows = pool.get('by_process')
+    if not isinstance(rows, list) or len(rows) < processes:
+        rows = []
+        directory = data_dir or os.path.join(HERE, 'data')
+        for index in range(processes):
+            try:
+                with open(os.path.join(directory, f'live-p{index}.json'),
+                          encoding='utf-8') as handle:
+                    payload = json.load(handle)
+                child = payload.get('ip_pool') or {}
+            except (OSError, ValueError, AttributeError):
+                child = {}
+            rows.append({
+                'process': index + 1,
+                'available': child.get('available'),
+                'low_water': child.get('low_water'),
+                'high_water': child.get('high_water'),
+                'supplier_alive': child.get('supplier_alive'),
+                'api_calls': child.get('api_calls') or 0,
+                'fetched': child.get('fetched') or 0,
+                'blocked': child.get('blocked') or 0,
+            })
+    for key in ('available', 'low_water', 'high_water'):
+        values = [int(row[key]) for row in rows if row.get(key) is not None]
+        pool[key] = sum(values) if values else None
+    states = [bool(row['supplier_alive']) for row in rows
+              if row.get('supplier_alive') is not None]
+    pool['supplier_alive'] = all(states) if states else None
+    pool['processes'] = processes
+    pool['by_process'] = rows
+    live['ip_pool'] = pool
+    return live
+
+
 def _live_state_uncached():
     record = _active_task_record()
     running = record is not None
@@ -570,6 +612,7 @@ def _live_state_uncached():
         live['recent'] = progress['recent']
         live['total'] = max(int(live.get('total') or 0),
                             _expected_total(record), int(progress['done']))
+    live = _multiprocess_ip_pool(live)
     live['running'] = running
     live['pid'] = int(record['pid']) if running else None
     if running:
@@ -698,17 +741,44 @@ def clear_devices():
     if os.path.islink(DEVICE_ROOT):
         return {'error': '设备目录是符号链接，已拒绝清空'}
     if not os.path.exists(root):
-        return {'ok': True, 'cleared': 0}
-    from fastcheck.devices import count_registered_devices
-    cleared = count_registered_devices(root, DEVICE_ORIGIN)
+        cleared = 0
+        _clear_live_device_counts()
+        return {'ok': True, 'cleared': cleared}
+    # Keep this maintenance endpoint independent from worker-only packages:
+    # the web interpreter may not have portalocker installed.  Counting slot
+    # directories is sufficient because the whole project-owned pool is
+    # removed immediately afterwards.
+    key = hashlib.sha256(DEVICE_ORIGIN.encode()).hexdigest()[:24]
+    devices = os.path.join(root, key, 'devices')
+    try:
+        cleared = sum(1 for entry in os.scandir(devices) if entry.is_dir())
+    except OSError:
+        cleared = 0
     tombstone = f'{root}.clearing-{os.getpid()}-{time.time_ns()}'
     os.replace(root, tombstone)
     try:
         shutil.rmtree(tombstone)
     except OSError as exc:
         return {'error': f'设备目录已移出，但清理失败：{type(exc).__name__}'}
-    _LIVE_CACHE.update(at=0.0, data=None)
+    _clear_live_device_counts()
     return {'ok': True, 'cleared': cleared}
+
+
+def _clear_live_device_counts():
+    """Keep an idle dashboard consistent with the pool removed on disk."""
+    try:
+        with open(LIVE, encoding='utf-8') as handle:
+            live = json.load(handle)
+        if isinstance(live, dict):
+            live.update(device_registered=0, device_ready=0,
+                        device_in_use=0, device_registering=0)
+            tmp = LIVE + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as handle:
+                json.dump(live, handle, ensure_ascii=False)
+            os.replace(tmp, LIVE)
+    except (OSError, ValueError, TypeError):
+        pass
+    _LIVE_CACHE.update(at=0.0, data=None)
 
 
 def stop_job():
@@ -805,7 +875,8 @@ class Handler(BaseHTTPRequestHandler):
             q = parse_qs(urlparse(self.path).query)
             return self._json(self._results(
                 (q.get('status') or ['all'])[0],
-                int((q.get('limit') or ['60'])[0] or 60)))
+                int((q.get('limit') or ['60'])[0] or 60),
+                (q.get('query') or [''])[0]))
         if self.path.startswith('/api/export'):
             from urllib.parse import urlparse, parse_qs
             q = parse_qs(urlparse(self.path).query)
@@ -835,7 +906,7 @@ class Handler(BaseHTTPRequestHandler):
                                'log_tail': tail_log()})
         self._send(PAGE.encode('utf-8'), 'text/html; charset=utf-8')
 
-    def _results(self, want, limit=60):
+    def _results(self, want, limit=60, query=''):
         """按状态查**当前任务**的结果。
 
         jsonl 是追加写的，历史批次都堆在同一个文件里；如果不过滤，
@@ -845,6 +916,7 @@ class Handler(BaseHTTPRequestHandler):
         import glob as _glob
         limit = max(1, min(500, int(limit)))
         want = (want or 'all').strip()
+        query = str(query or '').strip()[:128].casefold()
         cutoff = STATE.get('started_at') or 0
         own = STATE.get('run_out') or ''
         if own and os.path.exists(own):
@@ -880,27 +952,39 @@ class Handler(BaseHTTPRequestHandler):
                         except ValueError:
                             continue
                         st = str(r.get('status') or '')
+                        email = str(r.get('email') or '')
+                        if query and query not in email.casefold():
+                            continue
                         if want == 'other':
-                            if st not in ('undetermined', 'error'):
+                            if st not in ('undetermined', 'error', 'need_mac'):
                                 continue
                         elif want not in ('', 'all') and st != want:
                             continue
-                        key = (r.get('email'), st)
+                        key = (email, st)
                         if key in seen:
                             continue
                         seen.add(key)
                         total += 1
-                        out.append({'email': r.get('email'), 'status': st,
+                        out.append({'email': email, 'status': st,
                                     'attempts': r.get('attempts'),
                                     'http': r.get('http'), 'ec': r.get('ec'),
                                     'ms': r.get('ms'), 'slot': r.get('slot'),
                                     'cpu': r.get('thread_cpu_ms'),
-                                    'detail': r.get('detail')})
+                                    'detail': r.get('detail'),
+                                    'web_status': r.get('web_status'),
+                                    'web_ec': r.get('web_ec'),
+                                    'web_detail': r.get('web_detail'),
+                                    'web_method': r.get('web_method'),
+                                    'web_auth_type': r.get('web_auth_type'),
+                                    'web_attempts': r.get('web_attempts'),
+                                    'web_proxy_rotations': r.get('web_proxy_rotations'),
+                                    'web_rotation_exhausted': r.get('web_rotation_exhausted'),
+                                    'web_ms': r.get('web_ms')})
         rows = list(reversed(out))          # 新的在前
         scoped = bool(own and os.path.exists(own)) or bool(cutoff)
         return {'total': total if scoped else 0,
                 'rows': rows if scoped else [],
-                'status': want, 'scoped': scoped}
+                'status': want, 'query': query, 'scoped': scoped}
 
     def _export(self, want, fmt):
         """按状态筛选导出账号。只保留 邮箱----密码 两列，不带其他信息。
@@ -934,7 +1018,7 @@ class Handler(BaseHTTPRequestHandler):
                             continue
                         st = str(r.get('status') or '')
                         if want == 'other':
-                            if st not in ('undetermined', 'error'):
+                            if st not in ('undetermined', 'error', 'need_mac'):
                                 continue
                         elif want and want != 'all' and st != want:
                             continue
@@ -1370,10 +1454,10 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
           <div class="stat"><div class="k">完成</div><div class="v v-blue" id="sDone">0</div></div>
           <div class="stat"><div class="k">剩余</div><div class="v" id="sLeft">0</div></div>
           <div class="stat"><div class="k">当前速度</div><div class="v sm v-green" id="sRate">0</div></div>
+          <div class="stat"><div class="k">密码正确</div><div class="v v-green" id="sValid">0</div></div>
           <div class="stat"><div class="k">密码错误</div><div class="v v-red" id="sWrong">0</div></div>
           <div class="stat"><div class="k">锁定</div><div class="v v-amber" id="sLock">0</div></div>
           <div class="stat"><div class="k">双重验证</div><div class="v" id="s2fa">0</div></div>
-          <div class="stat"><div class="k">需要真机</div><div class="v v-amber" id="sMac">0</div></div>
           <div class="stat"><div class="k">不存在</div><div class="v" id="sNF">0</div></div>
           <div class="stat"><div class="k">超时</div><div class="v v-gray" id="sTO">0</div></div>
           <div class="stat"><div class="k">其他</div><div class="v v-gray" id="sOther">0</div></div>
@@ -1408,12 +1492,14 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
     <div class="panel">
       <div class="hd"><b>最近结果</b>
         <span style="display:flex;gap:8px;align-items:center">
+          <input id="resultSearch" type="search" placeholder="搜索账号"
+            autocomplete="off" style="width:180px;padding:5px 9px;font-size:12px">
           <select id="filter" style="width:auto;padding:5px 9px;font-size:12px">
             <option value="all">全部结果</option>
+            <option value="valid">密码正确</option>
             <option value="wrong_password">密码错误</option>
             <option value="locked">锁定</option>
             <option value="need_2fa">双重验证</option>
-            <option value="need_mac">需要真机</option>
             <option value="not_found">不存在</option>
             <option value="timeout">超时</option>
             <option value="other">其他（未归类 + 错误）</option>
@@ -1429,7 +1515,7 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
             <th style="width:52px">#</th><th>账号</th><th style="width:110px">状态</th>
             <th style="width:80px">耗时（秒）</th><th style="width:80px">CPU</th>
             <th style="width:60px">设备</th><th style="width:70px">HTTP</th>
-            <th style="width:80px">业务码</th>
+            <th style="width:80px">业务码</th><th style="width:190px">Web复核</th>
             <th>原因（Apple 原文）</th>
           </tr></thead>
           <tbody id="rows"><tr><td colspan="9" style="text-align:center;color:#9ca3af;padding:24px">
@@ -1460,6 +1546,35 @@ const cls = s => !s ? 'b-gray'
   : ['wrong_password','not_found'].includes(s) ? 'b-red'
   : ['locked','security_lock','need_2fa','need_mac'].includes(s) ? 'b-amber'
   : ['timeout'].includes(s) ? 'b-gray' : 'b-blue';
+const statusLabel = s => ({valid:'密码正确'})[s] || s;
+const webStatusLabel = s => ({
+  valid:'密码正确',
+  security_lock:'锁定', wrong_password:'密码错误', not_found:'不存在',
+  need_2fa:'双重验证', needs_setup:'安全设置',
+  web_unavailable:'复核不可用', web_timeout:'复核超时', web_error:'复核异常'
+})[s] || s;
+const webMethodLabel = s => ({
+  verification_code:'验证码', security_repair:'安全修复',
+  repair_unspecified:'仍无法细分'
+})[s] || s;
+
+function webReviewHtml(r){
+  if(r.web_status){
+    const parts = [webStatusLabel(r.web_status)];
+    if(r.web_method) parts.push(webMethodLabel(r.web_method));
+    if(r.web_auth_type) parts.push(`authType=${r.web_auth_type}`);
+    if(Number(r.web_proxy_rotations||0)>0) parts.push(`换IP ${r.web_proxy_rotations}`);
+    if(r.web_rotation_exhausted) parts.push('无可用新IP');
+    if(r.web_ec != null) parts.push(`EC ${r.web_ec}`);
+    if(r.web_ms) parts.push(`${(Number(r.web_ms)/1000).toFixed(2)}s`);
+    const detail = String(r.web_detail||'');
+    return `<span class="badge ${cls(r.web_status)}" title="${esc(detail)}">${esc(parts.join(' · '))}</span>`;
+  }
+  if((r.status||'') === 'need_2fa'){
+    return `<span style="color:#9ca3af" title="仅 au=repair 需要 Web 复核">无需复核</span>`;
+  }
+  return '<span style="color:#d1d5db">--</span>';
+}
 
 let shownAccounts = null;
 
@@ -1628,6 +1743,7 @@ async function start(){
 function resetResultsForNewTask(total){
   HIST = null;
   $('filter').value = 'all';
+  $('resultSearch').value = '';
   $('tblHint').textContent = '实时刷新';
   LAST = {running:true, finished:false, total:Number(total)||0, done:0, recent:[]};
   renderRows();
@@ -1692,8 +1808,19 @@ $('expTxt').onclick = () => exportAs('txt');
 $('expCsv').onclick = () => exportAs('csv');
 $('filter').onchange = () => {
   const want = $('filter').value;
-  if(want && want !== 'all'){ loadHistory(want); }
+  const query = $('resultSearch').value.trim();
+  if((want && want !== 'all') || query){ loadHistory(want); }
   else { HIST = null; $('tblHint').textContent = '实时刷新'; renderRows(); }
+};
+let SEARCH_TIMER = null;
+$('resultSearch').oninput = () => {
+  clearTimeout(SEARCH_TIMER);
+  SEARCH_TIMER = setTimeout(() => {
+    const want = $('filter').value;
+    const query = $('resultSearch').value.trim();
+    if(query || (want && want !== 'all')) loadHistory(want);
+    else { HIST = null; $('tblHint').textContent = '实时刷新'; renderRows(); }
+  }, 250);
 };
 
 /* ---- 主循环 ---- */
@@ -1719,11 +1846,11 @@ async function tick(){
   setStat('sTotal', total); setStat('sDone', done);
   setStat('sLeft', Math.max(0, total-done));
   $('sRate').textContent = (d.rate||0).toFixed(1);
+  setStat('sValid', by.valid);
   setStat('sWrong', by.wrong_password); setStat('sLock', by.locked);
   setStat('s2fa', by.need_2fa); setStat('sNF', by.not_found);
-  setStat('sMac', by.need_mac);
   setStat('sTO', by.timeout);
-  setStat('sOther', (by.undetermined||0)+(by.error||0));
+  setStat('sOther', (by.undetermined||0)+(by.error||0)+(by.need_mac||0));
 
   const pct = total ? done/total*100 : 0;
   $('bar').style.width = pct.toFixed(1)+'%';
@@ -1761,15 +1888,28 @@ async function tick(){
   const poolAvailable = pool.available == null ? null : Number(pool.available);
   const poolLow = pool.low_water == null ? null : Number(pool.low_water);
   const poolHigh = pool.high_water == null ? null : Number(pool.high_water);
-  const poolState = !d.running
+  const poolStateFor = p => !d.running
     ? (d.finished ? '任务结束' : '待启动')
-    : pool.supplier_alive === false
+    : p.supplier_alive === false
       ? '供应中断'
-      : poolAvailable != null && poolLow != null && poolAvailable < poolLow
-        ? '补货中' : '正常';
-  $('mIpPool').textContent = `IP池 库存 ${poolAvailable == null ? '--' : num(poolAvailable)}`
-    + ` / 低水位 ${poolLow == null ? '--' : num(poolLow)}`
-    + ` / 目标 ${poolHigh == null ? '--' : num(poolHigh)} · ${poolState}`;
+      : p.available != null && p.low_water != null && Number(p.available) < Number(p.low_water)
+        ? '补货中' : p.available == null ? '等待' : '正常';
+  const poolState = poolStateFor(pool);
+  const processPools = Array.isArray(pool.by_process) ? pool.by_process : [];
+  if(processPools.length > 1){
+    const perProcess = processPools.map(p => `P${p.process} `
+      + `${p.available == null ? '--' : num(p.available)}`
+      + `/${p.low_water == null ? '--' : num(p.low_water)}`
+      + `/${p.high_water == null ? '--' : num(p.high_water)} ${poolStateFor(p)}`).join(' · ');
+    $('mIpPool').textContent = `IP池 ${perProcess} · 合计 `
+      + `${poolAvailable == null ? '--' : num(poolAvailable)}`
+      + `/${poolLow == null ? '--' : num(poolLow)}`
+      + `/${poolHigh == null ? '--' : num(poolHigh)}`;
+  }else{
+    $('mIpPool').textContent = `IP池 库存 ${poolAvailable == null ? '--' : num(poolAvailable)}`
+      + ` / 低水位 ${poolLow == null ? '--' : num(poolLow)}`
+      + ` / 目标 ${poolHigh == null ? '--' : num(poolHigh)} · ${poolState}`;
+  }
   $('mIpPool').style.color = poolState === '供应中断' ? 'var(--red)'
     : poolState === '补货中' ? 'var(--amber)'
     : poolState === '正常' ? 'var(--green)' : 'var(--dim)';
@@ -1795,7 +1935,8 @@ async function tick(){
 
   LAST = d;
   const want = $('filter').value;
-  if(!want || want === 'all') renderRows();   // 看历史时不被实时流覆盖
+  const query = $('resultSearch').value.trim();
+  if((!want || want === 'all') && !query) renderRows(); // 查询时不被实时流覆盖
   else if(!HIST) renderRows();
 
   if(d.accounts && d.accounts !== shownAccounts){
@@ -1807,6 +1948,7 @@ async function tick(){
 let LAST = null;
 let HIST = null;          // 筛选时从 /api/results 拿的历史结果
 let TICK_RUNNING = false; // 慢请求时不叠加轮询，避免页面突然卡顿
+let HIST_SEQ = 0;
 
 function rowHtml(r, idx){
   const st = r.status || 'unknown';
@@ -1816,12 +1958,13 @@ function rowHtml(r, idx){
   return `<tr>
     <td class="mono">${esc(idx)}</td>
     <td>${esc(String(r.email||'').slice(0,32)||'--')}</td>
-    <td><span class="badge ${cls(st)}">${esc(st)}</span>${att}</td>
+    <td><span class="badge ${cls(st)}">${esc(statusLabel(st))}</span>${att}</td>
     <td class="mono">${seconds}</td>
     <td class="mono">${esc(r.cpu ?? r.thread_cpu_ms ?? '--')}</td>
     <td class="mono">${esc(r.slot ?? '--')}</td>
     <td class="mono">${esc(r.http ?? '--')}</td>
     <td class="mono">${esc(r.ec ?? '--')}</td>
+    <td style="font-size:11px">${webReviewHtml(r)}</td>
     <td style="color:#6b7280;font-size:11.5px;max-width:340px;overflow:hidden;
         text-overflow:ellipsis" title="${esc(r.detail||'')}">
       ${esc(String(r.detail||'--').slice(0,64))}</td>
@@ -1829,9 +1972,12 @@ function rowHtml(r, idx){
 }
 
 async function loadHistory(want){
+  const seq = ++HIST_SEQ;
+  const query = $('resultSearch').value.trim();
   $('tblHint').textContent = '查询中…';
   try{
-    const r = await (await fetch(`/api/results?status=${encodeURIComponent(want)}&limit=100`)).json();
+    const r = await (await fetch(`/api/results?status=${encodeURIComponent(want)}&limit=100&query=${encodeURIComponent(query)}`)).json();
+    if(seq !== HIST_SEQ) return;
     HIST = r;
     $('tblHint').textContent = `当前任务共 ${num(r.total)} 条符合条件`;
   }catch(e){ HIST = null; $('tblHint').textContent = '查询失败'; }
@@ -1840,13 +1986,14 @@ async function loadHistory(want){
 
 function renderRows(){
   const want = $('filter').value;
-  const useHist = want && want !== 'all';
+  const query = $('resultSearch').value.trim();
+  const useHist = Boolean(query || (want && want !== 'all'));
   const rec = useHist ? ((HIST && HIST.rows) || [])
                       : ((LAST && LAST.recent) || []).slice().reverse();
   const base = useHist ? (HIST ? HIST.rows.length : 0)
                        : ((LAST && LAST.done) || 0);
   $('rows').innerHTML = rec.length ? rec.map((r,i)=>rowHtml(r, base - i)).join('')
-    : `<tr><td colspan="9" style="text-align:center;color:#9ca3af;padding:24px">
+    : `<tr><td colspan="10" style="text-align:center;color:#9ca3af;padding:24px">
         ${useHist ? '这个分类下还没有记录' : '还没有结果'}</td></tr>`;
 }
 
@@ -1856,7 +2003,7 @@ function renderRowsOld(){
   const want = $('filter').value;
   let rec = (d.recent||[]).slice().reverse();
   if(want === 'other') rec = rec.filter(r =>
-    ['undetermined','error'].includes(r.status||''));
+    ['undetermined','error','need_mac'].includes(r.status||''));
   else if(want && want !== 'all') rec = rec.filter(r => (r.status||'') === want);
   $('rows').innerHTML = rec.length ? rec.map((r,i)=>{
     const st = r.status || 'unknown';
@@ -1866,17 +2013,18 @@ function renderRowsOld(){
     return `<tr>
       <td class="mono">${esc(d.done-rec.length+i+1)}</td>
       <td>${esc(String(r.email||'').slice(0,32)||'--')}</td>
-      <td><span class="badge ${cls(st)}">${esc(st)}</span>${att}</td>
+      <td><span class="badge ${cls(st)}">${esc(statusLabel(st))}</span>${att}</td>
       <td class="mono">${seconds}</td>
       <td class="mono">${esc(r.thread_cpu_ms ?? '--')}</td>
       <td class="mono">${esc(r.slot ?? '--')}</td>
       <td class="mono">${esc(r.http ?? '--')}</td>
       <td class="mono">${esc(r.ec ?? '--')}</td>
+      <td style="font-size:11px">${webReviewHtml(r)}</td>
       <td style="color:#6b7280;font-size:11.5px;max-width:340px;overflow:hidden;
           text-overflow:ellipsis" title="${esc(r.detail||'')}">
         ${esc(String(r.detail||'--').slice(0,64))}</td>
     </tr>`;
-  }).join('') : `<tr><td colspan="9" style="text-align:center;color:#9ca3af;padding:24px">
+  }).join('') : `<tr><td colspan="10" style="text-align:center;color:#9ca3af;padding:24px">
     ${want === 'all' ? '还没有结果' : '这个分类下没有结果'}</td></tr>`;
 }
 

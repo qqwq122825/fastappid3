@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import io
 import json
 import os
@@ -212,6 +213,29 @@ class ConsoleRequestTests(unittest.TestCase):
             self.assertFalse(os.path.exists(root))
             self.assertTrue(os.path.exists(keep))
 
+    def test_clear_devices_works_without_worker_dependencies_and_resets_live_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = os.path.join(directory, 'data')
+            root = os.path.join(data, 'devices-simple')
+            live = os.path.join(data, 'live.json')
+            key = hashlib.sha256(web.DEVICE_ORIGIN.encode()).hexdigest()[:24]
+            for slot in ('01', '02', '03'):
+                os.makedirs(os.path.join(root, key, 'devices', slot))
+            with open(live, 'w', encoding='utf-8') as handle:
+                json.dump({'finished': True, 'device_registered': 3000,
+                           'device_ready': 3000}, handle)
+            with patch.object(web, 'HERE', directory), \
+                 patch.object(web, 'LIVE', live), \
+                 patch.object(web, 'DEVICE_ROOT', root), \
+                 patch.object(web, 'is_running', return_value=False):
+                response = web.clear_devices()
+            self.assertEqual(3, response['cleared'])
+            self.assertFalse(os.path.exists(root))
+            with open(live, encoding='utf-8') as handle:
+                state = json.load(handle)
+            self.assertEqual(0, state['device_registered'])
+            self.assertEqual(0, state['device_ready'])
+
     def test_clear_devices_refuses_while_task_is_running(self):
         with tempfile.TemporaryDirectory() as directory, \
              patch.object(web, 'HERE', directory), \
@@ -377,6 +401,25 @@ new vm.Script(input.source, {filename: 'web-inline.js'}).runInContext(context);
         self.assertIn('class="task-actions"', web.PAGE)
         self.assertIn("post('/api/clear-devices')", web.PAGE)
         self.assertIn('确定清空所有已注册设备', web.PAGE)
+
+    def test_valid_results_have_summary_counter_and_filter(self):
+        self.assertIn('id="sValid"', web.PAGE)
+        self.assertIn('<option value="valid">密码正确</option>', web.PAGE)
+        self.assertIn("setStat('sValid', by.valid)", web.PAGE)
+        self.assertIn("valid:'密码正确'", web.PAGE)
+        self.assertNotIn('id="sMac"', web.PAGE)
+        self.assertNotIn('<option value="need_mac">需要真机</option>', web.PAGE)
+        self.assertIn('(by.need_mac||0)', web.PAGE)
+
+    def test_web_review_result_has_visible_column_and_labels(self):
+        self.assertIn('>Web复核</th>', web.PAGE)
+        self.assertIn('function webReviewHtml(r)', web.PAGE)
+        self.assertIn("web_timeout:'复核超时'", web.PAGE)
+        self.assertIn("repair_unspecified:'仍无法细分'", web.PAGE)
+        self.assertIn('authType=${r.web_auth_type}', web.PAGE)
+        self.assertIn('`\u6362IP ${r.web_proxy_rotations}`', web.PAGE)
+        self.assertIn("need_2fa:'双重验证'", web.PAGE)
+        self.assertIn('仅 au=repair 需要 Web 复核', web.PAGE)
 
 
 if __name__ == '__main__':

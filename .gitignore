@@ -15,3 +15,7 @@ __pycache__/
 
 # 打包产物
 *.tar.gz
+
+# 本地密钥（历史中如曾提交真实值，仍需在供应商处轮换）
+secrets.json
+**/secrets.json

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""多进程调度：把账号和设备槽位切开，起 N 个线程工作子进程，汇总 live.json。
+"""多进程调度：切分账号并共享持久设备池，起 N 个线程进程，汇总 live.json。
 
 每个子进程使用简单线程处理网络请求和 SRP/PBKDF2 计算。
 
@@ -25,6 +25,7 @@ if os.path.isdir(os.path.join(HERE, 'fastcheck')):
     sys.path.insert(0, HERE)
 from simple import (histogram_median, histogram_value_at,
                     proxy_api_default)      # noqa: E402  凭据统一从 secrets/env 读
+from fastcheck.devices import registered_device_slots  # noqa: E402
 PYTHON = os.path.join(HERE, '.venv', 'bin', 'python')
 DATA = os.path.join(HERE, 'data')
 LIVE = os.path.join(DATA, 'live.json')
@@ -64,6 +65,18 @@ def build_jobs(args, total):
     return jobs
 
 
+def assign_device_slots(jobs, persisted_slots, slot_base=0):
+    """Evenly assign persisted devices and disjoint new-slot sequences."""
+    slots = sorted({int(slot) for slot in persisted_slots if int(slot) > 0})
+    owner_count = max(1, len(jobs))
+    first_new_slot = max(slots or [int(slot_base or 0)]) + 1
+    for owner, job in enumerate(jobs):
+        job['device_slots'] = slots[owner::owner_count]
+        job['new_slot_start'] = first_new_slot + owner
+        job['new_slot_step'] = owner_count
+    return jobs
+
+
 def spawn(args, jobs):
     procs = []
     for job in jobs:
@@ -73,6 +86,10 @@ def spawn(args, jobs):
                '--offset', str(job['offset']),
                '--limit', str(job['limit']),
                '--slot-base', str(job['slot_base']),
+               '--device-root', args.device_root,
+               '--device-slots', (','.join(map(str, job['device_slots'])) or '-'),
+               '--new-slot-start', str(job['new_slot_start']),
+               '--new-slot-step', str(job['new_slot_step']),
                '--per-ip', str(args.per_ip),
                '--otp-reuse', str(args.otp_reuse),
                '--retry', str(args.retry),
@@ -97,7 +114,8 @@ def spawn(args, jobs):
         job['proc'] = proc
         procs.append(job)
         print(f'  进程 {job["index"]}: offset={job["offset"]} 条数={job["limit"]} '
-              f'槽位={job["slot_base"]+1}-{job["slot_base"]+args.threads} pid={proc.pid}')
+              f'加载设备={len(job["device_slots"])} 新槽位={job["new_slot_start"]}'
+              f'+{job["new_slot_step"]} pid={proc.pid}')
     return procs
 
 
@@ -130,6 +148,9 @@ def merge(jobs, started, expected_total=0, wall_started=None):
     recent = []
     p50s, p90s = [], []
     ip_calls = fetched = blocked = 0
+    pool_processes = []
+    pool_available_values, pool_low_values, pool_high_values = [], [], []
+    pool_supplier_states = []
     latency_hist = {}
     otp_hit = otp_fetch = 0
     retried = budget_hit = 0
@@ -142,6 +163,11 @@ def merge(jobs, started, expected_total=0, wall_started=None):
         payload = read_live(job['live'])
         if payload is None:
             finished_flag = False
+            pool_processes.append({
+                'process': int(job.get('index') or 0) + 1,
+                'available': None, 'low_water': None, 'high_water': None,
+                'supplier_alive': None,
+            })
             continue
         done += payload.get('done') or 0
         cpu += payload.get('cpu_seconds') or 0
@@ -157,6 +183,25 @@ def merge(jobs, started, expected_total=0, wall_started=None):
         if payload.get('p90') and weight:
             p90s.append((payload['p90'], weight))
         pool = payload.get('ip_pool') or {}
+        process_pool = {
+            'process': int(job.get('index') or 0) + 1,
+            'available': pool.get('available'),
+            'low_water': pool.get('low_water'),
+            'high_water': pool.get('high_water'),
+            'supplier_alive': pool.get('supplier_alive'),
+            'api_calls': pool.get('api_calls') or 0,
+            'fetched': pool.get('fetched') or 0,
+            'blocked': pool.get('blocked') or 0,
+        }
+        pool_processes.append(process_pool)
+        if pool.get('available') is not None:
+            pool_available_values.append(int(pool['available']))
+        if pool.get('low_water') is not None:
+            pool_low_values.append(int(pool['low_water']))
+        if pool.get('high_water') is not None:
+            pool_high_values.append(int(pool['high_water']))
+        if pool.get('supplier_alive') is not None:
+            pool_supplier_states.append(bool(pool['supplier_alive']))
         for value, count in (payload.get('latency_hist') or {}).items():
             bucket = int(value)
             latency_hist[bucket] = latency_hist.get(bucket, 0) + int(count)
@@ -200,8 +245,17 @@ def merge(jobs, started, expected_total=0, wall_started=None):
         'cpu_cores': round(cpu / elapsed, 3) if elapsed else 0,
         'cpu_per_account': round(cpu / done * 1000, 1) if done else 0,
         'ip_fail': 0,
-        'ip_pool': {'api_calls': ip_calls, 'fetched': fetched, 'blocked': blocked,
-                    'processes': len(jobs)},
+        'ip_pool': {
+            'api_calls': ip_calls, 'fetched': fetched, 'blocked': blocked,
+            'processes': len(jobs),
+            'available': (sum(pool_available_values)
+                          if pool_available_values else None),
+            'low_water': (sum(pool_low_values) if pool_low_values else None),
+            'high_water': (sum(pool_high_values) if pool_high_values else None),
+            'supplier_alive': (all(pool_supplier_states)
+                               if pool_supplier_states else None),
+            'by_process': pool_processes,
+        },
         'by_status': by_status,
         'p50': (round(histogram_median(latency_hist)) if latency_hist
                 else round(sum(v * w for v, w in p50s) / sum(w for _, w in p50s))
@@ -240,6 +294,7 @@ def main():
     ap.add_argument('--limit', type=int, default=0, help='总条数，0=全部')
     ap.add_argument('--offset', type=int, default=0)
     ap.add_argument('--slot-base', type=int, default=0, dest='slot_base')
+    ap.add_argument('--device-root', default='./data/devices-simple', dest='device_root')
     ap.add_argument('--per-ip', type=int, default=1, dest='per_ip',
                     help='一条 IP 跑多少条账号（1=每个任务换新 IP，走 IP 池 rotate）')
     ap.add_argument('--otp-reuse', type=int, default=15, dest='otp_reuse',
@@ -254,7 +309,7 @@ def main():
                     help='公共头走代理（机房 IP 直连 sidestore 被墙时必须开）')
     ap.add_argument('--anisette-timeout', type=float, default=30.0, dest='anisette_timeout')
     ap.add_argument('--register-timeout', type=float, default=20.0, dest='register_timeout',
-                    help='设备注册单次超时，超时后子线程换代理继续注册')
+                    help='设备初始化总超时，耗尽后剩余账号记为超时')
     ap.add_argument('--no-register', action='store_true', dest='no_register')
     ap.add_argument('--anisette-workers', type=int, default=0, dest='anisette_workers',
                     help='并发请求公共头上限，0=不限')
@@ -274,10 +329,17 @@ def main():
 
     total = count_accounts(args.accounts)
     jobs = build_jobs(args, total)
+    persisted_slots = registered_device_slots(
+        args.device_root, 'https://new.ani.sidestore.io')
+    # Stable disjoint ownership for this run: process 0 gets slots 0,N,2N...;
+    # process 1 gets 1,N+1...  No device crosses processes.
+    assign_device_slots(jobs, persisted_slots, args.slot_base)
     need_slots = args.slot_base + len(jobs) * args.threads
     print(f'账号总数 {total}，切成 {len(jobs)} 个进程 × {args.threads} 线程 '
-          f'= {len(jobs)*args.threads} 并发，设备槽位 1-{need_slots}')
-    print('线程模式：每个工作线程独占设备槽位和 HTTP Session；线程栈与连接均占用内存')
+          f'= {len(jobs)*args.threads} 并发，设备池容量按需扩展（参考槽位 1-{need_slots}）')
+    print(f'设备分组：磁盘已注册 {len(persisted_slots)} 台，平均加载到 {len(jobs)} 个进程；'
+          '进程之间不共享设备')
+    print('线程模式：优先租用本进程内使用次数最少的空闲设备；全部占用才注册新设备；任务结束即归还')
     if not jobs:
         raise SystemExit(f'没有可处理的账号：文件 {args.accounts} 在 offset={args.offset} '
                          f'之后没有记录（共 {total} 条）')
