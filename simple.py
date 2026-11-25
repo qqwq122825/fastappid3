@@ -37,6 +37,17 @@ def wait_for_proxy_when_tasks_remain(pending, stopped=False):
     return int(pending) > 0 and not bool(stopped)
 
 
+def _new_state_lock():
+    """Return a queued mutex so the once-per-second live writer cannot starve.
+
+    ``threading.Lock`` does not define which waiter is woken.  With hundreds of
+    hot workers it can repeatedly favor a new result update over the live
+    writer.  ``Semaphore(1)`` uses the condition wait queue while preserving the
+    same context-manager API and mutual-exclusion semantics.
+    """
+    return threading.Semaphore(1)
+
+
 def load_accounts(path, limit, shuffle=True):
     rows = [l.strip() for l in open(path, encoding='utf-8', errors='replace')
             if l.strip() and '----' in l]
@@ -409,7 +420,9 @@ def main():
     for index, item in enumerate(rows):
         shards[index % args.threads].append(item)
     print(f'账号已切成 {args.threads} 份，每份约 {len(rows)//args.threads} 条')
-    lock = threading.Lock()
+    lock = _new_state_lock()
+    sink_lock = threading.Lock()       # 结果落盘不占用状态锁
+    budget_lock = threading.Lock()     # 预算日志有独立的 I/O 锁
     sink = open(args.out, 'w', encoding='utf-8')
     write_buffer = []          # 攒够再落盘，避免每条都 fsync
     # 预算耗尽专用日志：每条 budget_hit 一行，含 OTP/每跳耗时拆解，方便单独分析
@@ -877,6 +890,22 @@ def main():
                        'web_detail': web_detail, 'web_method': web_method,
                        'web_ms': round(web_ms, 1)}
                 line = json.dumps(row, ensure_ascii=False)
+                budget_line = None
+                if budget_hit:
+                    budget_line = json.dumps({
+                        'at': time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime()),
+                        'tid': tid, 'slot': slot, 'email': email,
+                        'proxy': row['proxy'],
+                        'budget_ms': round(budget * 1000, 1),
+                        'otp_ms': round(otp_ms, 1), 'chk_ms': round(chk_ms, 1),
+                        'ip_ms': round(ip_ms, 1), 'gap_ms': round(gap_ms, 2),
+                        'attempts': attempts, 'attempt_ms': attempt_ms,
+                        'budget_left_ms': budget_left_ms,
+                        'retry_reason': retry_reason,
+                        'retry_ip_ms': retry_ip_ms,
+                        'ip_wait_ms': round(sum(retry_ip_ms), 1),
+                        'ip_wait_none': ip_wait_none,
+                    }, ensure_ascii=False) + '\n'
                 batch = None
                 with lock:
                     results['done'] += 1
@@ -904,21 +933,6 @@ def main():
                     seg['chk'].append(chk_ms)
                     if budget_hit:
                         results['budget_hit'] = results.get('budget_hit', 0) + 1
-                        budget_sink.write(json.dumps({
-                            'at': time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime()),
-                            'tid': tid, 'slot': slot, 'email': email,
-                            'proxy': row['proxy'],
-                            'budget_ms': round(budget * 1000, 1),
-                            'otp_ms': round(otp_ms, 1), 'chk_ms': round(chk_ms, 1),
-                            'ip_ms': round(ip_ms, 1), 'gap_ms': round(gap_ms, 2),
-                            'attempts': attempts, 'attempt_ms': attempt_ms,
-                            'budget_left_ms': budget_left_ms,
-                            'retry_reason': retry_reason,
-                            'retry_ip_ms': retry_ip_ms,
-                            'ip_wait_ms': round(sum(retry_ip_ms), 1),
-                            'ip_wait_none': ip_wait_none,
-                        }, ensure_ascii=False) + '\n')
-                        budget_sink.flush()
                     if attempts > 1:
                         results['retried'] = results.get('retried', 0) + 1
                         rk = results.setdefault('by_retry', {})
@@ -940,11 +954,16 @@ def main():
                     results['recent'].append(row)
                     write_buffer.append(line)
                     if len(write_buffer) >= 200:        # 200 条才落一次盘
-                        batch = '\n'.join(write_buffer) + '\n'
+                        batch = write_buffer[:]
                         write_buffer.clear()
-                if batch is not None:                   # 落盘在锁外
-                    sink.write(batch)
-                    sink.flush()
+                if budget_line is not None:
+                    with budget_lock:
+                        budget_sink.write(budget_line)
+                        budget_sink.flush()
+                if batch is not None:                   # 序列化和落盘都在状态锁外
+                    with sink_lock:
+                        sink.write('\n'.join(batch) + '\n')
+                        sink.flush()
                 served += 1
                 mine += 1
                 t_prev_end = time.perf_counter()

@@ -3,6 +3,7 @@ import json
 import os
 import plistlib
 import tempfile
+import threading
 import time
 import unittest
 
@@ -10,6 +11,7 @@ from fastcheck.protocols import gsa_async
 from fastcheck.status import result_bucket
 from gsafast.ippool import IpPool
 from simple_async import _attempt_slice
+from simple import _new_state_lock
 
 
 class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
@@ -65,6 +67,15 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         before = pool.stats['blocked']
         self.assertEqual((None, 0.0), pool.acquire_nowait(0))
         self.assertEqual(before, pool.stats['blocked'])
+
+    def test_live_state_lock_uses_waiter_queue(self):
+        gate = _new_state_lock()
+        self.assertIsInstance(gate, threading.Semaphore)
+        self.assertTrue(gate.acquire(blocking=False))
+        self.assertFalse(gate.acquire(blocking=False))
+        gate.release()
+        self.assertTrue(gate.acquire(blocking=False))
+        gate.release()
 
     def test_multi_process_uses_thread_worker(self):
         import run_mp
