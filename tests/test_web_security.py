@@ -74,10 +74,33 @@ class ConsoleRequestTests(unittest.TestCase):
     def test_authenticated_configuration_save_still_works(self):
         handler = make_handler('/api/set-api', {'api': 'https://fixture.invalid/?num=1'},
                                cookie=self.cookie())
-        with patch.object(web, 'save_api') as save:
+        with patch.object(web, 'validate_proxy_api', return_value=True) as validate, \
+             patch.object(web, 'save_api') as save:
             response = handler._do_post()
+        validate.assert_called_once_with('https://fixture.invalid/?num={num}')
         save.assert_called_once_with('https://fixture.invalid/?num={num}')
         self.assertTrue(response['ok'])
+
+    def test_supplier_error_is_rejected_before_configuration_save(self):
+        handler = make_handler('/api/set-api', {'api': 'https://fixture.invalid/?num=1'},
+                               cookie=self.cookie())
+        with patch.object(web, 'validate_proxy_api',
+                          side_effect=ValueError('供应商未返回代理：29776密码错误')), \
+             patch.object(web, 'save_api') as save:
+            response = handler._do_post()
+        save.assert_not_called()
+        self.assertIn('29776密码错误', response['error'])
+
+    def test_masked_password_can_never_overwrite_saved_credential(self):
+        handler = make_handler('/api/set-api',
+                               {'api': 'https://proxy.invalid/list?password=***&num=1'},
+                               cookie=self.cookie())
+        with patch.object(web, 'validate_proxy_api') as validate, \
+             patch.object(web, 'save_api') as save:
+            response = handler._do_post()
+        validate.assert_not_called()
+        save.assert_not_called()
+        self.assertIn('隐藏后的地址', response['error'])
 
     def test_invalid_secrets_json_is_preserved(self):
         with tempfile.TemporaryDirectory() as directory, \
@@ -118,7 +141,8 @@ class ConsoleRequestTests(unittest.TestCase):
     def test_invalid_secrets_json_error_reaches_client(self):
         handler = make_handler('/api/set-api', {'api': 'https://fixture.invalid/?num=1'},
                                cookie=self.cookie())
-        with patch.object(web, 'save_api', side_effect=ValueError('原文件未修改')):
+        with patch.object(web, 'validate_proxy_api', return_value=True), \
+             patch.object(web, 'save_api', side_effect=ValueError('原文件未修改')):
             response = handler._do_post()
         self.assertIn('原文件未修改', response['error'])
 

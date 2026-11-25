@@ -18,6 +18,7 @@ import signal
 import subprocess
 import threading
 import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -78,6 +79,21 @@ def save_api(url):
         os.fsync(handle.fileno())
     os.replace(tmp, path)
     os.chmod(path, 0o600)
+
+
+def validate_proxy_api(url, timeout=8.0):
+    """Reject supplier error pages before replacing the working credential."""
+    target = str(url).replace('{num}', '1')
+    try:
+        with urllib.request.urlopen(target, timeout=float(timeout)) as response:
+            body = response.read(4096).decode('utf-8', 'replace').strip()
+    except Exception as exc:                                      # noqa: BLE001
+        raise ValueError(f'接口无法访问：{type(exc).__name__}') from exc
+    if not re.search(r'(?<!\d)(?:\d{1,3}\.){3}\d{1,3}:\d+(?!\d)', body):
+        reason = re.sub(r'(?i)(password|passwd|pwd|token|key)=[^&\s]+',
+                        r'\1=***', body[:120])
+        raise ValueError(f'供应商未返回代理：{reason or "空响应"}')
+    return True
 
 
 def command_for_log(cmd):
@@ -1018,13 +1034,17 @@ class Handler(BaseHTTPRequestHandler):
             raw = str(payload.get('api') or '')
             if not raw.strip():
                 return self._json({'error': '接口地址不能为空'})
+            if re.search(r'(?i)(?:password|passwd|pwd|token|key)=\*{3}(?:&|$)', raw):
+                return self._json({'error': '这是页面隐藏后的地址，不会覆盖真实密码；'
+                                          '请粘贴供应商给的完整接口'})
             fixed = normalize_api(raw)
             if '{num}' not in fixed:
                 return self._json({'error': '无法识别 num 参数，请确认地址里有 num=数字'})
             try:
+                validate_proxy_api(fixed)
                 save_api(fixed)
             except (OSError, ValueError) as exc:
-                return self._json({'error': f'写 secrets.json 失败: {exc}'})
+                return self._json({'error': f'保存接口失败: {exc}'})
             return self._json({'ok': True, 'api': mask_api(fixed)})
         if self.path.startswith('/api/login'):
             if str(payload.get('password') or '') != PASSWORD:
@@ -1201,7 +1221,7 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
   <span class="tag">极简模型</span>
   <div class="right">
     <span id="stateTag"><span class="dot" style="background:#9ca3af"></span>未开始</span>
-    <span>启动 <b id="started">--</b></span>
+    <span><span id="runtimeLabel">已运行</span> <b id="runtime">--:--:--</b></span>
     <span>SRP <b id="backend">--</b></span>
     <a href="#" id="logout">换个密码</a>
   </div>
@@ -1403,7 +1423,10 @@ $('logout').onclick = e => { e.preventDefault(); document.cookie='gsa_auth=; Max
 async function loadApi(){
   try{
     const r = await (await fetch('/api/api-config')).json();
-    if(r.api) $('api').value = r.api;
+    // The masked URL is display-only.  Never put password=*** back into the
+    // editable value because a second Save would destroy the real credential.
+    $('api').value = '';
+    if(r.api) $('api').placeholder = '已配置：' + r.api + '（要更换请粘贴完整新接口）';
     $('apiState').textContent = r.configured ? '已配置' : '未配置';
     $('apiState').style.color = r.configured ? 'var(--green)' : 'var(--red)';
   }catch(e){}
@@ -1417,7 +1440,9 @@ async function saveApiFn(){
   if(r.error){ $('apiHint').textContent = r.error; $('apiHint').style.color='var(--red)'; }
   else { $('apiHint').textContent = '已保存：' + r.api;
          $('apiHint').style.color='var(--green)';
-         $('api').value = r.api; $('apiState').textContent='已配置';
+         $('api').value = '';
+         $('api').placeholder = '已配置：' + r.api + '（要更换请粘贴完整新接口）';
+         $('apiState').textContent='已配置';
          $('apiState').style.color='var(--green)'; }
 }
 $('saveApi').onclick = saveApiFn;
@@ -1624,7 +1649,13 @@ async function tick(){
   $('pPct').textContent = pct.toFixed(1)+'%';
   $('pSpeed').textContent = `${num(d.per_hour)} 条/小时`;
 
-  $('started').textContent = d.started || '--';
+  const elapsed = Math.max(0, Math.floor(Number(d.elapsed)||0));
+  const hh = String(Math.floor(elapsed/3600)).padStart(2,'0');
+  const mm = String(Math.floor(elapsed%3600/60)).padStart(2,'0');
+  const ss = String(elapsed%60).padStart(2,'0');
+  $('runtimeLabel').textContent = d.running ? '已运行' : (d.finished ? '本次用时' : '已运行');
+  $('runtime').textContent = `${hh}:${mm}:${ss}`;
+  $('runtime').title = d.started ? `启动 ${d.started}` : '';
   $('backend').textContent = [d.backend, d.engine].filter(Boolean).join('·') || '--';
   $('backend').style.color = d.backend==='gmpy2' ? 'var(--green)' : 'var(--red)';
   const threads = Number(d.threads) || Number($('threads').value) || 0;
