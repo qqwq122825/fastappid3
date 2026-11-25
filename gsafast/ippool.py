@@ -22,7 +22,7 @@ class IpPool:
     def __init__(self, api, *, threads=1000, ttl=50.0, per_ip=9,
                  batch=1000, refill_interval=2.0, log=None,
                  initial_max=1000, refill_batch=200, low_water=200,
-                 lease_margin=8.0, quarantine=120.0, gateway_limit=200):
+                 lease_margin=8.0, quarantine=120.0, gateway_limit=0):
         self.api = api
         self.threads = max(1, int(threads))
         self.ttl = max(5.0, float(ttl))
@@ -36,7 +36,10 @@ class IpPool:
                               self.low_water + self.refill_batch)
         self.lease_margin = max(1.0, min(self.ttl - 1.0, float(lease_margin)))
         self.quarantine = max(self.ttl, float(quarantine))
-        self.gateway_limit = max(1, int(gateway_limit))
+        # 实测：同一入口网关（如 137.184.119.209 的 400 个端口）同时建 400 连接
+        # 成功率 100%，且每个端口背后是独立出口 IP。所以网关并发不是瓶颈，
+        # 0 表示不限制；需要限流时显式传正数。
+        self.gateway_limit = max(0, int(gateway_limit))
         self.log = log or (lambda *a, **k: None)
 
         # 每线程一个本地队列：只有一个线程读写，天然无锁
@@ -117,11 +120,14 @@ class IpPool:
 
     # ---------------------------------------------------------------- 预热
     def warm(self, extra=0):
-        """启动预热；尊重旧 extra 语义，但每进程最多只保留 initial_max 条。"""
+        """启动预热：默认按 threads × 1.2 备料，上限 initial_max。
+
+        实测每个入口端口背后是独立出口 IP，且同一网关 400 并发 100% 通过，
+        所以多备料是有意义的（换 IP 时不必等补货）；但备太多会在队列里
+        放到快过期，1.2 倍是折中。
+        """
         requested = int(self.threads * (1 + max(0, extra)))
-        # 一条协程只需要一个初始出口；旧 extra=1 会让 800 协程先拉 1600 条，
-        # 大量端口在队列里等到接近过期。保留参数仅用于日志兼容。
-        target = min(self.initial_max, self.threads)
+        target = min(self.initial_max, requested if extra else int(self.threads * 1.2))
         fresh = []
         rounds = 0
         while len(fresh) < target and rounds < 8 and not self._stop.is_set():
@@ -195,6 +201,8 @@ class IpPool:
             return proxy
 
     def _reserve_gateway(self, proxy):
+        if not self.gateway_limit:
+            return True                      # 不限制
         gateway = self._gateway(proxy)
         with self._gateway_lock:
             if self._gateway_active[gateway] >= self.gateway_limit:
@@ -204,6 +212,8 @@ class IpPool:
         return True
 
     def _release_gateway(self, proxy):
+        if not self.gateway_limit:
+            return
         gateway = self._gateway(proxy)
         with self._gateway_lock:
             if self._gateway_active[gateway] > 1:

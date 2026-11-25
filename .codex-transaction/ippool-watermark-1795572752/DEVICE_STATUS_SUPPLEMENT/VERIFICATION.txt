@@ -1,0 +1,115 @@
+OBJECT: /Users/xxx/Documents/并发3/simple_async.py
+GOAL: registered ready slots waiting for bootstrap must not be counted as registering
+CHANGED_SYMBOLS: _needs_device_registration, run.prepare_slot_sync, run.prepare_slot
+BASELINE_SHA256: 3036c03ae0131f00d02ac85fc295026cb7d4b722b8ab2b6fa40304f8702c1f2a
+BASELINE_BYTES: 24871
+MODIFIED_SHA256: 854fc2e66ec95a63839fb1d82f26f55d2eb427777c37a20be6522304cfd0dea8
+MODIFIED_BYTES: 25493
+INPUT: registered=800 using=576 queued_ready=224 missing=0
+LOCAL_DEVICE_EVIDENCE: data/devices-simple has 3000 registered; exact slots 1-1600 are 1600 ready, 0 pending/missing/invalid
+PROXY_GOOGLE_PROBE: /Users/xxx/Documents/并发3/data/proxy-google-probe-1795573007.jsonl
+PROXY_GOOGLE_SUMMARY: /Users/xxx/Documents/并发3/data/proxy-google-probe-1795573007.summary.txt
+
+[BASELINE_BEHAVIOR]
+COMMAND: python3 /Users/xxx/Documents/并发3/.codex-transaction/ippool-watermark-1795572752/DEVICE_STATUS_SUPPLEMENT/device_status_probe.py /Users/xxx/Documents/并发3/simple_async.py
+STDOUT:
+{"display_registering": 224, "input": {"missing": 0, "queued_ready": 224, "registered": 800, "using": 576}, "missing_slots_registering": 5, "no_register_mode_registering": 5, "policy": "queued-before-gate"}
+STDERR:
+EXIT_STATUS: 0
+
+[MODIFIED_BEHAVIOR]
+COMMAND: python3 /Users/xxx/Documents/并发3/.codex-transaction/ippool-watermark-1795572752/DEVICE_STATUS_SUPPLEMENT/device_status_probe.py /Users/xxx/Documents/并发3/.codex-transaction/ippool-watermark-1795572752/DEVICE_STATUS_SUPPLEMENT/MODIFIED_FILE.py
+STDOUT:
+STDERR:
+Traceback (most recent call last):
+  File "/Users/xxx/Documents/并发3/.codex-transaction/ippool-watermark-1795572752/DEVICE_STATUS_SUPPLEMENT/device_status_probe.py", line 5, in <module>
+    spec=importlib.util.spec_from_file_location('device_candidate',p); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+                                                                                                                ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "<frozen importlib._bootstrap_external>", line 751, in exec_module
+  File "<frozen importlib._bootstrap>", line 549, in _call_with_frames_removed
+  File "/Users/xxx/Documents/并发3/.codex-transaction/ippool-watermark-1795572752/DEVICE_STATUS_SUPPLEMENT/MODIFIED_FILE.py", line 23, in <module>
+    from simple import (device_profile, load_accounts, local_exception_result,
+                        proxy_api_default, refine_status, retry_kind)
+ModuleNotFoundError: No module named 'simple'
+EXIT_STATUS: 1
+
+[CORRECTION]
+Previous modified probe failed because dynamic import could not resolve simple; replaced with AST-isolated function execution.
+
+[BASELINE_BEHAVIOR_CORRECTED]
+COMMAND: python3 /Users/xxx/Documents/并发3/.codex-transaction/ippool-watermark-1795572752/DEVICE_STATUS_SUPPLEMENT/device_status_probe.py /Users/xxx/Documents/并发3/simple_async.py
+STDOUT:
+{"display_registering": 224, "input": {"missing": 0, "queued_ready": 224, "registered": 800, "using": 576}, "missing_slots_registering": 5, "no_register_mode_registering": 5, "policy": "queued-before-gate"}
+STDERR:
+EXIT_STATUS: 0
+
+[MODIFIED_BEHAVIOR_CORRECTED]
+COMMAND: python3 /Users/xxx/Documents/并发3/.codex-transaction/ippool-watermark-1795572752/DEVICE_STATUS_SUPPLEMENT/device_status_probe.py /Users/xxx/Documents/并发3/.codex-transaction/ippool-watermark-1795572752/DEVICE_STATUS_SUPPLEMENT/MODIFIED_FILE.py
+STDOUT:
+{"display_registering": 0, "input": {"missing": 0, "queued_ready": 224, "registered": 800, "using": 576}, "missing_slots_registering": 5, "no_register_mode_registering": 0, "policy": "exact-slot-state"}
+STDERR:
+EXIT_STATUS: 0
+
+[MODIFIED_COMPILE]
+COMMAND: python3 -m py_compile /Users/xxx/Documents/并发3/.codex-transaction/ippool-watermark-1795572752/DEVICE_STATUS_SUPPLEMENT/MODIFIED_FILE.py
+STDOUT:
+STDERR:
+EXIT_STATUS: 0
+
+[COMBINED_UNIT_TEST]
+COMMAND: candidate simple_async + candidate ippool; unittest test_async_engine.py
+STDOUT:
+STDERR:
+......
+----------------------------------------------------------------------
+Ran 6 tests in 0.038s
+
+OK
+EXIT_STATUS: 0
+
+[ROLLBACK_EXEC]
+COMMAND: /Users/xxx/Documents/并发3/.codex-transaction/ippool-watermark-1795572752/DEVICE_STATUS_SUPPLEMENT/ROLLBACK.sh /Users/xxx/Documents/并发3/.codex-transaction/ippool-watermark-1795572752/DEVICE_STATUS_SUPPLEMENT/ROLLBACK_PROBE.py
+STDOUT:
+STDERR:
+EXIT_STATUS: 0
+
+[ROLLBACK_BEHAVIOR]
+COMMAND: python3 /Users/xxx/Documents/并发3/.codex-transaction/ippool-watermark-1795572752/DEVICE_STATUS_SUPPLEMENT/device_status_probe.py /Users/xxx/Documents/并发3/.codex-transaction/ippool-watermark-1795572752/DEVICE_STATUS_SUPPLEMENT/ROLLBACK_PROBE.py
+STDOUT:
+{"display_registering": 224, "input": {"missing": 0, "queued_ready": 224, "registered": 800, "using": 576}, "missing_slots_registering": 5, "no_register_mode_registering": 5, "policy": "queued-before-gate"}
+STDERR:
+EXIT_STATUS: 0
+
+[MODIFIED_ROLLBACK]
+COMMAND: /Users/xxx/Documents/并发3/.codex-transaction/ippool-watermark-1795572752/DEVICE_STATUS_SUPPLEMENT/ROLLBACK.sh /Users/xxx/Documents/并发3/.codex-transaction/ippool-watermark-1795572752/DEVICE_STATUS_SUPPLEMENT/MODIFIED_FILE.py
+STDOUT:
+STDERR:
+EXIT_STATUS: 0
+
+[REAPPLY_GOAL]
+COMMAND: patch -s /Users/xxx/Documents/并发3/.codex-transaction/ippool-watermark-1795572752/DEVICE_STATUS_SUPPLEMENT/MODIFIED_FILE.py < /Users/xxx/Documents/并发3/.codex-transaction/ippool-watermark-1795572752/DEVICE_STATUS_SUPPLEMENT/DIFF_FILE.patch
+STDOUT:
+STDERR:
+EXIT_STATUS: 0
+
+[REAPPLIED_BEHAVIOR]
+COMMAND: python3 /Users/xxx/Documents/并发3/.codex-transaction/ippool-watermark-1795572752/DEVICE_STATUS_SUPPLEMENT/device_status_probe.py /Users/xxx/Documents/并发3/.codex-transaction/ippool-watermark-1795572752/DEVICE_STATUS_SUPPLEMENT/MODIFIED_FILE.py
+STDOUT:
+{"display_registering": 0, "input": {"missing": 0, "queued_ready": 224, "registered": 800, "using": 576}, "missing_slots_registering": 5, "no_register_mode_registering": 0, "policy": "exact-slot-state"}
+STDERR:
+EXIT_STATUS: 0
+ROLLBACK_SHA256: 3036c03ae0131f00d02ac85fc295026cb7d4b722b8ab2b6fa40304f8702c1f2a
+RESTORED_EQUALS_BASELINE: yes
+REAPPLIED_SHA256: 854fc2e66ec95a63839fb1d82f26f55d2eb427777c37a20be6522304cfd0dea8
+ORIGINAL_FINAL_SHA256: 3036c03ae0131f00d02ac85fc295026cb7d4b722b8ab2b6fa40304f8702c1f2a
+ORIGINAL_UNCHANGED: yes
+
+[RESILIENCE_V2]
+CHANGED_BRANCHES: exact registration state; final Apple/network transient retires and quarantines current proxy
+BASELINE_BEHAVIOR: {"failed_endpoint_accepted_again": 1, "final_timeout_retires_proxy": false, "final_verdict_retires_proxy": false, "gateway_first_acquired": 5, "gateway_input": {"endpoints": 5, "limit": 3, "same_host": true}, "gateway_waiter_after_release": true, "near_expiry_5s_returned": true, "queued_ready_display_registering": 224, "warm_input": {"extra": 1, "threads": 800}, "warm_requests": [1000, 600], "warmed": 1600}
+MODIFIED_BEHAVIOR: {"failed_endpoint_accepted_again": 0, "final_timeout_retires_proxy": true, "final_verdict_retires_proxy": false, "gateway_first_acquired": 3, "gateway_input": {"endpoints": 5, "limit": 3, "same_host": true}, "gateway_waiter_after_release": true, "near_expiry_5s_returned": false, "queued_ready_display_registering": 0, "warm_input": {"extra": 1, "threads": 800}, "warm_requests": [800], "warmed": 800}
+ROLLBACK_BEHAVIOR: {"failed_endpoint_accepted_again": 1, "final_timeout_retires_proxy": false, "final_verdict_retires_proxy": false, "gateway_first_acquired": 5, "gateway_input": {"endpoints": 5, "limit": 3, "same_host": true}, "gateway_waiter_after_release": true, "near_expiry_5s_returned": true, "queued_ready_display_registering": 224, "warm_input": {"extra": 1, "threads": 800}, "warm_requests": [1000, 600], "warmed": 1600}
+REAPPLIED_BEHAVIOR: {"failed_endpoint_accepted_again": 0, "final_timeout_retires_proxy": true, "final_verdict_retires_proxy": false, "gateway_first_acquired": 3, "gateway_input": {"endpoints": 5, "limit": 3, "same_host": true}, "gateway_waiter_after_release": true, "near_expiry_5s_returned": false, "queued_ready_display_registering": 0, "warm_input": {"extra": 1, "threads": 800}, "warm_requests": [800], "warmed": 800}
+UNIT_EXIT_STATUS: 0
+MOCK_EXIT_STATUS: 0
+MOCK_DONE: 100

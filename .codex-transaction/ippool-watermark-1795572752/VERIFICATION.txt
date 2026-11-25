@@ -1,0 +1,105 @@
+OBJECT: /Users/xxx/Documents/并发3/gsafast/ippool.py
+GOAL: startup at most 1000 proxies per process; refill each process at low-water 200 in batches of 200
+CHANGED_SYMBOLS: IpPool.__init__, IpPool.warm, IpPool._available_live, IpPool._supply_loop, IpPool.acquire_nowait, IpPool.snapshot
+BASELINE_SHA256: 67976cbf5b52a908cb133a4ad61ff857a62bd049f52d9471ad2bb6c9137854db
+BASELINE_BYTES: 11160
+MODIFIED_SHA256: 6f21643df2d10defc49d1dbdd9ab13f0f639987c3861e57f671420dc83d24203
+MODIFIED_BYTES: 11851
+INPUT: threads=800, warm(extra=1), 1400 acquire attempts, one supplier cycle, deterministic proxy fixture
+OBSERVED_LOG_DIAGNOSIS:
+- p0: 2127 gsa_connection_reset; 6 ip_api_error; requests up to 1000
+- p1: 1611 gsa_connection_reset; 5 ip_api_error; requests up to 1000
+- p2: 1729 gsa_connection_reset; 8 ip_api_error; requests up to 1000
+- representative API errors: HTTP 502 and 25-second TimeoutError
+- initial orchestration command: rejected before execution because rm-style cleanup was prohibited; exit status unavailable
+STATE_TRANSITION: legacy tracked/_seen water level -> real queued inventory water level
+
+[BASELINE_BEHAVIOR]
+COMMAND: python3 /Users/xxx/Documents/并发3/.codex-transaction/ippool-watermark-1795572752/watermark_probe.py /Users/xxx/Documents/并发3/gsafast/ippool.py
+STDOUT:
+{"acquire_attempts": 1400, "acquire_success": 1400, "available_after": 200, "available_before": 200, "fetch_requests": [1000, 600], "refill_calls": "legacy", "threads": 800, "tracked_before": 1000, "warm_extra": 1, "warmed": 1600}
+STDERR:
+EXIT_STATUS: 0
+
+[MODIFIED_BEHAVIOR]
+COMMAND: python3 /Users/xxx/Documents/并发3/.codex-transaction/ippool-watermark-1795572752/watermark_probe.py /Users/xxx/Documents/并发3/.codex-transaction/ippool-watermark-1795572752/MODIFIED_FILE.py
+STDOUT:
+{"acquire_attempts": 1400, "acquire_success": 1000, "available_after": 200, "available_before": 0, "fetch_requests": [1000, 200], "refill_calls": 1, "threads": 800, "tracked_before": 1000, "warm_extra": 1, "warmed": 1000}
+STDERR:
+EXIT_STATUS: 0
+
+[MODIFIED_COMPILE]
+COMMAND: python3 -m py_compile /Users/xxx/Documents/并发3/.codex-transaction/ippool-watermark-1795572752/MODIFIED_FILE.py
+STDOUT:
+STDERR:
+EXIT_STATUS: 0
+
+[UNIT_TEST]
+COMMAND: cd /Users/xxx/Documents/并发3/.codex-transaction/ippool-watermark-1795572752 && PYTHONPATH=/Users/xxx/Documents/并发3/.codex-transaction/ippool-watermark-1795572752/overlay:/Users/xxx/Documents/并发3 /Users/xxx/Documents/并发3/.venv/bin/python -m unittest discover -s /Users/xxx/Documents/并发3/tests -p test_async_engine.py
+STDOUT:
+STDERR:
+......
+----------------------------------------------------------------------
+Ran 6 tests in 0.038s
+
+OK
+EXIT_STATUS: 0
+
+[ROLLBACK_EXEC]
+COMMAND: /Users/xxx/Documents/并发3/.codex-transaction/ippool-watermark-1795572752/ROLLBACK.sh /Users/xxx/Documents/并发3/.codex-transaction/ippool-watermark-1795572752/ROLLBACK_PROBE.py
+STDOUT:
+STDERR:
+EXIT_STATUS: 0
+
+[ROLLBACK_BEHAVIOR]
+COMMAND: python3 /Users/xxx/Documents/并发3/.codex-transaction/ippool-watermark-1795572752/watermark_probe.py /Users/xxx/Documents/并发3/.codex-transaction/ippool-watermark-1795572752/ROLLBACK_PROBE.py
+STDOUT:
+{"acquire_attempts": 1400, "acquire_success": 1400, "available_after": 200, "available_before": 200, "fetch_requests": [1000, 600], "refill_calls": "legacy", "threads": 800, "tracked_before": 1000, "warm_extra": 1, "warmed": 1600}
+STDERR:
+EXIT_STATUS: 0
+
+[MODIFIED_ROLLBACK]
+COMMAND: /Users/xxx/Documents/并发3/.codex-transaction/ippool-watermark-1795572752/ROLLBACK.sh /Users/xxx/Documents/并发3/.codex-transaction/ippool-watermark-1795572752/MODIFIED_FILE.py
+STDOUT:
+STDERR:
+EXIT_STATUS: 0
+
+[REAPPLY_GOAL]
+COMMAND: patch -s /Users/xxx/Documents/并发3/.codex-transaction/ippool-watermark-1795572752/MODIFIED_FILE.py < /Users/xxx/Documents/并发3/.codex-transaction/ippool-watermark-1795572752/DIFF_FILE.patch
+STDOUT:
+STDERR:
+EXIT_STATUS: 0
+
+[REAPPLIED_BEHAVIOR]
+COMMAND: python3 /Users/xxx/Documents/并发3/.codex-transaction/ippool-watermark-1795572752/watermark_probe.py /Users/xxx/Documents/并发3/.codex-transaction/ippool-watermark-1795572752/MODIFIED_FILE.py
+STDOUT:
+{"acquire_attempts": 1400, "acquire_success": 1000, "available_after": 200, "available_before": 0, "fetch_requests": [1000, 200], "refill_calls": 1, "threads": 800, "tracked_before": 1000, "warm_extra": 1, "warmed": 1000}
+STDERR:
+EXIT_STATUS: 0
+ROLLBACK_SHA256: 67976cbf5b52a908cb133a4ad61ff857a62bd049f52d9471ad2bb6c9137854db
+RESTORED_EQUALS_BASELINE: yes
+REAPPLIED_SHA256: 6f21643df2d10defc49d1dbdd9ab13f0f639987c3861e57f671420dc83d24203
+ORIGINAL_FINAL_SHA256: 67976cbf5b52a908cb133a4ad61ff857a62bd049f52d9471ad2bb6c9137854db
+ORIGINAL_UNCHANGED: yes
+
+[DEVICE_STATUS_SUPPLEMENT]
+PATH: /Users/xxx/Documents/并发3/.codex-transaction/ippool-watermark-1795572752/DEVICE_STATUS_SUPPLEMENT
+BASELINE: 224 queued ready slots displayed as registering
+MODIFIED: 0 queued ready slots displayed as registering; only exact missing slots register
+ROLLBACK: 224 queued ready slots displayed as registering again
+PROXY_GOOGLE_PROBE: 20 tested, 19 HTTP 204, 1 connect timeout
+PROXY_EVIDENCE: /Users/xxx/Documents/并发3/data/proxy-google-probe-1795573007.jsonl
+
+[RESILIENCE_V2]
+CHANGED_FIELDS: initial_max, refill_batch, low_water, lease_margin=8, quarantine=120, gateway_limit=200
+CHANGED_BRANCHES: warm actual-concurrency cap; acquire gateway reservation; near-expiry rejection; unhealthy quarantine
+BASELINE_BEHAVIOR: {"failed_endpoint_accepted_again": 1, "final_timeout_retires_proxy": false, "final_verdict_retires_proxy": false, "gateway_first_acquired": 5, "gateway_input": {"endpoints": 5, "limit": 3, "same_host": true}, "gateway_waiter_after_release": true, "near_expiry_5s_returned": true, "queued_ready_display_registering": 224, "warm_input": {"extra": 1, "threads": 800}, "warm_requests": [1000, 600], "warmed": 1600}
+MODIFIED_BEHAVIOR: {"failed_endpoint_accepted_again": 0, "final_timeout_retires_proxy": true, "final_verdict_retires_proxy": false, "gateway_first_acquired": 3, "gateway_input": {"endpoints": 5, "limit": 3, "same_host": true}, "gateway_waiter_after_release": true, "near_expiry_5s_returned": false, "queued_ready_display_registering": 0, "warm_input": {"extra": 1, "threads": 800}, "warm_requests": [800], "warmed": 800}
+ROLLBACK_BEHAVIOR: {"failed_endpoint_accepted_again": 1, "final_timeout_retires_proxy": false, "final_verdict_retires_proxy": false, "gateway_first_acquired": 5, "gateway_input": {"endpoints": 5, "limit": 3, "same_host": true}, "gateway_waiter_after_release": true, "near_expiry_5s_returned": true, "queued_ready_display_registering": 224, "warm_input": {"extra": 1, "threads": 800}, "warm_requests": [1000, 600], "warmed": 1600}
+REAPPLIED_BEHAVIOR: {"failed_endpoint_accepted_again": 0, "final_timeout_retires_proxy": true, "final_verdict_retires_proxy": false, "gateway_first_acquired": 3, "gateway_input": {"endpoints": 5, "limit": 3, "same_host": true}, "gateway_waiter_after_release": true, "near_expiry_5s_returned": false, "queued_ready_display_registering": 0, "warm_input": {"extra": 1, "threads": 800}, "warm_requests": [800], "warmed": 800}
+UNIT_COMMAND: PYTHONPATH=candidate-overlay .venv/bin/python -m unittest discover -s tests
+UNIT_EXIT_STATUS: 0
+MOCK_COMMAND: FASTCHECK_MOCK=1 simple_async.py --threads 100 --accounts mock-accounts-100.txt
+MOCK_EXIT_STATUS: 0
+MOCK_DONE: 100
+GOOGLE_PROBE: /Users/xxx/Documents/并发3/data/proxy-google-probe-1795573007.jsonl

@@ -1,0 +1,1 @@
+{"acquire_attempts": 1400, "acquire_success": 1400, "available_after": 200, "available_before": 200, "fetch_requests": [1000, 600], "refill_calls": "legacy", "threads": 800, "tracked_before": 1000, "warm_extra": 1, "warmed": 1600}

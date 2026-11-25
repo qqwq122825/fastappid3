@@ -1,0 +1,1 @@
+{"display_registering": 224, "input": {"missing": 0, "queued_ready": 224, "registered": 800, "using": 576}, "missing_slots_registering": 5, "no_register_mode_registering": 5, "policy": "queued-before-gate"}
