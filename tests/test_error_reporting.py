@@ -7,7 +7,7 @@ from pathlib import Path
 from fastcheck.devices import count_registered_devices
 from fastcheck.status import result_bucket
 from run_mp import merge
-from simple import local_exception_result
+from simple import local_exception_result, wait_for_proxy_when_tasks_remain
 
 
 def test_transport_exception_becomes_retryable_timeout():
@@ -26,6 +26,12 @@ def test_programming_exception_remains_visible_undetermined():
     assert result_bucket(result) == "undetermined"
     assert "KeyError" in result["detail"]
     assert "secret account" not in result["detail"]
+
+
+def test_proxy_starvation_keeps_pending_worker_alive():
+    assert wait_for_proxy_when_tasks_remain(130, stopped=False) is True
+    assert wait_for_proxy_when_tasks_remain(0, stopped=False) is False
+    assert wait_for_proxy_when_tasks_remain(130, stopped=True) is False
 
 
 def test_multiprocess_merge_keeps_retry_counters(tmp_path=None):
@@ -86,6 +92,9 @@ class ErrorReportingTest(unittest.TestCase):
 
     def test_programming_exception(self):
         test_programming_exception_remains_visible_undetermined()
+
+    def test_proxy_starvation_keeps_worker(self):
+        test_proxy_starvation_keeps_pending_worker_alive()
 
     def test_merge_retry_counters(self):
         test_multiprocess_merge_keeps_retry_counters()

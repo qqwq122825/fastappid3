@@ -32,6 +32,11 @@ import urllib.request
 SHUFFLE_SEED = 20261125
 
 
+def wait_for_proxy_when_tasks_remain(pending, stopped=False):
+    """A temporary empty proxy pool must not retire a worker with queued work."""
+    return int(pending) > 0 and not bool(stopped)
+
+
 def load_accounts(path, limit, shuffle=True):
     rows = [l.strip() for l in open(path, encoding='utf-8', errors='replace')
             if l.strip() and '----' in l]
@@ -669,13 +674,19 @@ def main():
             if proxy is None:
                 with lock:
                     results['ip_fail'] += 1
-                break
+                # 代理池短暂断货不能让 worker 退出，否则这个线程
+                # 已分配但未处理的整个账号分片会被直接丢下，最终任务
+                # 显示 incomplete。保留分片等待 supplier 下一次补池。
+                if not wait_for_proxy_when_tasks_remain(len(my_tasks), stop.is_set()):
+                    break
+                stop.wait(0.5 + random.uniform(0.0, 0.5))
+                continue
             served = ok_count = 0
             t_prev_end = time.perf_counter()      # 上一轮记录完的时刻
             while served < args.per_ip and not stop.is_set():
                 t_loop = time.perf_counter()
                 gap_ms = (t_loop - t_prev_end) * 1000   # 轮与轮之间的空档
-                if not my_tasks:
+                if not wait_for_proxy_when_tasks_remain(len(my_tasks), stop.is_set()):
                     break
                 email, password = my_tasks.pop()
                 task_key = (email, password)
@@ -893,7 +904,9 @@ def main():
             if ip_pool is not None:
                 ip_pool.release(tid, proxy, proxy_exp, healthy=ok_count > 0)
             if served == 0:
-                break
+                if not my_tasks:
+                    break
+                stop.wait(0.5 + random.uniform(0.0, 0.5))
         with lock:
             spent = (time.thread_time() - cpu_start) * 1000
             results['per_thread_cpu'].append(round(spent, 1))
