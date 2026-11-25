@@ -9,7 +9,7 @@ from fastcheck.protocols import gsa_status
 from fastcheck.status import result_bucket
 from run_mp import merge
 from simple import (finalize_retry_exhausted, local_exception_result, retry_kind,
-                    wait_for_proxy_when_tasks_remain)
+                    probe_google, wait_for_proxy_when_tasks_remain)
 
 
 def test_transport_exception_becomes_retryable_timeout():
@@ -19,6 +19,32 @@ def test_transport_exception_becomes_retryable_timeout():
     assert result_bucket(result) == "timeout"
     assert "TimeoutError" in result["detail"]
     assert "secret proxy URL" not in result["detail"]
+
+
+def test_google_probe_uses_exact_proxy_endpoint_without_logging_credentials():
+    calls = {}
+
+    class Response:
+        status_code = 204
+        def close(self):
+            calls['response_closed'] = True
+
+    class Session:
+        trust_env = True
+        def get(self, url, **kwargs):
+            calls.update(url=url, **kwargs)
+            return Response()
+        def close(self):
+            calls['session_closed'] = True
+
+    proxy = 'socks5h://user:secret@147.182.194.69:8563'
+    result = probe_google(proxy, timeout=3, session_factory=Session)
+    assert result['google_ok'] is True
+    assert result['google_http'] == 204
+    assert calls['proxies'] == {'http': proxy, 'https': proxy}
+    assert calls['timeout'] == (3.0, 3.0)
+    assert calls['response_closed'] and calls['session_closed']
+    assert 'secret' not in json.dumps(result)
 
 
 def test_requests_timeout_is_one_total_wall_clock_budget():
@@ -141,6 +167,9 @@ def test_memory_device_store_loads_once_and_writes_through(tmp_path=None):
 
 
 class ErrorReportingTest(unittest.TestCase):
+    def test_google_timeout_probe(self):
+        test_google_probe_uses_exact_proxy_endpoint_without_logging_credentials()
+
     def test_requests_total_timeout(self):
         test_requests_timeout_is_one_total_wall_clock_budget()
 

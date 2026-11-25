@@ -86,6 +86,42 @@ def _proxy_host(proxy):
         return str(proxy).split('@')[-1]
 
 
+def probe_google(proxy, timeout=3.0, session_factory=None):
+    """Probe Google through the exact proxy endpoint and return log-safe data."""
+    started = time.perf_counter()
+    session = None
+    try:
+        if session_factory is None:
+            import requests
+            session_factory = requests.Session
+        session = session_factory()
+        session.trust_env = False
+        response = session.get(
+            'https://www.google.com/generate_204',
+            proxies={'http': proxy, 'https': proxy},
+            timeout=(float(timeout), float(timeout)),
+            verify=True, allow_redirects=False)
+        try:
+            status = int(response.status_code)
+        finally:
+            response.close()
+        return {'google_ok': True, 'google_http': status,
+                'google_ms': round((time.perf_counter() - started) * 1000, 1),
+                'google_error': ''}
+    except Exception as exc:                                         # noqa: BLE001
+        return {'google_ok': False, 'google_http': 0,
+                'google_ms': round((time.perf_counter() - started) * 1000, 1),
+                # Exception messages can contain proxy credentials.  The type
+                # is sufficient for this connectivity diagnostic.
+                'google_error': type(exc).__name__}
+    finally:
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+
 def load_accounts(path, limit, shuffle=True):
     rows = [l.strip() for l in open(path, encoding='utf-8', errors='replace')
             if l.strip() and '----' in l]
@@ -467,12 +503,15 @@ def main():
     lock = _new_state_lock()
     sink_lock = threading.Lock()       # 结果落盘不占用状态锁
     budget_lock = threading.Lock()     # 预算日志有独立的 I/O 锁
+    google_lock = threading.Lock()     # 超时代理 Google 诊断日志
     info_gate = threading.Lock()       # 全进程只获取一次 anisette 客户端信息
     info_cache = {}
     sink = open(args.out, 'w', encoding='utf-8')
     write_buffer = []          # 攒够再落盘，避免每条都 fsync
     # 预算耗尽专用日志：每条 budget_hit 一行，含 OTP/每跳耗时拆解，方便单独分析
     budget_sink = open(os.path.splitext(args.out)[0] + '-budget.jsonl', 'w', encoding='utf-8')
+    google_log_path = os.path.splitext(args.out)[0] + '-timeout-google.jsonl'
+    google_sink = open(google_log_path, 'w', encoding='utf-8')
     import collections
     started = time.perf_counter()
     wall_started = time.time()
@@ -486,6 +525,7 @@ def main():
                'device_registering': set(), 'register_errors': 0,
                'register_error_types': {}}
     stop = threading.Event()
+    print(f'超时 Google 诊断日志: {google_log_path}')
 
     SAMPLE_CAP = 4000          # 历史样本上限，超出只保留最近的一批
 
@@ -819,6 +859,24 @@ def main():
                         attempt_ms.append(round((time.perf_counter() - _a0) * 1000, 1))
                         probe_status = refine_status(result, result_bucket(result))
                         kind, why = retry_kind(result, probe_status)
+                        if probe_status == 'timeout':
+                            # 双重验证必须由刚发生 Apple 超时的同一个业务线程
+                            # 立刻执行。它使用同一代理端点，但为 Google 新建一条
+                            # 独立 SOCKS5 连接；验证完再进入丢弃/换 IP 流程。
+                            google_record = {
+                                'at': time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime()),
+                                'tid': tid, 'slot': slot, 'email': email,
+                                'attempt': attempts, 'proxy': _proxy_host(proxy),
+                                'apple_status': probe_status,
+                                'apple_kind': str(result.get('kind') or ''),
+                                'apple_http': result.get('http'),
+                                'apple_detail': str(result.get('detail') or '')[:160],
+                            }
+                            google_record.update(probe_google(proxy, timeout=3.0))
+                            with google_lock:
+                                google_sink.write(json.dumps(
+                                    google_record, ensure_ascii=False) + '\n')
+                                google_sink.flush()
                         if kind is None or attempts > args.retry or stop.is_set():
                             if attempts > args.retry:
                                 finalize_retry_exhausted(result)
@@ -1052,6 +1110,7 @@ def main():
         thread.start()
     for thread in threads:
         thread.join()
+    google_sink.close()
     wall = time.perf_counter() - started
     with lock:
         if write_buffer:
