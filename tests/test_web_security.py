@@ -187,6 +187,27 @@ class ConsoleRequestTests(unittest.TestCase):
         self.assertEqual({'ok': True}, response)
         stop.assert_called_once_with()
 
+    def test_new_multi_process_run_removes_stale_result_files(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(web, 'HERE', directory), \
+             patch.object(web, 'LIVE', os.path.join(directory, 'data', 'live.json')):
+            data = os.path.join(directory, 'data')
+            os.makedirs(data)
+            stale = [os.path.join(data, 'live.json'),
+                     os.path.join(data, 'live-p0.json'),
+                     os.path.join(data, 'mp-p0.jsonl')]
+            for path in stale:
+                with open(path, 'w', encoding='utf-8') as handle:
+                    handle.write('stale')
+            keep = os.path.join(data, 'accounts.txt')
+            with open(keep, 'w', encoding='utf-8') as handle:
+                handle.write('fixture')
+            web._LIVE_CACHE.update(at=123.0, data={'recent': ['stale']})
+            web._reset_run_artifacts(2)
+            self.assertTrue(all(not os.path.exists(path) for path in stale))
+            self.assertTrue(os.path.exists(keep))
+            self.assertEqual({'at': 0.0, 'data': None}, web._LIVE_CACHE)
+
     def test_unauthenticated_raw_upload_does_not_write_files(self):
         handler = make_handler('/api/upload', raw=b'fixture')
         handler.headers.replace_header('Content-Type', 'application/octet-stream')
@@ -268,7 +289,13 @@ new vm.Script(input.source, {filename: 'web-inline.js'}).runInContext(context);
   const legacy = element('rows').innerHTML;
   context.fetch = async () => ({json: async () => ({error: input.fixture})});
   await vm.runInContext('TICK_RUNNING = false; tick()', context);
-  console.log(JSON.stringify({row, legacy, error: element('stateTag').innerHTML}));
+  const error = element('stateTag').innerHTML;
+  vm.runInContext("HIST={rows:[fixtureRow],total:1}; LAST={done:1,recent:[fixtureRow]}; $('filter').value='timeout'; renderRows();", context);
+  context.fetch = async () => ({ok: true, status: 200,
+    text: async () => JSON.stringify({ok:true,total:2})});
+  await vm.runInContext('start()', context);
+  const reset = vm.runInContext("({filter:$('filter').value,hist:HIST,last:LAST,rows:$('rows').innerHTML,hint:$('tblHint').textContent})", context);
+  console.log(JSON.stringify({row, legacy, error, reset}));
 })().catch(error => { console.error(error); process.exitCode = 1; });
 '''
         source = web.PAGE.split('<script>', 1)[1].split('</script>', 1)[0]
@@ -299,6 +326,16 @@ new vm.Script(input.source, {filename: 'web-inline.js'}).runInContext(context);
         parsed = ParsedHTML(self.rendered['error'])
         self.assertNotIn('b', parsed.tags)
         self.assertIn(self.fixture, ''.join(parsed.text))
+
+    def test_successful_start_clears_old_rows_and_filter(self):
+        reset = self.rendered['reset']
+        self.assertEqual('all', reset['filter'])
+        self.assertIsNone(reset['hist'])
+        self.assertEqual(0, reset['last']['done'])
+        self.assertEqual(2, reset['last']['total'])
+        self.assertEqual([], reset['last']['recent'])
+        self.assertIn('还没有结果', reset['rows'])
+        self.assertEqual('实时刷新', reset['hint'])
 
 
 if __name__ == '__main__':

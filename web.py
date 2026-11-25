@@ -597,11 +597,8 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
                         - int(account_info.get('format_error') or 0))
     total = min(limit, account_total) if limit else account_total
     os.makedirs(os.path.dirname(LIVE), exist_ok=True)
-    try:
-        os.remove(LIVE)
-    except OSError:
-        pass
     processes = max(1, min(int(processes or 1), 8))
+    _reset_run_artifacts(processes)
     run_out = os.path.join(HERE, 'data', f'run-{int(time.time())}.jsonl')
     STATE['run_out'] = run_out
     STATE['started_at'] = time.time()
@@ -670,6 +667,21 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
             'limit': limit, 'total': total, 'total_threads': total_threads,
             'warmup_hint': (f'已启动 {processes} 进程 × {threads} 线程 = {total_threads} 并发；'
                             f'首轮注册设备约 {max(4, total_threads // 16)} 秒后才会有速度')}
+
+
+def _reset_run_artifacts(processes):
+    """Synchronously remove the previous run before a new worker can be polled."""
+    import glob
+    paths = [LIVE]
+    if int(processes) > 1:
+        paths.extend(glob.glob(os.path.join(HERE, 'data', 'live-p*.json')))
+        paths.extend(glob.glob(os.path.join(HERE, 'data', 'mp-p*.jsonl')))
+    for path in paths:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    _LIVE_CACHE.update(at=0.0, data=None)
 
 
 def stop_job():
@@ -1564,9 +1576,17 @@ async function start(){
     $('hint').style.color = 'var(--red)';
     $('start').disabled = false;
   }else{
+    resetResultsForNewTask(res.total);
     $('hint').textContent = res.warmup_hint || '已启动';
     $('hint').style.color = 'var(--green)';
   }
+}
+function resetResultsForNewTask(total){
+  HIST = null;
+  $('filter').value = 'all';
+  $('tblHint').textContent = '实时刷新';
+  LAST = {running:true, finished:false, total:Number(total)||0, done:0, recent:[]};
+  renderRows();
 }
 async function stop(){
   $('stop').disabled = true;
