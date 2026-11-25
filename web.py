@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import os
 import re
@@ -557,6 +558,13 @@ class Handler(BaseHTTPRequestHandler):
             from urllib.parse import urlparse, parse_qs
             query = parse_qs(urlparse(self.path).query)
             name = (query.get('name') or ['accounts.txt'])[0]
+            if 'gzip' in (self.headers.get('Content-Encoding') or '').lower():
+                try:
+                    raw = gzip.decompress(raw)
+                except (OSError, EOFError):
+                    return self._json({'error': '压缩文件损坏，请重新选择文件上传'})
+                if len(raw) > 64 * 1024 * 1024:
+                    return self._json({'error': '解压后内容过大（上限 64MB）'})
             try:
                 content = raw.decode('utf-8-sig')
             except UnicodeDecodeError:
@@ -1000,15 +1008,27 @@ async function upload(file){
   status.textContent = `正在读取 ${file.name}…`;
   status.style.color = 'var(--dim)';
   try{
-    status.textContent = `正在上传 ${file.name}…`;
+    let body = file;
+    const headers = {'Content-Type':'application/octet-stream'};
+    if('CompressionStream' in window){
+      status.textContent = `正在压缩 ${file.name}…`;
+      body = await new Response(
+        file.stream().pipeThrough(new CompressionStream('gzip'))).blob();
+      headers['Content-Encoding'] = 'gzip';
+    }
+    const fromSize = (file.size/1048576).toFixed(1);
+    const toSize = (body.size/1048576).toFixed(1);
+    status.textContent = body === file
+      ? `正在上传 ${file.name}（${fromSize} MB）…`
+      : `正在上传 ${file.name}（${fromSize} → ${toSize} MB）…`;
     const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), 120000);
+    const timer = setTimeout(() => ctl.abort(), 600000);
     let response;
     try{
       response = await fetch('/api/upload?name='+encodeURIComponent(file.name),{
         method:'POST',
-        headers:{'Content-Type':'application/octet-stream'},
-        body:file,
+        headers,
+        body,
         signal:ctl.signal});
     }finally{
       clearTimeout(timer);
@@ -1023,7 +1043,7 @@ async function upload(file){
     $('hint').textContent = `已上传 ${res.name}：${num(res.total)} 条`;
     $('hint').style.color = 'var(--green)';
   }catch(e){
-    const msg = e && e.name === 'AbortError' ? '上传超过 120 秒，请检查网络后重试'
+    const msg = e && e.name === 'AbortError' ? '上传超过 10 分钟，请检查网络后重试'
       : (e.message || e);
     status.textContent = `上传失败：${msg}`;
     status.style.color = 'var(--red)';
