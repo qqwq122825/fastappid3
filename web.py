@@ -345,6 +345,63 @@ def _lower_task_priority(pid, niceness=10):
         return False
 
 
+_PROCESS_CPU = {'pid': None, 'at': None, 'seconds': None, 'cores': None}
+_PROCESS_CPU_LOCK = threading.Lock()
+
+
+def _parse_cpu_time(value):
+    """Parse ``ps -o time=`` (MM:SS.xx or HH:MM:SS.xx) into seconds."""
+    parts = str(value or '').strip().split(':')
+    try:
+        if len(parts) == 2:
+            return float(parts[0]) * 60 + float(parts[1])
+        if len(parts) == 3:
+            return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+    except ValueError:
+        pass
+    return None
+
+
+def _process_cpu_seconds(pid):
+    """Read cumulative CPU time for another process without extra packages."""
+    pid = int(pid)
+    if os.path.isdir('/proc'):
+        try:
+            raw = open(f'/proc/{pid}/stat', encoding='utf-8').read()
+            fields = raw.rsplit(') ', 1)[1].split()
+            ticks = float(os.sysconf('SC_CLK_TCK'))
+            return (float(fields[11]) + float(fields[12])) / ticks
+        except (OSError, ValueError, IndexError):
+            return None
+    if os.name == 'posix':
+        try:
+            result = subprocess.run(
+                ['ps', '-p', str(pid), '-o', 'time='], capture_output=True,
+                text=True, timeout=0.5, check=False)
+            return _parse_cpu_time(result.stdout) if result.returncode == 0 else None
+        except (OSError, subprocess.SubprocessError):
+            return None
+    return None
+
+
+def _process_cpu_now(pid):
+    """Return rolling cores used by PID; unlike live.json this is current."""
+    now = time.monotonic()
+    with _PROCESS_CPU_LOCK:
+        if _PROCESS_CPU['pid'] == int(pid) and _PROCESS_CPU['at'] is not None \
+                and now - _PROCESS_CPU['at'] < 0.75:
+            return _PROCESS_CPU['cores']
+        seconds = _process_cpu_seconds(pid)
+        if seconds is None:
+            return None
+        cores = None
+        if (_PROCESS_CPU['pid'] == int(pid) and _PROCESS_CPU['at'] is not None
+                and now > _PROCESS_CPU['at'] and seconds >= _PROCESS_CPU['seconds']):
+            cores = (seconds - _PROCESS_CPU['seconds']) / (now - _PROCESS_CPU['at'])
+        _PROCESS_CPU.update(pid=int(pid), at=now, seconds=seconds, cores=cores)
+        return cores
+
+
 _LIVE_CACHE = {'at': 0.0, 'data': None}
 _RESULT_PROGRESS = {'key': None, 'offset': 0, 'done': 0, 'tail': b'',
                     'by_status': {}, 'recent': collections.deque(maxlen=12)}
@@ -474,6 +531,10 @@ def _live_state_uncached():
             live['eta'] = round(max(0, total - done) / rate, 0)
     live['running'] = running
     live['pid'] = int(record['pid']) if running else None
+    if running:
+        current_cores = _process_cpu_now(record['pid'])
+        if current_cores is not None:
+            live['proc_cpu_now'] = round(current_cores, 2)
     live['accounts'] = STATE['accounts']
     if not live.get('total') and not running:
         live.setdefault('error', 'live.json 还没生成，先点「开始」')
@@ -1549,7 +1610,10 @@ async function tick(){
   $('mThreads').textContent = processes>1
     ? `${threads} 线程 × ${processes} 进程` : `${threads} 线程`;
   const procCores = d.proc_cpu_cores ?? d.cpu_cores ?? 0;
-  $('mCpu').textContent = `CPU ${procCores.toFixed(2)} 核`
+  const nowCores = d.proc_cpu_now;
+  $('mCpu').textContent = nowCores == null
+    ? `CPU 平均 ${procCores.toFixed(2)} 核`
+    : `CPU 当前 ${Number(nowCores).toFixed(2)} 核 · 平均 ${procCores.toFixed(2)} 核`
     + (d.cpu_per_account ? ` · ${d.cpu_per_account.toFixed(1)} ms/条` : '');
   $('mP50').textContent = `p50 ${d.p50 ?? '--'} ms · p90 ${d.p90 ?? '--'} ms`;
   $('mOtp').textContent = `公共头 命中 ${num(d.otp_hit)} / 拉取 ${num(d.otp_fetch)}`;

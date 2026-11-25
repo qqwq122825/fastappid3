@@ -134,6 +134,14 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('controller.abort(), 4000', web.PAGE)
         self.assertNotIn('fetch(\'/api/live?t=\'+Date.now())).json()', web.PAGE)
 
+    def test_cpu_display_distinguishes_current_from_average(self):
+        import web
+        self.assertEqual(3153.82, web._parse_cpu_time('52:33.82'))
+        self.assertEqual(3723.5, web._parse_cpu_time('1:02:03.5'))
+        self.assertIsNone(web._parse_cpu_time('not-a-time'))
+        self.assertIn('CPU 当前 ${Number(nowCores).toFixed(2)} 核', web.PAGE)
+        self.assertIn('· 平均 ${procCores.toFixed(2)} 核', web.PAGE)
+
     def test_stop_uses_persisted_process_group_after_web_restart(self):
         from unittest.mock import patch
         import web
