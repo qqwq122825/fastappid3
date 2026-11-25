@@ -195,6 +195,15 @@ def retry_kind(result, bucket):
     return RETRY_NONE, ''
 
 
+def finalize_retry_exhausted(result):
+    """Turn Apple's ambiguous account-information reason into the final verdict."""
+    from fastcheck.status import account_information_incorrect
+    if account_information_incorrect(result):
+        result['retry_exhausted'] = 'account_information_incorrect'
+        result['status'] = 'wrong_password'
+    return result
+
+
 def local_exception_result(exc):
     """Turn a caught local exception into a safe, classifiable result.
 
@@ -735,6 +744,8 @@ def main():
                         probe_status = refine_status(result, result_bucket(result))
                         kind, why = retry_kind(result, probe_status)
                         if kind is None or attempts > args.retry or stop.is_set():
+                            if attempts > args.retry:
+                                finalize_retry_exhausted(result)
                             retry_reason = why if attempts > 1 else ''
                             break
                         retry_reason = why

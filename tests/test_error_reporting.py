@@ -7,7 +7,8 @@ from pathlib import Path
 from fastcheck.devices import count_registered_devices
 from fastcheck.status import result_bucket
 from run_mp import merge
-from simple import local_exception_result, wait_for_proxy_when_tasks_remain
+from simple import (finalize_retry_exhausted, local_exception_result, retry_kind,
+                    wait_for_proxy_when_tasks_remain)
 
 
 def test_transport_exception_becomes_retryable_timeout():
@@ -26,6 +27,22 @@ def test_programming_exception_remains_visible_undetermined():
     assert result_bucket(result) == "undetermined"
     assert "KeyError" in result["detail"]
     assert "secret account" not in result["detail"]
+
+
+def test_account_information_incorrect_retries_then_becomes_wrong_password():
+    result = {
+        "status": "error",
+        "http": 200,
+        "apple_message": "Your account information was entered incorrectly.",
+    }
+    bucket = result_bucket(result)
+    assert bucket == "timeout"
+    assert retry_kind(result, bucket)[0] is not None
+
+    finalize_retry_exhausted(result)
+    assert result["retry_exhausted"] == "account_information_incorrect"
+    assert result_bucket(result) == "wrong_password"
+    assert retry_kind(result, result_bucket(result))[0] is None
 
 
 def test_proxy_starvation_keeps_pending_worker_alive():
@@ -87,6 +104,9 @@ def test_registered_devices_are_persisted_total_not_live_workers(tmp_path=None):
 
 
 class ErrorReportingTest(unittest.TestCase):
+    def test_account_information_retry_exhaustion(self):
+        test_account_information_incorrect_retries_then_becomes_wrong_password()
+
     def test_transport_exception(self):
         test_transport_exception_becomes_retryable_timeout()
 
