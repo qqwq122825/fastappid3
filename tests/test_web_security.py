@@ -198,7 +198,7 @@ new vm.Script(input.source, {filename: 'web-inline.js'}).runInContext(context);
   vm.runInContext("LAST = {done: 1, recent: [fixtureRow]}; $('filter').value = 'all'; renderRowsOld();", context);
   const legacy = element('rows').innerHTML;
   context.fetch = async () => ({json: async () => ({error: input.fixture})});
-  await vm.runInContext('tick()', context);
+  await vm.runInContext('TICK_RUNNING = false; tick()', context);
   console.log(JSON.stringify({row, legacy, error: element('stateTag').innerHTML}));
 })().catch(error => { console.error(error); process.exitCode = 1; });
 '''

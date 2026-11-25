@@ -328,6 +328,23 @@ def _running_pid():
     return int(record['pid']) if record else None
 
 
+def _lower_task_priority(pid, niceness=10):
+    """Keep a high-concurrency worker from starving the web console.
+
+    ``setpriority`` runs in the parent after ``Popen`` and is therefore safe in
+    this threaded HTTP server (unlike ``preexec_fn``).  Worker children inherit
+    the lower scheduling priority.  Unsupported platforms simply keep their
+    default priority.
+    """
+    if os.name != 'posix' or not hasattr(os, 'setpriority'):
+        return False
+    try:
+        os.setpriority(os.PRIO_PROCESS, int(pid), int(niceness))
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 _LIVE_CACHE = {'at': 0.0, 'data': None}
 _RESULT_PROGRESS = {'key': None, 'offset': 0, 'done': 0, 'tail': b'',
                     'by_status': {}, 'recent': collections.deque(maxlen=12)}
@@ -536,6 +553,7 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
     # inherit it, so Stop can terminate the whole tree with one signal.
     proc = subprocess.Popen(cmd, cwd=HERE, stdout=log, stderr=subprocess.STDOUT,
                             start_new_session=True)
+    _lower_task_priority(proc.pid)
     STATE.update(proc=proc, accounts=accounts, threads=threads, limit=limit,
                  total=total, processes=processes, started=time.time(),
                  pending_accounts=None)
@@ -1492,9 +1510,14 @@ $('filter').onchange = () => {
 function setStat(id, v){ $(id).textContent = num(v); }
 
 async function tick(){
+  if(TICK_RUNNING) return;
+  TICK_RUNNING = true;
+  const controller = new AbortController();
+  const timeout = setTimeout(()=>controller.abort(), 4000);
   let d;
-  try{ d = await (await fetch('/api/live?t='+Date.now())).json(); }
+  try{ d = await (await fetch('/api/live?t='+Date.now(), {signal:controller.signal})).json(); }
   catch(e){ $('stateTag').innerHTML='<span class="dot" style="background:#dc2626"></span>读取失败'; return; }
+  finally{ clearTimeout(timeout); TICK_RUNNING = false; }
   if(d.error){
     if(d.need_login){ $('gate').style.display='flex'; $('pwd').focus(); return; }
     $('stateTag').innerHTML='<span class="dot" style="background:#9ca3af"></span>'+esc(d.error);
@@ -1568,6 +1591,7 @@ async function tick(){
 
 let LAST = null;
 let HIST = null;          // 筛选时从 /api/results 拿的历史结果
+let TICK_RUNNING = false; // 慢请求时不叠加轮询，避免页面突然卡顿
 
 function rowHtml(r, idx){
   const st = r.status || 'unknown';

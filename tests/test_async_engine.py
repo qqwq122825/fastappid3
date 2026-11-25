@@ -124,6 +124,16 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
             task = json.loads((root / 'data' / 'task-process.json').read_text())
             self.assertEqual(123, task['pid'])
 
+    def test_worker_priority_and_live_polling_protect_console(self):
+        from unittest.mock import patch
+        import web
+        with patch.object(web.os, 'setpriority') as setpriority:
+            self.assertTrue(web._lower_task_priority(123, 10))
+        setpriority.assert_called_once_with(web.os.PRIO_PROCESS, 123, 10)
+        self.assertIn('if(TICK_RUNNING) return', web.PAGE)
+        self.assertIn('controller.abort(), 4000', web.PAGE)
+        self.assertNotIn('fetch(\'/api/live?t=\'+Date.now())).json()', web.PAGE)
+
     def test_stop_uses_persisted_process_group_after_web_restart(self):
         from unittest.mock import patch
         import web
