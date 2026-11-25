@@ -12,6 +12,7 @@ import gzip
 import json
 import os
 import re
+import signal
 import subprocess
 import threading
 import time
@@ -22,6 +23,7 @@ LIVE = os.path.join(HERE, 'data', 'live.json')
 UPLOAD_DIR = os.path.join(HERE, 'data', 'uploads')
 DEFAULT_ACCOUNTS = os.path.join(HERE, 'data', 'accounts.txt')
 ACCOUNT_STATE = os.path.join(HERE, 'data', 'current-accounts.json')
+TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -219,8 +221,81 @@ def _path_allowed(path):
 
 
 def is_running():
-    proc = STATE['proc']
-    return bool(proc is not None and proc.poll() is None)
+    return _active_task_record() is not None
+
+
+def _pid_start_token(pid):
+    """Linux PID identity token; prevents killing an unrelated reused PID."""
+    try:
+        raw = open(f'/proc/{int(pid)}/stat', encoding='utf-8').read()
+        return raw.rsplit(') ', 1)[1].split()[19]
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _group_alive(pgid):
+    try:
+        os.killpg(int(pgid), 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _read_task_record():
+    try:
+        with open(TASK_STATE, encoding='utf-8') as handle:
+            record = json.load(handle)
+        return record if isinstance(record, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _write_task_record(record):
+    os.makedirs(os.path.dirname(TASK_STATE), exist_ok=True)
+    tmp = TASK_STATE + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as handle:
+        json.dump(record, handle, ensure_ascii=False)
+    os.replace(tmp, TASK_STATE)
+
+
+def _clear_task_record():
+    try:
+        os.remove(TASK_STATE)
+    except OSError:
+        pass
+
+
+def _active_task_record():
+    """Return the live task even after this web controller was restarted."""
+    proc = STATE.get('proc')
+    if proc is not None and proc.poll() is None:
+        record = _read_task_record() or {'pid': proc.pid, 'pgid': proc.pid}
+        return record
+    record = _read_task_record()
+    if not record:
+        return None
+    try:
+        pid, pgid = int(record['pid']), int(record['pgid'])
+    except (KeyError, TypeError, ValueError):
+        _clear_task_record()
+        return None
+    if pid <= 1 or pgid <= 1 or not _group_alive(pgid):
+        _clear_task_record()
+        return None
+    expected = record.get('pid_start')
+    actual = _pid_start_token(pid)
+    if expected and actual and expected != actual:
+        _clear_task_record()
+        return None
+    for key in ('accounts', 'threads', 'limit', 'processes', 'started', 'started_at', 'run_out'):
+        if key in record:
+            STATE[key] = record[key]
+    return record
+
+
+def _running_pid():
+    record = _active_task_record()
+    return int(record['pid']) if record else None
 
 
 _LIVE_CACHE = {'at': 0.0, 'data': None}
@@ -245,7 +320,7 @@ def _live_state_uncached():
         live = {}
     live = dict(live) if isinstance(live, dict) else {}
     live['running'] = running
-    live['pid'] = STATE['proc'].pid if running else None
+    live['pid'] = _running_pid() if running else None
     live['accounts'] = STATE['accounts']
     if not live.get('total') and not running:
         live.setdefault('error', 'live.json 还没生成，先点「开始」')
@@ -317,9 +392,22 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
     log.write(f'\n===== 启动 {time.strftime("%F %T")} =====\n')
     log.write(' '.join(cmd) + '\n')
     log.flush()
-    proc = subprocess.Popen(cmd, cwd=HERE, stdout=log, stderr=subprocess.STDOUT)
+    # One task owns one process group.  run_mp.py and every simple.py child
+    # inherit it, so Stop can terminate the whole tree with one signal.
+    proc = subprocess.Popen(cmd, cwd=HERE, stdout=log, stderr=subprocess.STDOUT,
+                            start_new_session=True)
     STATE.update(proc=proc, accounts=accounts, threads=threads, limit=limit,
                  processes=processes, started=time.time(), pending_accounts=None)
+    try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        pgid = proc.pid
+    _write_task_record({
+        'pid': proc.pid, 'pgid': pgid, 'pid_start': _pid_start_token(proc.pid),
+        'accounts': accounts, 'threads': threads, 'limit': limit,
+        'processes': processes, 'started': STATE['started'],
+        'started_at': STATE['started_at'], 'run_out': STATE['run_out'],
+    })
     total_threads = threads * processes
     return {'ok': True, 'pid': proc.pid, 'threads': threads, 'processes': processes,
             'limit': limit, 'total_threads': total_threads,
@@ -328,15 +416,38 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
 
 
 def stop_job():
-    proc = STATE['proc']
-    if not is_running():
+    record = _active_task_record()
+    if not record:
         return {'error': '没有正在跑的任务'}
-    proc.terminate()
+    pid, pgid = int(record['pid']), int(record['pgid'])
     try:
-        proc.wait(timeout=8)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-    return {'ok': True}
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    proc = STATE.get('proc')
+    deadline = time.monotonic() + 8.0
+    while _group_alive(pgid) and time.monotonic() < deadline:
+        if proc is not None:
+            proc.poll()  # reap the direct child so a zombie cannot keep the group "alive"
+        time.sleep(0.05)
+    forced = _group_alive(pgid)
+    if forced:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    if proc is not None:
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+    stopped = not _group_alive(pgid)
+    if stopped:
+        _clear_task_record()
+        STATE['proc'] = None
+    _LIVE_CACHE.update(at=0.0, data=None)
+    return {'ok': stopped, 'pid': pid, 'pgid': pgid, 'forced': forced,
+            **({} if stopped else {'error': '任务进程组仍未退出'})}
 
 
 # ---------------------------------------------------------------- HTTP
@@ -421,7 +532,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({'running': is_running(),
                                'accounts': STATE['accounts'],
                                'threads': STATE['threads'], 'limit': STATE['limit'],
-                               'pid': STATE['proc'].pid if STATE['proc'] else None,
+                               'pid': _running_pid(),
                                'log_tail': tail_log()})
         self._send(PAGE.encode('utf-8'), 'text/html; charset=utf-8')
 

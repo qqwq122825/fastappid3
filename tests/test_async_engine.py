@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import plistlib
 import tempfile
@@ -82,6 +83,7 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
                          log=str(root / 'data' / 'run.log'))
             with patch.object(web, 'HERE', directory), \
                  patch.object(web, 'LIVE', str(root / 'data' / 'live.json')), \
+                 patch.object(web, 'TASK_STATE', str(root / 'data' / 'task-process.json')), \
                  patch.object(web, 'STATE', state), \
                  patch.object(web, 'is_running', return_value=False), \
                  patch.object(web, 'proxy_api', return_value='http://fixture.invalid/{num}'), \
@@ -89,6 +91,26 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
                 result = web.start_job(str(accounts), 2, 1)
             self.assertTrue(result['ok'])
             self.assertEqual('simple.py', Path(launch.call_args.args[0][1]).name)
+            self.assertTrue(launch.call_args.kwargs['start_new_session'])
+            task = json.loads((root / 'data' / 'task-process.json').read_text())
+            self.assertEqual(123, task['pid'])
+
+    def test_stop_uses_persisted_process_group_after_web_restart(self):
+        from unittest.mock import patch
+        import web
+        record = {'pid': 321, 'pgid': 654, 'pid_start': 'token'}
+        state = dict(web.STATE, proc=None)
+        alive = iter((True, True, False, False, False))
+        with patch.object(web, 'STATE', state), \
+             patch.object(web, '_active_task_record', return_value=record), \
+             patch.object(web, '_group_alive', side_effect=lambda pgid: next(alive)), \
+             patch.object(web.os, 'killpg') as killpg, \
+             patch.object(web, '_clear_task_record') as clear, \
+             patch.object(web.time, 'sleep'):
+            result = web.stop_job()
+        self.assertTrue(result['ok'])
+        killpg.assert_called_once_with(654, web.signal.SIGTERM)
+        clear.assert_called_once_with()
 
     def test_transport_http_zero_is_classified_as_timeout(self):
         row = gsa_async._result(
