@@ -312,14 +312,28 @@ def main():
                   f'活跃进程 {len(alive)}/{len(procs)}')
             time.sleep(5)
     finally:
+        # The web controller gives this parent eight seconds to stop.  Waiting
+        # five seconds *per child* could exceed that window, after which the
+        # parent was killed and later children became PPID-1 orphans.  Use one
+        # shared deadline, then reap every remaining worker in a second pass.
         for job in procs:
             if job['proc'].poll() is None:
                 job['proc'].terminate()
+        deadline = time.monotonic() + 4.0
         for job in procs:
             try:
-                job['proc'].wait(timeout=5)
+                remaining = max(0.05, deadline - time.monotonic())
+                job['proc'].wait(timeout=remaining)
             except subprocess.TimeoutExpired:
+                pass
+        for job in procs:
+            if job['proc'].poll() is None:
                 job['proc'].kill()
+        for job in procs:
+            try:
+                job['proc'].wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
 
     payload = merge(procs, started, expected_total, wall_started)   # 结束时重新汇总
     complete = payload['done'] >= payload['total'] > 0

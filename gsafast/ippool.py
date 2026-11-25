@@ -55,16 +55,23 @@ class IpPool:
         num = max(1, min(self.batch, int(num)))
         url = self.api.format(num=num)
         started = time.monotonic()
+        error = None
         try:
             with urllib.request.urlopen(url, timeout=25) as resp:
                 body = resp.read().decode('utf-8', 'replace')
         except Exception as exc:                                    # noqa: BLE001
             self.stats['api_error'] += 1
-            self.log('ip_api_error', error=type(exc).__name__)
+            error = exc
             return []
         finally:
+            elapsed_ms = round((time.monotonic() - started) * 1000, 1)
             self.stats['api_calls'] += 1
-            self.stats['last_fetch_ms'] = round((time.monotonic() - started) * 1000, 1)
+            self.stats['last_fetch_ms'] = elapsed_ms
+            if error is not None:
+                self.log('ip_api_error', requested=num,
+                         elapsed_ms=elapsed_ms,
+                         error=type(error).__name__,
+                         detail=str(error)[:160])
         values = []
         for line in body.splitlines():
             line = line.strip()
@@ -72,6 +79,8 @@ class IpPool:
                 continue
             values.append(line if '://' in line else f'socks5h://{line}')
         self.stats['fetched'] += len(values)
+        self.log('ip_api_fetch', requested=num, got=len(values),
+                 elapsed_ms=round((time.monotonic() - started) * 1000, 1))
         return values
 
     def _accept(self, values, now=None):

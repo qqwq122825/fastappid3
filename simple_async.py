@@ -94,6 +94,20 @@ async def run(args) -> int:
     os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
     os.makedirs(os.path.dirname(args.live) or '.', exist_ok=True)
 
+    # One causal timeline per process: proxy-API activity and downstream GSA
+    # resets use the same wall clock, so their failure stages are unambiguous.
+    event_path = os.path.splitext(args.live)[0] + '-events.jsonl'
+    event_sink = open(event_path, 'w', encoding='utf-8', buffering=1)
+    event_lock = threading.Lock()
+
+    def emit_event(event: str, **fields):
+        payload = {
+            'at': time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime()),
+            'wall_ts': round(time.time(), 3), 'event': event, **fields,
+        }
+        with event_lock:
+            event_sink.write(json.dumps(payload, ensure_ascii=False) + '\n')
+
     # CPU work stays bounded near core count.  Blocking device bootstrap has a
     # separate executor so it cannot starve SRP while many slots initialise.
     loop = asyncio.get_running_loop()
@@ -110,7 +124,7 @@ async def run(args) -> int:
             raise SystemExit('没有代理接口：设置 GSA_PROXY_API 或 secrets.json')
         ip_pool = IpPool(args.api, threads=concurrency, ttl=args.ip_ttl,
                          per_ip=args.per_ip, batch=args.ip_batch,
-                         refill_interval=args.ip_interval)
+                         refill_interval=args.ip_interval, log=emit_event)
         warmed = await loop.run_in_executor(io_pool, ip_pool.warm, 1)
         ip_pool.start()
         print(f'异步 IP 池预热 {warmed} 条')
@@ -329,14 +343,23 @@ async def run(args) -> int:
                 raw_status = str(result.get('status') or 'error')
                 final = refine_status(result, result_bucket(result))
                 row = {
+                    'at': time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime()),
+                    'wall_ts': round(time.time(), 3),
                     'tid': tid, 'slot': slot, 'email': email,
                     'raw_status': raw_status, 'status': final, 'final': final,
+                    'stage': result.get('stage'), 'kind': result.get('kind'),
                     'ec': result.get('apple_ec'),
                     'detail': str(result.get('apple_message') or result.get('detail') or '')[:160],
                     'http': result.get('http'), 'ms': round(elapsed, 1),
                     'thread_cpu_ms': 0.0, 'attempts': attempts,
                     'retry_reason': retry_reason, 'budget_hit': budget_hit,
                 }
+                detail_lower = row['detail'].lower()
+                if ('connection reset by peer' in detail_lower
+                        or 'connectionreseterror' in detail_lower):
+                    emit_event('gsa_connection_reset', tid=tid, slot=slot,
+                               stage=row.get('stage'), kind=row.get('kind'),
+                               attempt=attempts, elapsed_ms=row['ms'])
                 record(row)
                 queue.task_done()
                 served += 1
@@ -420,6 +443,8 @@ async def run(args) -> int:
         await loop.run_in_executor(io_pool, ip_pool.stop)
     io_pool.shutdown(wait=True, cancel_futures=True)
     cpu_pool.shutdown(wait=True, cancel_futures=True)
+    emit_event('run_stopped', done=state['done'], total=len(rows))
+    event_sink.close()
     print(f"完成 {payload['done']}/{payload['total']} | {payload['rate']} 条/秒 | "
           f"{payload['per_hour']/10000:.1f} 万/小时 | CPU {payload['cpu_cores']} 核")
     if payload['worker_errors']:
