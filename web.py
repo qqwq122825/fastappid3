@@ -92,6 +92,8 @@ STATE = {
     'log': os.path.join(HERE, 'data', 'run.log'),
     'pending_accounts': None,
     'take_pending': False,
+    'run_out': '',          # 本轮结果文件（每次任务独立，避免和历史混在一起）
+    'started_at': 0.0,      # 本轮开始的 epoch 秒
 }
 _ACCOUNT_CACHE = {}
 _LOCK = threading.Lock()
@@ -269,6 +271,9 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
     except OSError:
         pass
     processes = max(1, min(int(processes or 1), 8))
+    run_out = os.path.join(HERE, 'data', f'run-{int(time.time())}.jsonl')
+    STATE['run_out'] = run_out
+    STATE['started_at'] = time.time()
     if processes > 1:
         # 多进程仍用于分配 CPU 密集的 SRP；每个子进程内是 asyncio 连接。
         cmd = [PYTHON, os.path.join(HERE, 'run_mp.py'),
@@ -284,6 +289,7 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
         cmd += ['--per-ip', str(per_ip), '--ip-ttl', str(ip_ttl),
                 '--timeout', str(timeout), '--retry', str(retry),
                 '--item-timeout', str(item_timeout)]
+        # run_mp 不接受 --out，子进程文件名由它自己生成（mp-p*.jsonl）
         if anisette_workers:
             cmd += ['--anisette-workers', str(anisette_workers)]
         if no_register:
@@ -294,6 +300,7 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
         cmd = [PYTHON, os.path.join(HERE, 'simple_async.py'),
                '--accounts', accounts, '--threads', str(threads),
                '--live', LIVE, '--limit', str(limit),
+               '--out', run_out,
                '--per-ip', str(per_ip), '--ip-ttl', str(ip_ttl),
                '--timeout', str(timeout), '--retry', str(retry),
                '--item-timeout', str(item_timeout)]
@@ -419,13 +426,31 @@ class Handler(BaseHTTPRequestHandler):
         self._send(PAGE.encode('utf-8'), 'text/html; charset=utf-8')
 
     def _results(self, want, limit=60):
-        """按状态查历史结果。只读每个 jsonl 的尾部 4MB，避免扫全文件。"""
+        """按状态查**当前任务**的结果。
+
+        jsonl 是追加写的，历史批次都堆在同一个文件里；如果不过滤，
+        页面筛出 2 万条超时、而顶部只有 3 条，因为顶部只统计当前任务。
+        这里用 STATE['started'] 做下界：只保留本轮开始后写入的行。
+        """
         import glob as _glob
         limit = max(1, min(500, int(limit)))
         want = (want or 'all').strip()
+        cutoff = STATE.get('started_at') or 0
+        own = STATE.get('run_out') or ''
+        if own and os.path.exists(own):
+            # 单进程：本轮就是一个文件，直接读全量
+            paths = [own]
+        else:
+            # 多进程：只读本轮开始后写过的 mp-p*.jsonl
+            paths = sorted(_glob.glob(os.path.join(HERE, 'data', 'mp-p*.jsonl')))
         out, seen = [], set()
-        for pat in ('simple-run.jsonl', 'mp-p*.jsonl'):
-            for path in sorted(_glob.glob(os.path.join(HERE, 'data', pat))):
+        if True:
+            for path in paths:
+                try:
+                    if cutoff and os.path.getmtime(path) < cutoff - 5:
+                        continue
+                except OSError:
+                    continue
                 try:
                     with open(path, 'rb') as handle:
                         handle.seek(0, os.SEEK_END)
@@ -459,16 +484,28 @@ class Handler(BaseHTTPRequestHandler):
                                 'cpu': r.get('thread_cpu_ms'),
                                 'detail': r.get('detail')})
         out.reverse()                      # 新的在前
-        return {'total': len(out), 'rows': out[:limit], 'status': want}
+        scoped = bool(own and os.path.exists(own)) or bool(cutoff)
+        return {'total': len(out) if scoped else 0,
+                'rows': out[:limit] if scoped else [],
+                'status': want, 'scoped': scoped}
 
     def _export(self, want, fmt):
-        """按状态筛选导出账号。只保留 邮箱----密码 两列，不带其他信息。"""
+        """按状态筛选导出账号。只保留 邮箱----密码 两列，不带其他信息。
+
+        同样按 STATE['started'] 限定在本轮任务范围内。
+        """
         import glob as _glob
         patterns = [os.path.join(HERE, 'data', 'simple-run.jsonl'),
                     os.path.join(HERE, 'data', 'mp-p*.jsonl')]
+        cutoff = STATE.get('started') or 0
         rows, seen = [], set()
         for pat in patterns:
             for path in sorted(_glob.glob(pat)):
+                try:
+                    if cutoff and os.path.getmtime(path) < cutoff - 5:
+                        continue
+                except OSError:
+                    continue
                 try:
                     handle = open(path, encoding='utf-8', errors='replace')
                 except OSError:
@@ -1265,7 +1302,7 @@ async function loadHistory(want){
   try{
     const r = await (await fetch(`/api/results?status=${encodeURIComponent(want)}&limit=100`)).json();
     HIST = r;
-    $('tblHint').textContent = `共 ${num(r.total)} 条符合条件的记录`;
+    $('tblHint').textContent = `当前任务共 ${num(r.total)} 条符合条件`;
   }catch(e){ HIST = null; $('tblHint').textContent = '查询失败'; }
   renderRows();
 }
