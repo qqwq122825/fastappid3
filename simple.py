@@ -355,7 +355,7 @@ def main():
             f'找不到 fastcheck 模块。应放在 {_local}，'
             f'或用 --fastcheck 指定目录')
     from fastcheck.protocols import gsa_status as gs
-    from fastcheck.devices import DevicePool
+    from fastcheck.devices import DevicePool, count_registered_devices
     from fastcheck.protocols.srp_auth import SRP_MATH_BACKEND
     from fastcheck.status import result_bucket
 
@@ -425,7 +425,6 @@ def main():
                 by_status = dict(results['by_status'])
                 cpu = results['cpu']
                 recent = list(results['recent'])
-                device_ready = len(results['device_ready'])
                 device_in_use = len(results['device_in_use'])
                 device_registering = len(results['device_registering'])
                 register_errors = results['register_errors']
@@ -438,6 +437,10 @@ def main():
                     cached['p50'] = round(statistics.median(ms)) if ms else None
                     cached['p90'] = ms[int(len(ms) * .9)] if ms else None
                     cached['done'] = done
+            # “已注册”是磁盘上持久化且完成注册的设备总数，不是
+            # 本轮已完成初始化的工作线程数。
+            device_registered = count_registered_devices(
+                args.device_root, 'https://new.ani.sidestore.io')
             ms = None
             payload = {
                 'started': time.strftime('%H:%M:%S', time.localtime(wall_started)),
@@ -465,7 +468,8 @@ def main():
                 'writer_cpu': round(time.thread_time() - wcpu0, 2),
                 'main_cpu': round(time.thread_time() - main_cpu0, 2),
                 'otp_fetch': results.get('otp_fetch', 0),
-                'device_ready': device_ready,
+                'device_ready': device_registered,  # 兼容旧页面/旧汇总器
+                'device_registered': device_registered,
                 'device_in_use': device_in_use,
                 'device_registering': device_registering,
                 'register_errors': register_errors,
@@ -940,7 +944,10 @@ def main():
         final['done'] = done_now
         final['incomplete'] = results['incomplete']
         final['elapsed'] = round(wall, 1)
-        final['device_ready'] = len(results['device_ready'])
+        device_registered = count_registered_devices(
+            args.device_root, 'https://new.ani.sidestore.io')
+        final['device_ready'] = device_registered
+        final['device_registered'] = device_registered
         final['device_in_use'] = len(results['device_in_use'])
         final['device_registering'] = len(results['device_registering'])
         final['register_errors'] = results['register_errors']

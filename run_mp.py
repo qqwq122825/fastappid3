@@ -116,7 +116,7 @@ def merge(jobs, started, expected_total=0, wall_started=None):
                 'by_status': {}, 'p50': None, 'p90': None, 'recent': [],
                 'accounts': '', 'finished': True, 'status': 'complete',
                 'incomplete': 0, 'processes': 0, 'otp_hit': 0, 'otp_fetch': 0,
-                'device_ready': 0, 'device_in_use': 0,
+                'device_ready': 0, 'device_registered': 0, 'device_in_use': 0,
                 'device_registering': 0, 'register_errors': 0,
                 'register_error_types': {}, 'retried': 0,
                 'by_retry': {}, 'budget_hit': 0}
@@ -160,7 +160,11 @@ def merge(jobs, started, expected_total=0, wall_started=None):
         budget_hit += payload.get('budget_hit') or 0
         for key, value in (payload.get('by_retry') or {}).items():
             by_retry[key] = by_retry.get(key, 0) + value
-        device_ready += payload.get('device_ready') or 0
+        # 每个子进程看到的都是同一个全局持久化设备池，取最大值
+        # 即可；求和会在 2 进程时把“已注册”重复计数两次。
+        device_ready = max(device_ready,
+                           payload.get('device_registered',
+                                       payload.get('device_ready') or 0) or 0)
         device_in_use += payload.get('device_in_use') or 0
         device_registering += payload.get('device_registering') or 0
         register_errors += payload.get('register_errors') or 0
@@ -202,6 +206,7 @@ def merge(jobs, started, expected_total=0, wall_started=None):
         'otp_hit': otp_hit, 'otp_fetch': otp_fetch,
         'retried': retried, 'by_retry': by_retry, 'budget_hit': budget_hit,
         'device_ready': device_ready,
+        'device_registered': device_ready,
         'device_in_use': device_in_use,
         'device_registering': device_registering,
         'register_errors': register_errors,

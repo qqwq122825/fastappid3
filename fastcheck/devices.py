@@ -98,6 +98,37 @@ class RegisteredStore(StateStore):
         return state
 
 
+def count_registered_devices(root, origin):
+    """Return the number of persisted, fully registered device identities.
+
+    Device registration state is written atomically by ``StateStore``.  Reading
+    the small JSON envelopes directly is much cheaper than constructing a
+    ``DevicePool`` and calling ``inspect`` for every slot, which matters because
+    the live dashboard refreshes this value continuously.
+    """
+    key = hashlib.sha256(origin.encode()).hexdigest()[:24]
+    devices = Path(root) / key / "devices"
+    if not devices.is_dir():
+        return 0
+    total = 0
+    for path in devices.glob(f"*/{key}.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            state = payload.get("state")
+            if not isinstance(state, dict) or not state.get("adi_pb"):
+                continue
+            identifier = base64.b64decode(state.get("identifier", ""), validate=True)
+            adi_pb = base64.b64decode(state["adi_pb"], validate=True)
+            if len(identifier) == 16 and adi_pb:
+                total += 1
+        except (OSError, ValueError, TypeError, KeyError):
+            # A concurrently replaced, truncated, or invalid state is not a
+            # registered device.  The next live refresh will count it once the
+            # atomic write has completed.
+            continue
+    return total
+
+
 @dataclass(frozen=True)
 class RetryPolicy:
     attempts: int = 2

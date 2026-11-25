@@ -1189,7 +1189,7 @@ async function tick(){
   const rkText = Object.keys(rk).length
     ? ' · ' + Object.entries(rk).map(([k,v]) => `${k}:${v}`).join(' ') : '';
   $('mRetry').textContent = `重试 ${num(d.retried)}${rkText}`;
-  $('mDevices').textContent = `设备池 已注册 ${num(d.device_ready)} / 使用中 ${num(d.device_in_use)} / 注册中 ${num(d.device_registering)}`;
+  $('mDevices').textContent = `设备池 已注册 ${num(d.device_registered ?? d.device_ready)} / 使用中 ${num(d.device_in_use)} / 注册中 ${num(d.device_registering)}`;
   const re = d.register_error_types || {};
   const reTop = Object.entries(re).sort((a,b)=>b[1]-a[1]).slice(0,2)
     .map(([k,v])=>`${k} ${num(v)}`).join(' · ');
