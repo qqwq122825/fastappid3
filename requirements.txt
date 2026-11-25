@@ -10,6 +10,9 @@ portalocker>=2.7
 # 本体会在 connect(proxy=...) 时反复 ImportError，所以需要 python-socks。
 websockets>=15,<18
 python-socks>=2.7,<3
+# 热路径改用 asyncio：600 个并发账号不再需要 600 个 OS 线程
+aiohttp>=3.10,<4
+aiohttp-socks>=0.10,<1
 
 # 测试（可选）：pip install pytest 后可跑 pytest tests/
 # pytest>=8.0

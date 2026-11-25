@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""多进程调度：把账号和设备槽位切开，起 N 个 simple.py 子进程，汇总成一份 live.json。
+"""多进程调度：把账号和设备槽位切开，起 N 个异步子进程，汇总 live.json。
 
-为什么要多进程：Python 单进程被 GIL 卡在 1 核，4 核机器必须 4 进程才能吃满。
+网络等待使用 asyncio；多进程只用于分摊 SRP/PBKDF2 的 CPU 工作。
 
     python3 run_mp.py --processes 4 --threads 500 --limit 0
     python3 run_mp.py --processes 4 --threads 500 --limit 20000 --per-ip 6
@@ -27,6 +27,7 @@ from simple import proxy_api_default      # noqa: E402  凭据统一从 secrets/
 PYTHON = os.path.join(HERE, '.venv', 'bin', 'python')
 DATA = os.path.join(HERE, 'data')
 LIVE = os.path.join(DATA, 'live.json')
+WORKER = os.path.join(HERE, 'simple_async.py')
 
 
 def count_accounts(path):
@@ -65,7 +66,7 @@ def build_jobs(args, total):
 def spawn(args, jobs):
     procs = []
     for job in jobs:
-        cmd = [PYTHON, os.path.join(HERE, 'simple.py'),
+        cmd = [PYTHON, WORKER,
                '--accounts', args.accounts,
                '--threads', str(args.threads),
                '--offset', str(job['offset']),
@@ -186,10 +187,10 @@ def merge(jobs, started, expected_total=0, wall_started=None):
         'rate': round(done / elapsed, 2) if elapsed else 0,
         'per_hour': round(done / elapsed * 3600) if elapsed else 0,
         'eta': round((total - done) / (done / elapsed), 0) if done and elapsed else None,
-        # 页面会再显示“每进程线程 × 进程数”，这里必须保留每进程口径，
+        # 页面会再显示“每进程协程 × 进程数”，这里必须保留每进程口径，
         # 不能提前乘一次，否则 2×400 会被误显示成 800×2。
         'threads': jobs[0].get('threads', 0) if jobs else 0,
-        'backend': 'gmpy2',
+        'backend': 'gmpy2', 'engine': 'asyncio',
         'cpu_seconds': round(cpu, 2),
         'cpu_cores': round(cpu / elapsed, 3) if elapsed else 0,
         'cpu_per_account': round(cpu / done * 1000, 1) if done else 0,
@@ -223,7 +224,7 @@ def main():
     ap.add_argument('--accounts', default='/Users/xxx/Downloads/2026-11-23_全部结果.txt')
     ap.add_argument('--api', default=proxy_api_default(), help='代理接口，含 {num} 占位符')
     ap.add_argument('--processes', type=int, default=4)
-    ap.add_argument('--threads', type=int, default=500, help='每进程线程数')
+    ap.add_argument('--threads', type=int, default=500, help='每进程并发协程数')
     ap.add_argument('--limit', type=int, default=0, help='总条数，0=全部')
     ap.add_argument('--offset', type=int, default=0)
     ap.add_argument('--slot-base', type=int, default=0, dest='slot_base')
@@ -261,9 +262,9 @@ def main():
     total = count_accounts(args.accounts)
     jobs = build_jobs(args, total)
     need_slots = args.slot_base + len(jobs) * args.threads
-    print(f'账号总数 {total}，切成 {len(jobs)} 个进程 × {args.threads} 线程 '
-          f'= {len(jobs)*args.threads} 线程，设备槽位 1-{need_slots}')
-    print(f'内存预估: 线程栈 {len(jobs)*args.threads} MB + 每进程约 150MB Python')
+    print(f'账号总数 {total}，切成 {len(jobs)} 个进程 × {args.threads} 协程 '
+          f'= {len(jobs)*args.threads} 并发，设备槽位 1-{need_slots}')
+    print(f'内存预估: 协程任务 + 每进程约 150MB Python（无每协程线程栈）')
     if not jobs:
         raise SystemExit(f'没有可处理的账号：文件 {args.accounts} 在 offset={args.offset} '
                          f'之后没有记录（共 {total} 条）')

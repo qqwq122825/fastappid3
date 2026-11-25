@@ -185,8 +185,8 @@ class IpPool:
             self._stop.wait(self.interval)
 
     # ---------------------------------------------------------------- 取还
-    def acquire(self, tid, wait=30.0):
-        """返回 (proxy, expires_at)；取用不排队，只有池真的空了才会短暂等待。"""
+    def acquire_nowait(self, tid):
+        """异步调度器用的非阻塞取用；池空时不睡眠也不计一次 blocked。"""
         bucket = self._local.get(tid)
         now = time.monotonic()
         if bucket:
@@ -196,17 +196,23 @@ class IpPool:
                     self.stats['local_hit'] += 1
                     return proxy, exp
                 self.stats['expired'] += 1
-        while True:                                  # 逐条取，过期的直接丢，直到拿到能用的
+        while True:
             try:
                 proxy, exp = self._shared.get_nowait()
             except queue.Empty:
-                break
+                return None, 0.0
             if exp > time.monotonic():
                 self.stats['shared_hit'] += 1
                 with self._seen_lock:
                     self._seen.pop(proxy, None)
                 return proxy, exp
             self.stats['expired'] += 1
+
+    def acquire(self, tid, wait=30.0):
+        """返回 (proxy, expires_at)；取用不排队，只有池真的空了才会短暂等待。"""
+        proxy, exp = self.acquire_nowait(tid)
+        if proxy:
+            return proxy, exp
         # 这里只等 supplier 补货，工作线程绝不自己发 API
         deadline = time.monotonic() + max(0.0, float(wait))
         while time.monotonic() < deadline and not self._stop.is_set():

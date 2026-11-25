@@ -270,7 +270,7 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
         pass
     processes = max(1, min(int(processes or 1), 8))
     if processes > 1:
-        # 多进程：4 核机器要吃满必须多进程（单进程被 GIL 卡在 1 核）
+        # 多进程仍用于分配 CPU 密集的 SRP；每个子进程内是 asyncio 连接。
         cmd = [PYTHON, os.path.join(HERE, 'run_mp.py'),
                '--accounts', accounts, '--processes', str(processes),
                '--threads', str(threads)]
@@ -291,7 +291,7 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
         if anisette_proxy:
             cmd.append('--anisette-proxy')
     else:
-        cmd = [PYTHON, os.path.join(HERE, 'simple.py'),
+        cmd = [PYTHON, os.path.join(HERE, 'simple_async.py'),
                '--accounts', accounts, '--threads', str(threads),
                '--live', LIVE, '--limit', str(limit),
                '--per-ip', str(per_ip), '--ip-ttl', str(ip_ttl),
@@ -316,7 +316,7 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
     total_threads = threads * processes
     return {'ok': True, 'pid': proc.pid, 'threads': threads, 'processes': processes,
             'limit': limit, 'total_threads': total_threads,
-            'warmup_hint': (f'已启动 {processes} 进程 × {threads} 线程 = {total_threads} 线程；'
+            'warmup_hint': (f'已启动 {processes} 进程 × {threads} 协程 = {total_threads} 并发；'
                             f'首轮注册设备约 {max(4, total_threads // 16)} 秒后才会有速度')}
 
 
@@ -798,8 +798,8 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
         <div class="row2">
           <div><input type="number" id="processes" value="2" min="1" max="8" placeholder="进程数">
             <div class="hint">进程数</div></div>
-          <div><input type="number" id="threads" value="1000" min="1" max="2000" placeholder="线程/进程">
-            <div class="hint">每进程线程</div></div>
+          <div><input type="number" id="threads" value="1000" min="1" max="2000" placeholder="协程/进程">
+            <div class="hint">每进程协程</div></div>
         </div>
         <div class="hint" id="rechint"></div>
       </div>
@@ -878,7 +878,7 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
 
         <div class="meta" style="display:flex;justify-content:space-between;
              padding:12px 0;border-top:1px solid var(--line);margin-top:12px;font-size:12px;color:var(--dim)">
-          <span id="mThreads">-- 线程</span>
+          <span id="mThreads">-- 协程</span>
           <span id="mCpu">CPU -- 核</span>
           <span id="mP50">p50 -- ms</span>
           <span id="mOtp">公共头 命中 -- / 拉取 --</span>
@@ -1117,11 +1117,11 @@ $('refresh').onclick = () => { shownAccounts=null; tick(); };
 /* ---- 推荐提示 ---- */
 function refreshHint(){
   const p=+$('processes').value, t=+$('threads').value, total=p*t, warn=[];
-  if(p===1 && t>1200) warn.push('单进程超 1200 线程会变慢，建议多进程');
-  if(total>3000) warn.push(`总线程 ${total} 可能超出 4G 内存`);
-  if(p>1 && t>1200) warn.push('每进程超 1200 线程边际递减');
+  if(p===1 && t>1600) warn.push('单进程超 1600 协程会放大上游长尾');
+  if(total>4000) warn.push(`总协程 ${total} 可能放大代理排队`);
+  if(p>1 && t>1600) warn.push('每进程超 1600 协程边际递减');
   $('rechint').textContent = warn.length ? '⚠ '+warn.join('；')
-    : `共 ${total} 线程 · 4 核 4G 推荐 2 × 1000`;
+    : `共 ${total} 协程 · asyncio 异步连接`;
   $('rechint').style.color = warn.length ? 'var(--amber)' : 'var(--dim)';
   $('modeTag').textContent = p>1 ? `${p} 进程` : '单进程';
   $('rechint').style.color = warn.length ? 'var(--amber)' : 'var(--dim)';
@@ -1176,10 +1176,10 @@ async function tick(){
   $('pSpeed').textContent = `${num(d.per_hour)} 条/小时`;
 
   $('started').textContent = d.started || '--';
-  $('backend').textContent = d.backend || '--';
+  $('backend').textContent = [d.backend, d.engine].filter(Boolean).join('·') || '--';
   $('backend').style.color = d.backend==='gmpy2' ? 'var(--green)' : 'var(--red)';
   $('mThreads').textContent = d.processes>1
-    ? `${d.threads} 线程 × ${d.processes} 进程` : `${d.threads} 线程`;
+    ? `${d.threads} 协程 × ${d.processes} 进程` : `${d.threads} 协程`;
   const procCores = d.proc_cpu_cores ?? d.cpu_cores ?? 0;
   $('mCpu').textContent = `CPU ${procCores.toFixed(2)} 核`
     + (d.cpu_per_account ? ` · ${d.cpu_per_account.toFixed(1)} ms/条` : '');
