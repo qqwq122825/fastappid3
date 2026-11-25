@@ -546,6 +546,23 @@ class Handler(BaseHTTPRequestHandler):
         if length > 64 * 1024 * 1024:          # 上传上限 64MB
             return self._json({'error': '上传内容过大（上限 64MB）'})
         raw = self.rfile.read(length) if length else b'{}'
+
+        # 文件上传直接发送原始字节，避免浏览器先把大文件读成字符串、再做一遍
+        # JSON 转义和复制。保留下面的 JSON 分支以兼容旧页面。
+        content_type = (self.headers.get('Content-Type') or '').lower()
+        if self.path.startswith('/api/upload') and \
+                'application/octet-stream' in content_type:
+            if not self._authorized():
+                return self._json({'error': '请先输入密码', 'need_login': True})
+            from urllib.parse import urlparse, parse_qs
+            query = parse_qs(urlparse(self.path).query)
+            name = (query.get('name') or ['accounts.txt'])[0]
+            try:
+                content = raw.decode('utf-8-sig')
+            except UnicodeDecodeError:
+                return self._json({'error': '文件不是 UTF-8 文本，请转换编码后重试'})
+            return self._json(self._upload({'name': name, 'content': content}))
+
         try:
             payload = json.loads(raw.decode('utf-8'))
         except ValueError:
@@ -983,11 +1000,19 @@ async function upload(file){
   status.textContent = `正在读取 ${file.name}…`;
   status.style.color = 'var(--dim)';
   try{
-    const content = await file.text();
     status.textContent = `正在上传 ${file.name}…`;
-    const response = await fetch('/api/upload',{method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({name:file.name, content})});
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 120000);
+    let response;
+    try{
+      response = await fetch('/api/upload?name='+encodeURIComponent(file.name),{
+        method:'POST',
+        headers:{'Content-Type':'application/octet-stream'},
+        body:file,
+        signal:ctl.signal});
+    }finally{
+      clearTimeout(timer);
+    }
     const text = await response.text();
     let res;
     try{ res = JSON.parse(text); }
@@ -998,7 +1023,9 @@ async function upload(file){
     $('hint').textContent = `已上传 ${res.name}：${num(res.total)} 条`;
     $('hint').style.color = 'var(--green)';
   }catch(e){
-    status.textContent = `上传失败：${e.message || e}`;
+    const msg = e && e.name === 'AbortError' ? '上传超过 120 秒，请检查网络后重试'
+      : (e.message || e);
+    status.textContent = `上传失败：${msg}`;
     status.style.color = 'var(--red)';
     $('hint').textContent = status.textContent;
     $('hint').style.color = 'var(--red)';
