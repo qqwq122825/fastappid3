@@ -77,6 +77,19 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(200, small.refill_batch)
         self.assertEqual(50, small.low_water)
 
+    def test_supplier_wakeup_does_not_bypass_refill_interval(self):
+        pool = IpPool('http://invalid/{num}', threads=1,
+                      refill_interval=.5)
+        calls = []
+        pool._fetch = lambda num: calls.append(time.monotonic()) or []
+        pool.start()
+        until = time.monotonic() + .15
+        while time.monotonic() < until:
+            pool._refill_wakeup.set()
+            time.sleep(.001)
+        pool.stop()
+        self.assertLessEqual(len(calls), 1)
+
     def test_bad_proxy_is_discarded_without_quarantine(self):
         pool = IpPool('http://invalid/{num}', threads=1)
         now = time.monotonic()

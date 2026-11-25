@@ -100,17 +100,14 @@ MOCK_CN = {"valid": "有效", "wrong_password": "密码错误",
 
 
 def _requests_timeout(timeout: float):
-    """Build one wall-clock budget for connect, TLS and response reading.
+    """Use independent connect/read limits, matching gsa-console.
 
-    A scalar requests timeout is applied independently to connect and read.
-    With a SOCKS proxy that allowed one POST to consume almost twice the value,
-    and GSA performs two POSTs per check.  urllib3's total timeout subtracts the
-    connect/TLS duration from the remaining read allowance instead.
+    A slow SOCKS connect must not consume the response read allowance. The
+    connect/TLS phase is capped at 10 seconds while the response may use the
+    full configured timeout (25 seconds by default).
     """
     seconds = max(0.001, float(timeout))
-    connect = min(_CONNECT_TIMEOUT_CAP, seconds)
-    return TimeoutSauce(total=seconds, connect=connect, read=seconds)
-
+    return (min(_CONNECT_TIMEOUT_CAP, seconds), seconds)
 
 def mock_enabled() -> bool:
     """FASTCHECK_MOCK=1 -> no network at all (for UI / engine testing)."""

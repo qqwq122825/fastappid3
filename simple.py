@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """极简线程模型：一个线程 = 一条 IP + 一台设备 + 一条长连接，跑完配额就退出。
 
-没有 IP 池、没有设备池、没有补货、没有重试调度。
+共享 IP 池按低/高水位预热与补货；工作线程只从池中取还代理。
 目的只有一个：量清楚"这套流程跑起来到底吃多少 CPU"。
 
 每个线程做的事：
-    1. 向代理接口领一条 IP（num=1）
+    1. 从按水位补货的共享 IP 池领取代理
     2. 建 SOCKS5 + TLS（requests.Session，keep-alive）
     3. 注册一台设备（fetch_headers registered=False，只做一次）
     4. 循环：取一个账号 → 向该设备领一个公共头(OTP) → 用同一条连接验证
@@ -30,6 +30,68 @@ import urllib.request
 
 
 SHUFFLE_SEED = 20261125
+
+
+def ensure_open_file_limit(threads, resource_module=None):
+    """Raise launchd's tiny descriptor limit before opening network sockets.
+
+    macOS launchd jobs default to a soft RLIMIT_NOFILE of 256. A 1000-thread
+    run reaches that ceiling during the first connection wave; getaddrinfo then
+    surfaces the underlying EMFILE as a misleading NameResolutionError. Keep
+    the hard limit unchanged and request enough descriptors for the workers.
+    """
+    if resource_module is None:
+        try:
+            import resource as resource_module
+        except ImportError:
+            return None
+    soft, hard = resource_module.getrlimit(resource_module.RLIMIT_NOFILE)
+    wanted = max(4096, max(1, int(threads)) * 8)
+    infinity = getattr(resource_module, 'RLIM_INFINITY', -1)
+    target = wanted if hard == infinity else min(wanted, hard)
+    if soft < target:
+        resource_module.setrlimit(resource_module.RLIMIT_NOFILE, (target, hard))
+        soft = target
+    return int(soft)
+
+
+def anisette_concurrency_limit(threads, configured=0):
+    """Bound only public-header refreshes; Apple worker concurrency is unchanged."""
+    threads = max(1, int(threads))
+    configured = int(configured or 0)
+    return configured if configured > 0 else min(100, threads)
+
+
+def anisette_retry_delay(previous, jitter=None):
+    """Stagger a direct provider retry so a transient outage cannot stampede."""
+    if jitter is None:
+        jitter = random.uniform(0.0, 0.5)
+    return min(4.0, 2.0 ** max(0, int(previous))) + float(jitter)
+
+
+def histogram_value_at(histogram, index):
+    """Return the value at a zero-based rank in an integer-ms histogram."""
+    total = sum(max(0, int(count)) for count in histogram.values())
+    if total <= 0:
+        return None
+    index = max(0, min(int(index), total - 1))
+    seen = 0
+    for value, count in sorted((int(value), int(count))
+                               for value, count in histogram.items()):
+        seen += max(0, count)
+        if index < seen:
+            return value
+    return None
+
+
+def histogram_median(histogram):
+    """Exact median without expanding all observations into a large list."""
+    total = sum(max(0, int(count)) for count in histogram.values())
+    if total <= 0:
+        return None
+    left = histogram_value_at(histogram, (total - 1) // 2)
+    right = histogram_value_at(histogram, total // 2)
+    return (left + right) / 2
 
 
 def wait_for_proxy_when_tasks_remain(pending, stopped=False):
@@ -120,6 +182,28 @@ def probe_google(proxy, timeout=3.0, session_factory=None):
                 session.close()
             except Exception:
                 pass
+
+
+def is_google_probe_candidate(result, status):
+    """Match only init-stage Apple ReadTimeouts requested for sampling."""
+    if status != 'timeout':
+        return False
+    detail = str(result.get('detail') or '')
+    folded = detail.casefold()
+    return ('init 超时' in detail
+            and 'readtimeout' in folded
+            and 'gsa.apple.co' in folded)
+
+
+def claim_google_probe_slot(state, lock, result, status, limit=50):
+    """Atomically reserve one of the first matching probe slots."""
+    if not is_google_probe_candidate(result, status):
+        return None
+    with lock:
+        if state.get('claimed', 0) >= int(limit):
+            return None
+        state['claimed'] = state.get('claimed', 0) + 1
+        return state['claimed']
 
 
 def load_accounts(path, limit, shuffle=True):
@@ -289,6 +373,15 @@ def finalize_retry_exhausted(result):
     return result
 
 
+def local_exception_used_proxy(gsa_started, anisette_proxy):
+    """Whether a caught local network error proves the current proxy failed.
+
+    Direct Anisette/OTP requests do not traverse the task proxy. Their DNS or
+    provider failures must not drain the IP pool.
+    """
+    return bool(gsa_started or anisette_proxy)
+
+
 def local_exception_result(exc):
     """Turn a caught local exception into a safe, classifiable result.
 
@@ -403,12 +496,12 @@ def main():
     ap.add_argument('--offset', type=int, default=0, help='从第几条账号开始（多进程切分用）')
     ap.add_argument('--slot-base', type=int, default=0, dest='slot_base',
                     help='设备槽位基址，多进程时各进程不重叠')
-    ap.add_argument('--timeout', type=float, default=10.0)
+    ap.add_argument('--timeout', type=float, default=25.0)
     ap.add_argument('--retries', type=int, default=0,
                     help='协议内重试（同一 IP 同一公共头），一般留 0')
     ap.add_argument('--no-fix-os', action='store_true', dest='no_fix_os',
                     help='不覆盖 macOS 10.12 的设备头（默认会覆盖成 14.0，避免 -23782）')
-    ap.add_argument('--item-timeout', type=float, default=20.0, dest='item_timeout',
+    ap.add_argument('--item-timeout', type=float, default=40.0, dest='item_timeout',
                     help='单条账号的墙钟总预算（含所有重试），超了就判超时放弃')
     ap.add_argument('--retry', type=int, default=2, dest='retry',
                     help='外层重试：http=0 / 5xx / -22421 时换 IP 重来（0=不重试）')
@@ -416,7 +509,7 @@ def main():
     ap.add_argument('--register-workers', type=int, default=0,
                     help='并发注册设备数上限，0=每个工作线程可独立注册')
     ap.add_argument('--anisette-workers', type=int, default=0,
-                    help='并发请求公共头的上限，0=不限（实测服务端扛得住）')
+                    help='并发请求公共头的上限，0=自动（最多100）')
     ap.add_argument('--verify-web', action='store_true', dest='verify_web',
                     help='GSA 判为 locked/security_lock 时，用 web 协议(idmsa)再验一次')
     ap.add_argument('--web-timeout', type=float, default=10.0, dest='web_timeout')
@@ -443,6 +536,7 @@ def main():
     ap.add_argument('--out', default='./data/simple-run.jsonl')
     ap.add_argument('--live', default='./data/live.json', help='实时状态文件，供页面读取')
     args = ap.parse_args()
+    nofile_limit = ensure_open_file_limit(args.threads)
 
     _here = os.path.dirname(os.path.abspath(__file__))
     _local = os.path.join(_here, 'fastcheck')
@@ -476,13 +570,18 @@ def main():
     print(f'账号 {len(rows)} 条（offset={args.offset}）| 线程 {args.threads} '
           f'| 槽位 {args.slot_base + 1}-{args.slot_base + args.threads} '
           f'| SRP {SRP_MATH_BACKEND}')
+    if nofile_limit is not None:
+        print(f'文件描述符上限 {nofile_limit}')
     if SRP_MATH_BACKEND != 'gmpy2':
         print('  警告：gmpy2 未生效，SRP 单次约 9.8ms 而不是 2.2ms')
 
     _rw = int(args.register_workers)
     register_gate = threading.Semaphore(_rw if _rw > 0 else max(1, args.threads))
     _aw = int(args.anisette_workers)
-    anisette_gate = threading.Semaphore(_aw if _aw > 0 else max(1, args.threads))
+    anisette_limit = anisette_concurrency_limit(args.threads, _aw)
+    anisette_gate = threading.Semaphore(anisette_limit)
+    print(f'公共头并发上限 {anisette_limit}'
+          f'{"（自动）" if _aw <= 0 else ""}')
     ip_pool = None
     if not args.no_ip_pool:
         from gsafast.ippool import IpPool
@@ -504,6 +603,7 @@ def main():
     sink_lock = threading.Lock()       # 结果落盘不占用状态锁
     budget_lock = threading.Lock()     # 预算日志有独立的 I/O 锁
     google_lock = threading.Lock()     # 超时代理 Google 诊断日志
+    google_probe_state = {'claimed': 0}
     info_gate = threading.Lock()       # 全进程只获取一次 anisette 客户端信息
     info_cache = {}
     sink = open(args.out, 'w', encoding='utf-8')
@@ -519,6 +619,7 @@ def main():
     main_cpu0 = time.thread_time()      # 主线程 CPU（写盘、序列化都在这里）
     results = {'done': 0, 'cpu': 0.0, 'by_status': {}, 'per_thread_cpu': [],
                'per_thread_count': [], 'samples': [], 'ip_fail': 0,
+               'latency_hist': {},
                'total': len(rows), 'expected': len(rows), 'started': started,
                'recent': collections.deque(maxlen=12),
                'device_ready': set(), 'device_in_use': set(),
@@ -546,13 +647,16 @@ def main():
                 device_registering = len(results['device_registering'])
                 register_errors = results['register_errors']
                 register_error_types = dict(results['register_error_types'])
+                latency_hist = dict(results['latency_hist'])
                 samples = results['samples']
                 if len(samples) > SAMPLE_CAP:
                     del samples[:-SAMPLE_CAP]
                 if done != cached['done']:                      # 只有新增结果才重算
-                    ms = sorted(r['ms'] for r in samples)
-                    cached['p50'] = round(statistics.median(ms)) if ms else None
-                    cached['p90'] = ms[int(len(ms) * .9)] if ms else None
+                    count = sum(latency_hist.values())
+                    median = histogram_median(latency_hist)
+                    cached['p50'] = round(median) if median is not None else None
+                    cached['p90'] = histogram_value_at(
+                        latency_hist, int(count * .9)) if count else None
                     cached['done'] = done
             # “已注册”是磁盘上持久化且完成注册的设备总数，不是
             # 本轮已完成初始化的工作线程数。
@@ -600,6 +704,7 @@ def main():
                 'by_method': results.get('by_method') or {},
                 'p50': cached['p50'],
                 'p90': cached['p90'],
+                'latency_hist': latency_hist,
                 'sample_count': len(samples),
                 'recent': recent,
             }
@@ -793,6 +898,7 @@ def main():
                 stop.wait(0.5 + random.uniform(0.0, 0.5))
                 continue
             served = ok_count = 0
+            proxy_failed = False
             t_prev_end = time.perf_counter()      # 上一轮记录完的时刻
             while served < args.per_ip and not stop.is_set():
                 t_loop = time.perf_counter()
@@ -815,12 +921,18 @@ def main():
                 retry_ip_ms = []                 # 重试换 IP 时 ip_pool.acquire 的等待耗时
                 ip_wait_none = False             # 重试里是否因为「等不到 IP」而中断
                 budget = max(1.0, float(args.item_timeout))
+                gsa_started = False
+                otp_metric = None
                 try:
                     # 同一个 OTP 复用若干条：设备注册时那一次就能摊薄到 15 条上
-                    if (cached_otp is None or args.otp_reuse <= 0
-                            or otp_used >= args.otp_reuse):
+                    needs_otp = (cached_otp is None or args.otp_reuse <= 0
+                                 or otp_used >= args.otp_reuse)
+                    if needs_otp:
                         cached_otp = fetch_otp()
                         otp_used = 0
+                        otp_metric = 'fetch'
+                    else:
+                        otp_metric = 'hit'
                     identity = cached_otp
                     otp_used += 1
                     otp_ms = (time.perf_counter() - t_otp) * 1000
@@ -845,38 +957,19 @@ def main():
                             retry_reason = 'budget'
                             break
                         # gs.check 内部有 init + complete 两跳，每跳读超时 per_hop，
-                        # 一次 check 最多 2×per_hop。之前 per_hop=min(timeout, remain/2)
-                        # 会让慢代理一次就吃满 2×10s≈整个 20s 预算，重试根本没机会跑。
-                        # 改成按「剩余尝试次数 × 2 跳」均分，慢代理只吃掉它该得的那份。
-                        total_attempts = max(1, int(args.retry) + 1)
-                        attempts_left = max(1, total_attempts - (attempts - 1))
-                        per_hop = max(1.0, min(float(args.timeout),
-                                                remain / (2.0 * attempts_left)))
+                        # 与 gsa-console 使用相同阈值：每个 GSA 请求独立获得
+                        # connect/read 时间，不再把账号总预算切碎到剩余重试和两跳。
+                        per_hop = max(1.0, float(args.timeout))
                         _a0 = time.perf_counter()
+                        gsa_started = True
                         result = gs.check(email, password, proxy,
                                           timeout=per_hop,
-                                          retries=args.retries, identity=identity)
+                                          retries=0, identity=identity)
                         attempt_ms.append(round((time.perf_counter() - _a0) * 1000, 1))
                         probe_status = refine_status(result, result_bucket(result))
                         kind, why = retry_kind(result, probe_status)
-                        if probe_status == 'timeout':
-                            # 双重验证必须由刚发生 Apple 超时的同一个业务线程
-                            # 立刻执行。它使用同一代理端点，但为 Google 新建一条
-                            # 独立 SOCKS5 连接；验证完再进入丢弃/换 IP 流程。
-                            google_record = {
-                                'at': time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime()),
-                                'tid': tid, 'slot': slot, 'email': email,
-                                'attempt': attempts, 'proxy': _proxy_host(proxy),
-                                'apple_status': probe_status,
-                                'apple_kind': str(result.get('kind') or ''),
-                                'apple_http': result.get('http'),
-                                'apple_detail': str(result.get('detail') or '')[:160],
-                            }
-                            google_record.update(probe_google(proxy, timeout=3.0))
-                            with google_lock:
-                                google_sink.write(json.dumps(
-                                    google_record, ensure_ascii=False) + '\n')
-                                google_sink.flush()
+                        if kind is not None:
+                            proxy_failed = True
                         if kind is None or attempts > args.retry or stop.is_set():
                             if attempts > args.retry:
                                 finalize_retry_exhausted(result)
@@ -888,6 +981,7 @@ def main():
                             _t_ip = time.perf_counter()
                             ip_pool.release(tid, proxy, proxy_exp, healthy=False)
                             proxy, proxy_exp = ip_pool.acquire(tid, wait=20.0)
+                            proxy_failed = False
                             retry_ip_ms.append(round((time.perf_counter() - _t_ip) * 1000, 1))
                             if proxy is None:
                                 ip_wait_none = True
@@ -900,9 +994,32 @@ def main():
                                 cached_otp = fetch_otp()
                                 identity = cached_otp
                                 otp_used = 1
+                                otp_metric = 'fetch'
                             except Exception:
                                 pass
                         served = max(0, served - 1)   # 重试不占 per_ip 配额
+                    # 只对最终仍为超时的结果做一次同线程 Google 复核。
+                    # 中间重试不再同步探测，避免每条额外阻塞数次 3 秒。
+                    final_probe_status = refine_status(result, result_bucket(result))
+                    probe_index = claim_google_probe_slot(
+                        google_probe_state, google_lock,
+                        result, final_probe_status, limit=50)
+                    if probe_index is not None and proxy:
+                        google_record = {
+                            'probe_index': probe_index,
+                            'at': time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime()),
+                            'tid': tid, 'slot': slot, 'email': email,
+                            'attempt': attempts, 'proxy': _proxy_host(proxy),
+                            'apple_status': final_probe_status,
+                            'apple_kind': str(result.get('kind') or ''),
+                            'apple_http': result.get('http'),
+                            'apple_detail': str(result.get('detail') or '')[:160],
+                        }
+                        google_record.update(probe_google(proxy, timeout=3.0))
+                        with google_lock:
+                            google_sink.write(json.dumps(
+                                google_record, ensure_ascii=False) + '\n')
+                            google_sink.flush()
                     chk_ms = (time.perf_counter() - t_chk) * 1000
                     chk_cpu = (time.thread_time() - c0_chk) * 1000
                     if budget_hit:
@@ -922,10 +1039,19 @@ def main():
                         cached_otp = None
                         otp_used = 0
                         replacement = proxy
-                        if ip_pool is not None:
+                        used_proxy = local_exception_used_proxy(
+                            gsa_started, args.anisette_proxy)
+                        if not used_proxy:
+                            # 直连公共头故障与任务代理无关。像 gsa-console
+                            # 一样延迟重试，并加随机抖动防止1000线程同时重连。
+                            delay = anisette_retry_delay(previous)
+                            stop.wait(delay)
+                        if ip_pool is not None and used_proxy:
+                            proxy_failed = True
                             ip_pool.release(tid, proxy, proxy_exp, healthy=False)
                             replacement, proxy_exp = ip_pool.acquire(tid, wait=20.0)
-                        elif args.api:
+                            proxy_failed = False
+                        elif args.api and used_proxy:
                             replacement = (fetch_one_ip(args.api) if args.no_precheck
                                            else fetch_usable_ip(args.api, args.precheck_timeout))
                         if replacement is not None:
@@ -1034,9 +1160,9 @@ def main():
                     seg['loop'].append((time.perf_counter() - t0) * 1000)
                     seg['ip'].append(ip_ms)
                     seg['otp'].append(otp_ms)
-                    if otp_ms < 5:
+                    if otp_metric == 'hit':
                         results['otp_hit'] = results.get('otp_hit', 0) + 1
-                    else:
+                    elif otp_metric == 'fetch':
                         results['otp_fetch'] = results.get('otp_fetch', 0) + 1
                     seg['chk'].append(chk_ms)
                     if budget_hit:
@@ -1057,6 +1183,9 @@ def main():
                         results['cross'][key] = results['cross'].get(key, 0) + 1
                     if results['done'] % 10 == 0:
                         results['samples'].append(row)
+                    latency_bucket = max(0, int(round(elapsed)))
+                    latency_hist = results['latency_hist']
+                    latency_hist[latency_bucket] = latency_hist.get(latency_bucket, 0) + 1
                     if len(results['recent']) >= 12:
                         results['recent'].popleft()
                     results['recent'].append(row)
@@ -1076,7 +1205,9 @@ def main():
                 mine += 1
                 t_prev_end = time.perf_counter()
             if ip_pool is not None:
-                ip_pool.release(tid, proxy, proxy_exp, healthy=ok_count > 0)
+                ip_pool.release(
+                    tid, proxy, proxy_exp,
+                    healthy=(ok_count > 0 or not proxy_failed))
             if served == 0:
                 if not my_tasks:
                     break

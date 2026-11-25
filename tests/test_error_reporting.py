@@ -7,9 +7,11 @@ from pathlib import Path
 from fastcheck.devices import DevicePool as PersistentDevicePool, count_registered_devices
 from fastcheck.protocols import gsa_status
 from fastcheck.status import result_bucket
+from simple import (claim_google_probe_slot, finalize_retry_exhausted,
+                    is_google_probe_candidate, local_exception_result,
+                    local_exception_used_proxy, probe_google, retry_kind,
+                    wait_for_proxy_when_tasks_remain)
 from run_mp import merge
-from simple import (finalize_retry_exhausted, local_exception_result, retry_kind,
-                    probe_google, wait_for_proxy_when_tasks_remain)
 
 
 def test_transport_exception_becomes_retryable_timeout():
@@ -47,15 +49,40 @@ def test_google_probe_uses_exact_proxy_endpoint_without_logging_credentials():
     assert 'secret' not in json.dumps(result)
 
 
-def test_requests_timeout_is_one_total_wall_clock_budget():
-    timeout = gsa_status._requests_timeout(3.25)
-    assert timeout.total == 3.25
-    assert timeout.connect_timeout == 3.25
-    assert timeout.read_timeout == 3.25
+def test_google_probe_candidate_is_only_init_read_timeout_for_gsa():
+    matching = {
+        'http': 0, 'kind': 'network',
+        'detail': "init 超时：ReadTimeout: SOCKSHTTPSConnectionPool(host='gsa.apple.com')",
+    }
+    assert is_google_probe_candidate(matching, 'timeout') is True
+    assert is_google_probe_candidate(
+        {**matching, 'detail': matching['detail'].replace(
+            'ReadTimeout', 'ConnectTimeout')}, 'timeout') is False
+    assert is_google_probe_candidate(
+        {**matching, 'detail': matching['detail'].replace(
+            'init 超时', 'complete 超时')}, 'timeout') is False
+    assert is_google_probe_candidate(matching, 'wrong_password') is False
+    state = {}
+    lock = __import__('threading').Lock()
+    claimed = [claim_google_probe_slot(
+        state, lock, matching, 'timeout', limit=50) for _ in range(55)]
+    assert claimed[:3] == [1, 2, 3]
+    assert claimed[49] == 50
+    assert claimed[50:] == [None] * 5
 
-    capped = gsa_status._requests_timeout(20)
-    assert capped.total == 20
-    assert capped.connect_timeout == gsa_status._CONNECT_TIMEOUT_CAP
+
+def test_requests_timeout_uses_independent_connect_and_read_limits():
+    assert gsa_status._requests_timeout(3.25) == (3.25, 3.25)
+    assert gsa_status._requests_timeout(25) == (
+        gsa_status._CONNECT_TIMEOUT_CAP, 25.0)
+
+
+
+
+def test_direct_local_exception_does_not_blame_task_proxy():
+    assert local_exception_used_proxy(False, False) is False
+    assert local_exception_used_proxy(False, True) is True
+    assert local_exception_used_proxy(True, False) is True
 
 
 def test_programming_exception_remains_visible_undetermined():
@@ -106,6 +133,25 @@ def test_multiprocess_merge_keeps_retry_counters(tmp_path=None):
     assert result["retried"] == 3
     assert result["by_retry"] == {"http=0": 2, "local_http=0": 1}
     assert result["budget_hit"] == 1
+
+
+def test_multiprocess_merge_uses_global_latency_distribution(tmp_path=None):
+    if tmp_path is None:
+        with tempfile.TemporaryDirectory() as directory:
+            return test_multiprocess_merge_uses_global_latency_distribution(Path(directory))
+    payloads = (
+        {"done": 9, "p50": 10, "p90": 10, "latency_hist": {"10": 9}},
+        {"done": 1, "p50": 1010, "p90": 1010, "latency_hist": {"1010": 1}},
+    )
+    jobs = []
+    for index, payload in enumerate(payloads):
+        path = tmp_path / f"live-{index}.json"
+        path.write_text(json.dumps({"finished": False, **payload}), encoding="utf-8")
+        jobs.append({"live": str(path), "threads": 1, "limit": payload["done"]})
+    result = merge(jobs, time.monotonic() - 1, expected_total=10)
+    assert result["p50"] == 10
+    assert result["latency_hist"] == {10: 9, 1010: 1}
+    assert "总体分位数" in result["p50_note"]
 
 
 def test_registered_devices_are_persisted_total_not_live_workers(tmp_path=None):
@@ -170,8 +216,14 @@ class ErrorReportingTest(unittest.TestCase):
     def test_google_timeout_probe(self):
         test_google_probe_uses_exact_proxy_endpoint_without_logging_credentials()
 
+    def test_google_probe_candidate_filter(self):
+        test_google_probe_candidate_is_only_init_read_timeout_for_gsa()
+
     def test_requests_total_timeout(self):
-        test_requests_timeout_is_one_total_wall_clock_budget()
+        test_requests_timeout_uses_independent_connect_and_read_limits()
+
+    def test_local_exception_proxy_attribution(self):
+        test_direct_local_exception_does_not_blame_task_proxy()
 
     def test_account_information_retry_exhaustion(self):
         test_account_information_incorrect_retries_then_becomes_wrong_password()
@@ -187,6 +239,9 @@ class ErrorReportingTest(unittest.TestCase):
 
     def test_merge_retry_counters(self):
         test_multiprocess_merge_keeps_retry_counters()
+
+    def test_global_latency_distribution(self):
+        test_multiprocess_merge_uses_global_latency_distribution()
 
     def test_registered_device_metrics(self):
         test_registered_devices_are_persisted_total_not_live_workers()

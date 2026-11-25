@@ -23,7 +23,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 if os.path.isdir(os.path.join(HERE, 'fastcheck')):
     sys.path.insert(0, HERE)
-from simple import proxy_api_default      # noqa: E402  凭据统一从 secrets/env 读
+from simple import (histogram_median, histogram_value_at,
+                    proxy_api_default)      # noqa: E402  凭据统一从 secrets/env 读
 PYTHON = os.path.join(HERE, '.venv', 'bin', 'python')
 DATA = os.path.join(HERE, 'data')
 LIVE = os.path.join(DATA, 'live.json')
@@ -129,6 +130,7 @@ def merge(jobs, started, expected_total=0, wall_started=None):
     recent = []
     p50s, p90s = [], []
     ip_calls = fetched = blocked = 0
+    latency_hist = {}
     otp_hit = otp_fetch = 0
     retried = budget_hit = 0
     by_retry = {}
@@ -155,6 +157,9 @@ def merge(jobs, started, expected_total=0, wall_started=None):
         if payload.get('p90') and weight:
             p90s.append((payload['p90'], weight))
         pool = payload.get('ip_pool') or {}
+        for value, count in (payload.get('latency_hist') or {}).items():
+            bucket = int(value)
+            latency_hist[bucket] = latency_hist.get(bucket, 0) + int(count)
         otp_hit += payload.get('otp_hit') or 0
         otp_fetch += payload.get('otp_fetch') or 0
         retried += payload.get('retried') or 0
@@ -198,9 +203,16 @@ def merge(jobs, started, expected_total=0, wall_started=None):
         'ip_pool': {'api_calls': ip_calls, 'fetched': fetched, 'blocked': blocked,
                     'processes': len(jobs)},
         'by_status': by_status,
-        'p50': round(sum(v * w for v, w in p50s) / sum(w for _, w in p50s)) if p50s else None,
-        'p90': round(sum(v * w for v, w in p90s) / sum(w for _, w in p90s)) if p90s else None,
-        'p50_note': '各进程 p50 按完成数加权平均，不是整体分位数',
+        'p50': (round(histogram_median(latency_hist)) if latency_hist
+                else round(sum(v * w for v, w in p50s) / sum(w for _, w in p50s))
+                if p50s else None),
+        'p90': (histogram_value_at(latency_hist, int(sum(latency_hist.values()) * .9))
+                if latency_hist
+                else round(sum(v * w for v, w in p90s) / sum(w for _, w in p90s))
+                if p90s else None),
+        'latency_hist': latency_hist,
+        'p50_note': ('各进程延迟直方图合并后的总体分位数' if latency_hist
+                     else '兼容旧子进程：各进程分位数按完成数加权'),
         'proc_cpu_seconds': round(proc_cpu, 2),
         'proc_cpu_cores': round(proc_cpu / elapsed, 3) if elapsed else 0,
         'incomplete': incomplete,

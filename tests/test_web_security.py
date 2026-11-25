@@ -6,7 +6,9 @@ import io
 import json
 import os
 import shutil
+import stat
 import subprocess
+import tempfile
 import unittest
 from email.message import Message
 from html.parser import HTMLParser
@@ -76,6 +78,49 @@ class ConsoleRequestTests(unittest.TestCase):
             response = handler._do_post()
         save.assert_called_once_with('https://fixture.invalid/?num={num}')
         self.assertTrue(response['ok'])
+
+    def test_invalid_secrets_json_is_preserved(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(web, 'HERE', directory):
+            path = os.path.join(directory, 'secrets.json')
+            original = b'{"keep": true,}'
+            with open(path, 'wb') as handle:
+                handle.write(original)
+            with self.assertRaisesRegex(ValueError, '原文件未修改'):
+                web.save_api('https://fixture.invalid/?num={num}')
+            with open(path, 'rb') as handle:
+                self.assertEqual(original, handle.read())
+
+    def test_valid_secrets_save_preserves_fields_and_uses_private_mode(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(web, 'HERE', directory):
+            path = os.path.join(directory, 'secrets.json')
+            with open(path, 'w', encoding='utf-8') as handle:
+                json.dump({'keep': 'value'}, handle)
+            web.save_api('https://fixture.invalid/?num={num}')
+            with open(path, encoding='utf-8') as handle:
+                saved = json.load(handle)
+            self.assertEqual('value', saved['keep'])
+            self.assertEqual('https://fixture.invalid/?num={num}', saved['proxy_api'])
+            self.assertEqual(0o600, stat.S_IMODE(os.stat(path).st_mode))
+
+    def test_proxy_api_is_redacted_from_command_log(self):
+        secret = 'https://proxy.invalid/list?token=fixture-secret&num={num}'
+        logged = web.command_for_log(['python', 'run_mp.py', '--api', secret,
+                                      '--threads', '100'])
+        self.assertNotIn('fixture-secret', logged)
+        self.assertNotIn(secret, logged)
+        self.assertIn('--api', logged)
+        self.assertIn('<proxy-api-redacted>', logged)
+        self.assertEqual('socks5://user:***@proxy.invalid:9000/?token=***',
+                         web.mask_api('socks5://user:secret@proxy.invalid:9000/?token=abc'))
+
+    def test_invalid_secrets_json_error_reaches_client(self):
+        handler = make_handler('/api/set-api', {'api': 'https://fixture.invalid/?num=1'},
+                               cookie=self.cookie())
+        with patch.object(web, 'save_api', side_effect=ValueError('原文件未修改')):
+            response = handler._do_post()
+        self.assertIn('原文件未修改', response['error'])
 
     def test_login_can_set_cookie_without_existing_session(self):
         handler = make_handler('/api/login', {'password': 'fixture-password'})

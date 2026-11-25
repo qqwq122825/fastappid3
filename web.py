@@ -13,6 +13,7 @@ import gzip
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import threading
@@ -51,20 +52,48 @@ def mask_api(url):
     """页面展示用：遮掉 password / token 的值。"""
     if not url:
         return ''
-    return re.sub(r'(?i)((?:password|passwd|pwd|token|key)=)[^&\s]+', r'\1***', url)
+    masked = re.sub(r'(?i)(://[^:/@\s]+:)[^@\s]+@', r'\1***@', str(url))
+    return re.sub(r'(?i)((?:password|passwd|pwd|token|key)=)[^&\s]+',
+                  r'\1***', masked)
 
 
 def save_api(url):
     path = os.path.join(HERE, 'secrets.json')
-    data = {}
     try:
         with open(path, encoding='utf-8') as handle:
-            data = json.load(handle) or {}
-    except (OSError, ValueError):
+            data = json.load(handle)
+    except FileNotFoundError:
         data = {}
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f'secrets.json 格式错误（第 {exc.lineno} 行第 {exc.colno} 列），原文件未修改') from exc
+    if not isinstance(data, dict):
+        raise ValueError('secrets.json 顶层必须是 JSON 对象，原文件未修改')
     data['proxy_api'] = url
-    with open(path, 'w', encoding='utf-8') as handle:
+    tmp = path + '.tmp'
+    descriptor = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
         json.dump(data, handle, ensure_ascii=False, indent=1)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+    os.chmod(path, 0o600)
+
+
+def command_for_log(cmd):
+    """Return a shell-readable command with credential-bearing values removed."""
+    safe = []
+    redact_next = False
+    for value in cmd:
+        text = str(value)
+        if redact_next:
+            safe.append('<proxy-api-redacted>')
+            redact_next = False
+            continue
+        safe.append(text)
+        if text == '--api':
+            redact_next = True
+    return shlex.join(safe)
 
 
 def proxy_api():
@@ -536,8 +565,8 @@ def _live_state_uncached():
 
 # ---------------------------------------------------------------- 任务控制
 def start_job(accounts, threads, limit, processes=1, verify_web=False,
-              per_ip=6, ip_ttl=50.0, timeout=10.0, anisette_workers=0,
-              no_register=False, retry=2, item_timeout=20.0, anisette_proxy=False):
+              per_ip=6, ip_ttl=50.0, timeout=25.0, anisette_workers=0,
+              no_register=False, retry=2, item_timeout=40.0, anisette_proxy=False):
     if is_running():
         return {'error': '已有任务在跑，先停止'}
     if STATE.get('take_pending') and STATE.get('pending_accounts'):
@@ -601,7 +630,7 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
     # 追加而不是覆盖：否则上一次的报错会被这次清空，排查时看不到
     log = open(STATE['log'], 'a', encoding='utf-8')
     log.write(f'\n===== 启动 {time.strftime("%F %T")} =====\n')
-    log.write(' '.join(cmd) + '\n')
+    log.write(command_for_log(cmd) + '\n')
     log.flush()
     # One task owns one process group.  run_mp.py and every simple.py child
     # inherit it, so Stop can terminate the whole tree with one signal.
@@ -994,7 +1023,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({'error': '无法识别 num 参数，请确认地址里有 num=数字'})
             try:
                 save_api(fixed)
-            except OSError as exc:
+            except (OSError, ValueError) as exc:
                 return self._json({'error': f'写 secrets.json 失败: {exc}'})
             return self._json({'ok': True, 'api': mask_api(fixed)})
         if self.path.startswith('/api/login'):
@@ -1022,11 +1051,11 @@ class Handler(BaseHTTPRequestHandler):
                                    bool(payload.get('verify_web')),
                                    int(payload.get('per_ip') or 6),
                                    float(payload.get('ip_ttl') or 50),
-                                   float(payload.get('timeout') or 10),
+                                   float(payload.get('timeout') or 25),
                                    int(payload.get('anisette_workers') or 0),
                                    bool(payload.get('no_register')),
                                    int(payload.get('retry') if payload.get('retry') is not None else 2),
-                                   float(payload.get('item_timeout') or 20),
+                                   float(payload.get('item_timeout') or 40),
                                    bool(payload.get('anisette_proxy')))
             return self._json(result)
         if self.path.startswith('/api/stop'):
@@ -1226,13 +1255,13 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
         <div class="row2">
           <div><input type="number" id="otpreuse" value="15" min="0" max="50">
             <div class="hint">公共头复用次数</div></div>
-          <div><input type="number" id="timeout" value="10" min="3" max="60">
+          <div><input type="number" id="timeout" value="25" min="3" max="60">
             <div class="hint">超时/秒</div></div>
         </div>
         <div class="row2" style="margin-top:10px">
           <div><input type="number" id="retry" value="2" min="0" max="5">
             <div class="hint">重试次数</div></div>
-          <div><input type="number" id="itemto" value="20" min="5" max="120" step="5">
+          <div><input type="number" id="itemto" value="40" min="5" max="120" step="5">
             <div class="hint">单条超时/秒</div></div>
         </div>
         <div class="hint" style="margin-top:4px">

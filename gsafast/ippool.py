@@ -234,16 +234,25 @@ class IpPool:
             self.cpu_supplier = time.thread_time() - sup0
 
     def _supply_loop(self):
+        # Empty-pool waiters may set _refill_wakeup thousands of times per
+        # second. Wakeups can request an earlier inventory check, but must not
+        # bypass the supplier API rate limit.
+        next_fetch_at = 0.0
         while not self._stop.is_set():
             try:
                 self._prune_shared()
                 available = self._available_live()
                 if available <= self.low_water:
                     self.stats['low_water_hits'] += 1
+                    delay = next_fetch_at - time.monotonic()
+                    if delay > 0:
+                        self._stop.wait(delay)
+                        continue
                     request = min(self.refill_batch,
                                   self.initial_max - available)
                     if request > 0:
                         values = self._fetch(request)
+                        next_fetch_at = time.monotonic() + self.interval
                         fresh = self._accept(values)
                         with self._cv:
                             for item in fresh:
