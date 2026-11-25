@@ -22,7 +22,8 @@ class IpPool:
     def __init__(self, api, *, threads=1000, ttl=50.0, per_ip=9,
                  batch=1000, refill_interval=2.0, log=None,
                  initial_max=1000, refill_batch=200, low_water=200,
-                 lease_margin=8.0, quarantine=120.0, gateway_limit=0):
+                 lease_margin=8.0, quarantine=120.0, gateway_limit=0,
+                 rotate=False):
         self.api = api
         self.threads = max(1, int(threads))
         self.ttl = max(5.0, float(ttl))
@@ -40,6 +41,9 @@ class IpPool:
         # 成功率 100%，且每个端口背后是独立出口 IP。所以网关并发不是瓶颈，
         # 0 表示不限制；需要限流时显式传正数。
         self.gateway_limit = max(0, int(gateway_limit))
+        # rotate=True：还回去的 IP 走共享队列，下次 acquire 从共享队头拿一条不同的，
+        # 实现「每个任务结束就换新 IP」。关闭时保留每线程本地队列以复用长连接。
+        self.rotate = bool(rotate)
         self.log = log or (lambda *a, **k: None)
 
         # 每线程一个本地队列：只有一个线程读写，天然无锁
@@ -140,7 +144,8 @@ class IpPool:
         fresh = fresh[:target]
         with self._cv:
             for index, item in enumerate(fresh):
-                if index < self.threads and not self._local[index]:
+                if (not self.rotate and index < self.threads
+                        and not self._local[index]):
                     self._local[index].append(item)
                 else:
                     self._shared.put(item)
@@ -259,7 +264,7 @@ class IpPool:
     # ---------------------------------------------------------------- 取还
     def acquire_nowait(self, tid):
         """异步调度器用的非阻塞取用；池空时不睡眠也不计一次 blocked。"""
-        bucket = self._local.get(tid)
+        bucket = None if self.rotate else self._local.get(tid)
         now = time.monotonic()
         if bucket:
             while bucket:
@@ -289,18 +294,21 @@ class IpPool:
 
     def acquire(self, tid, wait=30.0):
         """返回 (proxy, expires_at)；取用不排队，只有池真的空了才会短暂等待。"""
+        t0 = time.monotonic()
         proxy, exp = self.acquire_nowait(tid)
         if proxy:
             return proxy, exp
         # 这里只等 supplier 补货，工作线程绝不自己发 API
-        deadline = time.monotonic() + max(0.0, float(wait))
+        deadline = t0 + max(0.0, float(wait))
         while time.monotonic() < deadline and not self._stop.is_set():
             proxy, exp = self.acquire_nowait(tid)
             if proxy:
                 self.stats['blocked'] += 1
+                self.stats['blocked_seconds'] += time.monotonic() - t0
                 return proxy, exp
             time.sleep(0.05)
         self.stats['blocked'] += 1
+        self.stats['blocked_seconds'] += time.monotonic() - t0
         return None, 0.0
 
     def release(self, tid, proxy, expires_at, *, healthy=True):
@@ -320,7 +328,7 @@ class IpPool:
                 else:
                     self._seen.pop(proxy, None)
             return 'discarded'
-        bucket = self._local.get(tid)
+        bucket = None if self.rotate else self._local.get(tid)
         if bucket is not None:
             bucket.append((proxy, expires_at))
         else:
@@ -341,6 +349,7 @@ class IpPool:
         local = self._live_local()
         shared = self._shared.qsize()
         return {'threads': self.threads, 'ttl': self.ttl, 'per_ip': self.per_ip,
+                'rotate': self.rotate,
                 'tracked': tracked, 'local_live': local, 'shared': shared,
                 'available': local + shared,
                 'initial_max': self.initial_max,

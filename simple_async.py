@@ -75,11 +75,13 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument('--anisette-workers', type=int, default=0, dest='anisette_workers')
     ap.add_argument('--anisette-proxy', action='store_true', dest='anisette_proxy')
     ap.add_argument('--verify-web', action='store_true', dest='verify_web')
-    ap.add_argument('--per-ip', type=int, default=6, dest='per_ip')
+    ap.add_argument('--per-ip', type=int, default=1, dest='per_ip',
+                    help='一条 IP 跑多少条账号（1=每个任务换新 IP，走 IP 池 rotate）')
     ap.add_argument('--otp-reuse', type=int, default=15, dest='otp_reuse')
     ap.add_argument('--ip-ttl', type=float, default=50.0, dest='ip_ttl')
     ap.add_argument('--ip-batch', type=int, default=1000, dest='ip_batch')
-    ap.add_argument('--ip-interval', type=float, default=3.0, dest='ip_interval')
+    ap.add_argument('--ip-interval', type=float, default=1.0, dest='ip_interval',
+                    help='supplier 补货检查间隔秒（1 秒一次补）')
     ap.add_argument('--out', default='./data/simple-run.jsonl')
     ap.add_argument('--live', default='./data/live.json')
     return ap
@@ -176,7 +178,8 @@ async def run(args) -> int:
             raise SystemExit('没有代理接口：设置 GSA_PROXY_API 或 secrets.json')
         ip_pool = IpPool(args.api, threads=concurrency, ttl=args.ip_ttl,
                          per_ip=args.per_ip, batch=args.ip_batch,
-                         refill_interval=args.ip_interval, log=emit_event)
+                         refill_interval=args.ip_interval, log=emit_event,
+                         rotate=(args.per_ip <= 1))
         warmed = await loop.run_in_executor(io_pool, ip_pool.warm, 1)
         ip_pool.start()
         print(f'异步 IP 池预热 {warmed} 条')
@@ -368,6 +371,10 @@ async def run(args) -> int:
                 budget_hit = False
                 retire_route = False
                 result = None
+                attempt_ms = []                 # 每次 gs.check 的实际墙钟耗时
+                budget_left_ms = None            # 预算耗尽时还剩多少（负数=超出）
+                retry_ip_ms = []                 # 重试换 IP 时 acquire_ip 的等待耗时
+                ip_wait_none = False             # 重试里是否因为「等不到 IP」而中断
                 try:
                     if cached_otp is None or args.otp_reuse <= 0 or otp_used >= args.otp_reuse:
                         cached_otp = await fetch_otp(context, route)
@@ -376,7 +383,9 @@ async def run(args) -> int:
                     else:
                         state['otp_hit'] += 1
                     otp_used += 1
-                    deadline = t0 + max(1.0, args.item_timeout)
+                    # 预算从 OTP 之后开始算：慢的 anisette 不吃掉 GSA 重试预算，
+                    # 否则 attempts=1 就直接「单条预算耗尽」。
+                    deadline = time.perf_counter() + max(1.0, args.item_timeout)
                     while True:
                         attempts += 1
                         remaining = deadline - time.perf_counter()
@@ -385,9 +394,19 @@ async def run(args) -> int:
                                       'detail': '单条预算耗尽', 'http': 0}
                             retry_reason = 'budget'
                             budget_hit = True
+                            budget_left_ms = round((deadline - time.perf_counter()) * 1000, 1)
+                            emit_event('budget_exhausted', tid=tid, slot=slot,
+                                       email=email, attempts=attempts,
+                                       budget_ms=round(max(1.0, args.item_timeout) * 1000, 1),
+                                       attempt_ms=attempt_ms,
+                                       budget_left_ms=budget_left_ms,
+                                       retry_ip_ms=retry_ip_ms,
+                                       ip_wait_ms=round(sum(retry_ip_ms), 1),
+                                       ip_wait_none=ip_wait_none)
                             break
                         attempt_budget = _attempt_slice(
                             remaining, args.retry, attempts)
+                        _a0 = time.perf_counter()
                         try:
                             result = await asyncio.wait_for(
                                 gs.check(email, password, route,
@@ -399,6 +418,7 @@ async def run(args) -> int:
                         except asyncio.TimeoutError:
                             result = {'status': 'timeout', 'kind': 'timeout',
                                       'detail': '本次代理连接超时', 'http': 0}
+                        attempt_ms.append(round((time.perf_counter() - _a0) * 1000, 1))
                         status = refine_status(result, result_bucket(result))
                         kind, why = retry_kind(result, status)
                         if kind is None or attempts > args.retry:
@@ -409,8 +429,11 @@ async def run(args) -> int:
                         transport = None
                         if ip_pool:
                             ip_pool.release(tid, route, expires, healthy=False)
+                        _t_ip = time.perf_counter()
                         route, expires = await acquire_ip(tid, 20)
+                        retry_ip_ms.append(round((time.perf_counter() - _t_ip) * 1000, 1))
                         if not route:
+                            ip_wait_none = True
                             break
                         try:
                             transport = gs.AsyncGsaSession(route)
@@ -439,6 +462,8 @@ async def run(args) -> int:
                     'http': result.get('http'), 'ms': round(elapsed, 1),
                     'thread_cpu_ms': 0.0, 'attempts': attempts,
                     'retry_reason': retry_reason, 'budget_hit': budget_hit,
+                    'attempt_ms': attempt_ms, 'budget_left_ms': budget_left_ms,
+                    'retry_ip_ms': retry_ip_ms, 'ip_wait_none': ip_wait_none,
                 }
                 detail_lower = row['detail'].lower()
                 if ('connection reset by peer' in detail_lower

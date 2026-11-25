@@ -472,8 +472,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header('Content-Encoding', 'gzip')
             self.send_header('Vary', 'Accept-Encoding')
         if is_page:
-            self.send_header('Connection', 'close')
             self.close_connection = True
+        if self.close_connection:
+            self.send_header('Connection', 'close')
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -675,7 +676,9 @@ class Handler(BaseHTTPRequestHandler):
                 elif em:
                     body.append(em)      # 原始文件里没有这行时只导 email
             out = '\n'.join(body) + ('\n' if body else '')
-            ctype, name = 'text/plain; charset=utf-8', f'export-{want or "all"}.txt'
+            # 文件名保持 ASCII，筛选参数中的控制字符不得进入响应头。
+            safe_status = re.sub(r'[^a-zA-Z0-9_-]', '_', want or 'all')[:80]
+            ctype, name = 'text/plain; charset=utf-8', f'export-{safe_status}.txt'
         data = out.encode('utf-8')
         self.send_response(200)
         self.send_header('Content-Type', ctype)
@@ -685,10 +688,17 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _authorized(self):
-        """简单密码：浏览器登录后带 gsa_auth cookie。"""
-        cookie = self.headers.get('Cookie') or ''
-        want = 'gsa_auth=' + _cookie_token()
-        return want in cookie
+        """只接受名称和值均完整匹配的登录 Cookie。"""
+        import hmac
+        from http.cookies import CookieError, SimpleCookie
+        cookies = SimpleCookie()
+        try:
+            cookies.load(self.headers.get('Cookie') or '')
+        except CookieError:
+            return False
+        token = cookies.get('gsa_auth')
+        return token is not None and hmac.compare_digest(
+            token.value.encode('utf-8'), _cookie_token().encode('ascii'))
 
     def do_POST(self):
         try:
@@ -710,8 +720,16 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     def _do_post(self):
-        length = int(self.headers.get('Content-Length') or 0)
+        try:
+            length = int(self.headers.get('Content-Length') or 0)
+            if length < 0:
+                raise ValueError('negative Content-Length')
+        except ValueError:
+            self.close_connection = True
+            return self._json({'error': 'Content-Length 必须是非负整数'})
         if length > 64 * 1024 * 1024:          # 上传上限 64MB
+            # 请求体尚未读取，关闭连接以免后续请求误读残留字节。
+            self.close_connection = True
             return self._json({'error': '上传内容过大（上限 64MB）'})
         # POST /api/stop has no request body.  Keep the transport body empty
         # while validating Content-Length; substituting ``{}`` before this
@@ -749,6 +767,10 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads((raw or b'{}').decode('utf-8'))
         except ValueError:
             return self._json({'error': '请求体不是合法 JSON'})
+        if not isinstance(payload, dict):
+            return self._json({'error': '请求体必须是 JSON 对象'})
+        if not self.path.startswith('/api/login') and not self._authorized():
+            return self._json({'error': '请先输入密码', 'need_login': True})
 
         if self.path.startswith('/api/set-api'):
             raw = str(payload.get('api') or '')
@@ -1111,6 +1133,9 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
 <script>
 const $ = id => document.getElementById(id);
 const num = n => (n ?? 0).toLocaleString();
+const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({
+  '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
+}[ch]));
 const cls = s => !s ? 'b-gray'
   : ['valid'].includes(s) ? 'b-green'
   : ['wrong_password','not_found'].includes(s) ? 'b-red'
@@ -1327,7 +1352,7 @@ async function tick(){
   catch(e){ $('stateTag').innerHTML='<span class="dot" style="background:#dc2626"></span>读取失败'; return; }
   if(d.error){
     if(d.need_login){ $('gate').style.display='flex'; $('pwd').focus(); return; }
-    $('stateTag').innerHTML='<span class="dot" style="background:#9ca3af"></span>'+d.error;
+    $('stateTag').innerHTML='<span class="dot" style="background:#9ca3af"></span>'+esc(d.error);
     return;
   }
   const by = d.by_status || {};
@@ -1396,20 +1421,20 @@ let HIST = null;          // 筛选时从 /api/results 拿的历史结果
 function rowHtml(r, idx){
   const st = r.status || 'unknown';
   const att = (r.attempts && r.attempts > 1)
-    ? ` <span class="badge b-blue" style="font-size:10px">×${r.attempts}</span>` : '';
+    ? ` <span class="badge b-blue" style="font-size:10px">×${esc(r.attempts)}</span>` : '';
   const seconds = r.ms == null ? '--' : (Number(r.ms) / 1000).toFixed(2);
   return `<tr>
-    <td class="mono">${idx}</td>
-    <td>${(r.email||'').slice(0,32)||'--'}</td>
-    <td><span class="badge ${cls(st)}">${st}</span>${att}</td>
+    <td class="mono">${esc(idx)}</td>
+    <td>${esc(String(r.email||'').slice(0,32)||'--')}</td>
+    <td><span class="badge ${cls(st)}">${esc(st)}</span>${att}</td>
     <td class="mono">${seconds}</td>
-    <td class="mono">${r.cpu ?? r.thread_cpu_ms ?? '--'}</td>
-    <td class="mono">${r.slot ?? '--'}</td>
-    <td class="mono">${r.http ?? '--'}</td>
-    <td class="mono">${r.ec ?? '--'}</td>
+    <td class="mono">${esc(r.cpu ?? r.thread_cpu_ms ?? '--')}</td>
+    <td class="mono">${esc(r.slot ?? '--')}</td>
+    <td class="mono">${esc(r.http ?? '--')}</td>
+    <td class="mono">${esc(r.ec ?? '--')}</td>
     <td style="color:#6b7280;font-size:11.5px;max-width:340px;overflow:hidden;
-        text-overflow:ellipsis" title="${(r.detail||'').replace(/"/g,'&quot;')}">
-      ${(r.detail||'--').slice(0,64)}</td>
+        text-overflow:ellipsis" title="${esc(r.detail||'')}">
+      ${esc(String(r.detail||'--').slice(0,64))}</td>
   </tr>`;
 }
 
@@ -1446,20 +1471,20 @@ function renderRowsOld(){
   $('rows').innerHTML = rec.length ? rec.map((r,i)=>{
     const st = r.status || 'unknown';
     const att = (r.attempts && r.attempts > 1)
-      ? ` <span class="badge b-blue" style="font-size:10px">×${r.attempts}</span>` : '';
+      ? ` <span class="badge b-blue" style="font-size:10px">×${esc(r.attempts)}</span>` : '';
     const seconds = r.ms == null ? '--' : (Number(r.ms) / 1000).toFixed(2);
     return `<tr>
-      <td class="mono">${(d.done-rec.length+i+1)}</td>
-      <td>${(r.email||'').slice(0,32)||'--'}</td>
-      <td><span class="badge ${cls(st)}">${st}</span>${att}</td>
+      <td class="mono">${esc(d.done-rec.length+i+1)}</td>
+      <td>${esc(String(r.email||'').slice(0,32)||'--')}</td>
+      <td><span class="badge ${cls(st)}">${esc(st)}</span>${att}</td>
       <td class="mono">${seconds}</td>
-      <td class="mono">${r.thread_cpu_ms ?? '--'}</td>
-      <td class="mono">${r.slot ?? '--'}</td>
-      <td class="mono">${r.http ?? '--'}</td>
-      <td class="mono">${r.ec ?? '--'}</td>
+      <td class="mono">${esc(r.thread_cpu_ms ?? '--')}</td>
+      <td class="mono">${esc(r.slot ?? '--')}</td>
+      <td class="mono">${esc(r.http ?? '--')}</td>
+      <td class="mono">${esc(r.ec ?? '--')}</td>
       <td style="color:#6b7280;font-size:11.5px;max-width:340px;overflow:hidden;
-          text-overflow:ellipsis" title="${(r.detail||'').replace(/"/g,'&quot;')}">
-        ${(r.detail||'--').slice(0,64)}</td>
+          text-overflow:ellipsis" title="${esc(r.detail||'')}">
+        ${esc(String(r.detail||'--').slice(0,64))}</td>
     </tr>`;
   }).join('') : `<tr><td colspan="9" style="text-align:center;color:#9ca3af;padding:24px">
     ${want === 'all' ? '还没有结果' : '这个分类下没有结果'}</td></tr>`;

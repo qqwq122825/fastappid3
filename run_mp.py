@@ -228,7 +228,8 @@ def main():
     ap.add_argument('--limit', type=int, default=0, help='总条数，0=全部')
     ap.add_argument('--offset', type=int, default=0)
     ap.add_argument('--slot-base', type=int, default=0, dest='slot_base')
-    ap.add_argument('--per-ip', type=int, default=6, dest='per_ip')
+    ap.add_argument('--per-ip', type=int, default=1, dest='per_ip',
+                    help='一条 IP 跑多少条账号（1=每个任务换新 IP，走 IP 池 rotate）')
     ap.add_argument('--otp-reuse', type=int, default=15, dest='otp_reuse',
                     help='一个公共头验多少条账号（0=每条都换）')
     ap.add_argument('--ip-ttl', type=float, default=50.0, dest='ip_ttl')

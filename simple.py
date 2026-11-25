@@ -345,12 +345,13 @@ def main():
     ap.add_argument('--register-timeout', type=float, default=20.0,
                     dest='register_timeout',
                     help='设备注册单次超时；超时后换代理继续注册')
-    ap.add_argument('--per-ip', type=int, default=9, help='一条 IP 跑多少条账号')
+    ap.add_argument('--per-ip', type=int, default=1,
+                    help='一条 IP 跑多少条账号（1=每个任务换新 IP，走 IP 池 rotate）')
     ap.add_argument("--otp-reuse", type=int, default=15, dest="otp_reuse",
                     help='一个公共头能验多少条账号（实测 15-20 安全，0=每条都换）')
     ap.add_argument('--ip-ttl', type=float, default=50.0, help='单条 IP 可用秒数（供应商 60 秒）')
     ap.add_argument('--ip-batch', type=int, default=1000, help='单次最多拉多少条')
-    ap.add_argument('--ip-interval', type=float, default=3.0, help='supplier 检查间隔秒')
+    ap.add_argument('--ip-interval', type=float, default=1.0, help='supplier 补货检查间隔秒（1 秒一次补）')
     ap.add_argument('--no-ip-pool', action='store_true', help='关掉池，回到每线程自取')
     ap.add_argument('--no-precheck', action='store_true')
     ap.add_argument('--precheck-timeout', type=float, default=8.0)
@@ -396,7 +397,8 @@ def main():
         from gsafast.ippool import IpPool
         ip_pool = IpPool(args.api, threads=args.threads, ttl=args.ip_ttl,
                          per_ip=args.per_ip, batch=args.ip_batch,
-                         refill_interval=args.ip_interval)
+                         refill_interval=args.ip_interval,
+                         rotate=(args.per_ip <= 1))
         warmed = ip_pool.warm(extra=1)
         ip_pool.start()
         print(f'IP 池: 预热 {warmed} 条（每线程先分 1 条，其余共享） '
@@ -410,6 +412,8 @@ def main():
     lock = threading.Lock()
     sink = open(args.out, 'w', encoding='utf-8')
     write_buffer = []          # 攒够再落盘，避免每条都 fsync
+    # 预算耗尽专用日志：每条 budget_hit 一行，含 OTP/每跳耗时拆解，方便单独分析
+    budget_sink = open(os.path.splitext(args.out)[0] + '-budget.jsonl', 'w', encoding='utf-8')
     import collections
     started = time.perf_counter()
     wall_started = time.time()
@@ -709,6 +713,11 @@ def main():
                 t_otp = time.perf_counter()
                 c0_otp = time.thread_time()
                 otp_cpu = chk_cpu = 0.0
+                attempt_ms = []                 # 每次 gs.check 的实际墙钟耗时
+                budget_left_ms = None            # 预算耗尽时还剩多少（负数=超出）
+                retry_ip_ms = []                 # 重试换 IP 时 ip_pool.acquire 的等待耗时
+                ip_wait_none = False             # 重试里是否因为「等不到 IP」而中断
+                budget = max(1.0, float(args.item_timeout))
                 try:
                     # 同一个 OTP 复用若干条：设备注册时那一次就能摊薄到 15 条上
                     if (cached_otp is None or args.otp_reuse <= 0
@@ -723,8 +732,10 @@ def main():
                     attempts = 0
                     t_chk = time.perf_counter()
                     c0_chk = time.thread_time()
-                    budget = max(1.0, float(args.item_timeout))
-                    deadline = t0 + budget          # 从拿到这条账号开始算
+                    # 预算从 OTP 之后开始算：慢的 anisette 不该吃掉 GSA 重试预算。
+                    # 之前 deadline = t0 + budget 把 fetch_otp 耗时也算进 20s，
+                    # 导致 OTP 一慢就「attempts=1 + 单条预算用尽」。
+                    deadline = time.perf_counter() + budget
                     budget_hit = False
                     while True:
                         attempts += 1
@@ -738,9 +749,11 @@ def main():
                             break
                         # gs.check 内部有 init + complete 两跳，每跳都要受剩余预算约束
                         per_hop = max(2.0, min(float(args.timeout), remain / 2))
+                        _a0 = time.perf_counter()
                         result = gs.check(email, password, proxy,
                                           timeout=per_hop,
                                           retries=args.retries, identity=identity)
+                        attempt_ms.append(round((time.perf_counter() - _a0) * 1000, 1))
                         probe_status = refine_status(result, result_bucket(result))
                         kind, why = retry_kind(result, probe_status)
                         if kind is None or attempts > args.retry or stop.is_set():
@@ -751,9 +764,12 @@ def main():
                         retry_reason = why
                         # 换 IP：归还当前这条（标记为坏），取新的
                         if ip_pool is not None:
+                            _t_ip = time.perf_counter()
                             ip_pool.release(tid, proxy, proxy_exp, healthy=False)
                             proxy, proxy_exp = ip_pool.acquire(tid, wait=20.0)
+                            retry_ip_ms.append(round((time.perf_counter() - _t_ip) * 1000, 1))
                             if proxy is None:
+                                ip_wait_none = True
                                 break
                         # 环境异常（-22421）还要顺带换一个公共头
                         if kind == RETRY_ENV:
@@ -768,6 +784,8 @@ def main():
                         served = max(0, served - 1)   # 重试不占 per_ip 配额
                     chk_ms = (time.perf_counter() - t_chk) * 1000
                     chk_cpu = (time.thread_time() - c0_chk) * 1000
+                    if budget_hit:
+                        budget_left_ms = round((deadline - time.perf_counter()) * 1000, 1)
                 except Exception as exc:                            # noqa: BLE001
                     otp_ms = chk_ms = 0.0
                     otp_cpu = chk_cpu = 0.0
@@ -851,6 +869,8 @@ def main():
                        'thread_cpu_ms': round(thread_cpu, 2),
                        'attempts': attempts, 'retry_reason': retry_reason,
                        'budget_hit': budget_hit,
+                       'attempt_ms': attempt_ms, 'budget_left_ms': budget_left_ms,
+                       'retry_ip_ms': retry_ip_ms, 'ip_wait_none': ip_wait_none,
                        'ip_ms': round(ip_ms, 1), 'otp_ms': round(otp_ms, 1),
                        'chk_ms': round(chk_ms, 1), 'gap_ms': round(gap_ms, 2),
                        'web_status': web_status, 'web_ec': web_ec,
@@ -884,6 +904,21 @@ def main():
                     seg['chk'].append(chk_ms)
                     if budget_hit:
                         results['budget_hit'] = results.get('budget_hit', 0) + 1
+                        budget_sink.write(json.dumps({
+                            'at': time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime()),
+                            'tid': tid, 'slot': slot, 'email': email,
+                            'proxy': row['proxy'],
+                            'budget_ms': round(budget * 1000, 1),
+                            'otp_ms': round(otp_ms, 1), 'chk_ms': round(chk_ms, 1),
+                            'ip_ms': round(ip_ms, 1), 'gap_ms': round(gap_ms, 2),
+                            'attempts': attempts, 'attempt_ms': attempt_ms,
+                            'budget_left_ms': budget_left_ms,
+                            'retry_reason': retry_reason,
+                            'retry_ip_ms': retry_ip_ms,
+                            'ip_wait_ms': round(sum(retry_ip_ms), 1),
+                            'ip_wait_none': ip_wait_none,
+                        }, ensure_ascii=False) + '\n')
+                        budget_sink.flush()
                     if attempts > 1:
                         results['retried'] = results.get('retried', 0) + 1
                         rk = results.setdefault('by_retry', {})
@@ -954,6 +989,10 @@ def main():
             sink.write('\n'.join(write_buffer) + '\n')
             write_buffer.clear()
     sink.close()
+    try:
+        budget_sink.close()
+    except OSError:
+        pass
     stop.set()
     live_thread.join(timeout=3)      # 必须等写线程退出，否则它会覆盖最终状态
     done_now = results['done']
