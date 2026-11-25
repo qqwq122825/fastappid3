@@ -372,6 +372,9 @@ new vm.Script(input.source, {filename: 'web-inline.js'}).runInContext(context);
 
     def test_page_exposes_clear_devices_control(self):
         self.assertIn('id="clearDevices"', web.PAGE)
+        self.assertIn('class="device-maintenance"', web.PAGE)
+        self.assertIn('class="btn danger-outline"', web.PAGE)
+        self.assertIn('class="task-actions"', web.PAGE)
         self.assertIn("post('/api/clear-devices')", web.PAGE)
         self.assertIn('确定清空所有已注册设备', web.PAGE)
 

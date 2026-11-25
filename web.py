@@ -1213,7 +1213,17 @@ cursor:pointer;transition:.15s}
 .btn.danger{background:var(--red);color:#fff}
 .btn.danger:hover{background:#b91c1c}
 .btn.ghost{background:#fff;border:1px solid var(--line);color:var(--fg)}
+.btn.danger-outline{background:#fff;border:1px solid #fecaca;color:#b91c1c;
+padding:6px 10px;font-size:11.5px;white-space:nowrap}
+.btn.danger-outline:hover{background:#fef2f2;border-color:#fca5a5}
 .btn:disabled{opacity:.45;cursor:not-allowed}
+.task-actions{display:grid;grid-template-columns:minmax(0,1fr) 72px 72px;gap:10px}
+.task-actions .btn{padding:10px 12px;white-space:nowrap}
+.device-maintenance{margin-top:10px;padding:8px 10px;border:1px solid var(--line);
+border-radius:8px;background:#fafbfc;display:flex;align-items:center;
+justify-content:space-between;gap:10px}
+.device-maintenance .title{font-size:11.5px;font-weight:600;color:#374151}
+.device-maintenance .desc{font-size:10.5px;color:var(--dim);margin-left:6px}
 .chk{display:flex;align-items:center;gap:7px;font-size:13px;color:var(--fg)}
 .hint{font-size:11px;color:var(--dim);line-height:1.5;margin-top:5px}
 
@@ -1337,11 +1347,14 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
         <label class="chk" style="margin-top:8px"><input type="checkbox" id="asproxy"> 公共头走代理 <span style="color:var(--amber);font-size:11px">（机房 IP 直连 sidestore 超时时勾）</span></label>
       </div>
 
-      <div style="display:flex;gap:10px">
-        <button class="btn primary" id="start" style="flex:1">开始</button>
+      <div class="task-actions">
+        <button class="btn primary" id="start">开始</button>
         <button class="btn danger" id="stop" disabled>停止</button>
         <button class="btn ghost" id="refresh">刷新</button>
-        <button class="btn danger" id="clearDevices">清空设备</button>
+      </div>
+      <div class="device-maintenance">
+        <span><span class="title">设备池维护</span><span class="desc">任务停止后可用</span></span>
+        <button class="btn danger-outline" id="clearDevices">清空设备</button>
       </div>
       <div class="hint" id="hint" style="margin-top:10px"></div>
     </div>
