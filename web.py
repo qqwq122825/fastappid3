@@ -300,6 +300,40 @@ def _running_pid():
 
 
 _LIVE_CACHE = {'at': 0.0, 'data': None}
+_RESULT_PROGRESS = {'key': None, 'offset': 0, 'done': 0}
+_RESULT_PROGRESS_LOCK = threading.Lock()
+
+
+def _result_progress(path):
+    """增量统计 JSONL 已落盘行数。
+
+    高并发工作线程可能让 live writer 长时间抢不到状态锁；结果文件
+    仍在持续追加。这里只读上次 offset 之后的字节，避免每次刷新都重扫
+    整个大文件。
+    """
+    if not path:
+        return 0
+    try:
+        stat = os.stat(path)
+        key = (os.path.realpath(path), stat.st_dev, stat.st_ino)
+    except OSError:
+        return 0
+    with _RESULT_PROGRESS_LOCK:
+        if (_RESULT_PROGRESS['key'] != key
+                or stat.st_size < _RESULT_PROGRESS['offset']):
+            _RESULT_PROGRESS.update(key=key, offset=0, done=0)
+        try:
+            with open(path, 'rb') as handle:
+                handle.seek(_RESULT_PROGRESS['offset'])
+                while True:
+                    chunk = handle.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    _RESULT_PROGRESS['done'] += chunk.count(b'\n')
+                _RESULT_PROGRESS['offset'] = handle.tell()
+        except OSError:
+            pass
+        return _RESULT_PROGRESS['done']
 
 
 def live_state():
@@ -313,15 +347,35 @@ def live_state():
 
 
 def _live_state_uncached():
-    running = is_running()
+    record = _active_task_record()
+    running = record is not None
     try:
         with open(LIVE, encoding='utf-8') as handle:
             live = json.load(handle)
     except (OSError, ValueError):
         live = {}
     live = dict(live) if isinstance(live, dict) else {}
+    # live writer 被大量工作线程饿饿时，用已落盘结果补齐进度。
+    # 不修改工作进程，也不读取账号内容。
+    try:
+        stale = time.time() - os.path.getmtime(LIVE) > 3.0
+    except OSError:
+        stale = True
+    if running and stale:
+        done = max(int(live.get('done') or 0),
+                   _result_progress(record.get('run_out')))
+        started_at = float(record.get('started_at') or time.time())
+        elapsed = max(float(live.get('elapsed') or 0),
+                      time.time() - started_at, 0.001)
+        rate = done / elapsed
+        live.update(done=done, elapsed=round(elapsed, 1),
+                    rate=round(rate, 2), per_hour=round(rate * 3600),
+                    live_fallback=True)
+        total = int(live.get('total') or 0)
+        if total and done:
+            live['eta'] = round(max(0, total - done) / rate, 0)
     live['running'] = running
-    live['pid'] = _running_pid() if running else None
+    live['pid'] = int(record['pid']) if running else None
     live['accounts'] = STATE['accounts']
     if not live.get('total') and not running:
         live.setdefault('error', 'live.json 还没生成，先点「开始」')

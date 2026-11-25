@@ -135,6 +135,32 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(1, result['total'])
             self.assertEqual('first@example.invalid', result['rows'][0]['email'])
 
+    def test_stale_live_state_uses_incremental_result_progress(self):
+        from pathlib import Path
+        from unittest.mock import patch
+        import web
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            live_file = root / 'live.json'
+            result_file = root / 'run.jsonl'
+            live_file.write_text(json.dumps({'done': 0, 'total': 10}))
+            os.utime(live_file, (1, 1))
+            result_file.write_text('{}\n{}\n{}\n')
+            record = {'pid': 123, 'started_at': 1,
+                      'run_out': str(result_file)}
+            state = dict(web.STATE, accounts='fixture.txt')
+            with patch.object(web, 'LIVE', str(live_file)), \
+                 patch.object(web, 'STATE', state), \
+                 patch.object(web, '_active_task_record', return_value=record), \
+                 patch.object(web.time, 'time', return_value=11):
+                result = web._live_state_uncached()
+            self.assertEqual(3, result['done'])
+            self.assertEqual(0.3, result['rate'])
+            self.assertEqual(1080, result['per_hour'])
+            self.assertTrue(result['live_fallback'])
+            self.assertTrue(result['running'])
+            self.assertEqual(123, result['pid'])
+
     def test_result_table_formats_duration_as_seconds(self):
         import web
         self.assertIn('耗时（秒）', web.PAGE)
