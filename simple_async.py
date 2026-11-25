@@ -205,6 +205,14 @@ async def run(args) -> int:
     anisette_gate = asyncio.Semaphore(max(1, anisette_limit))
     register_gate = asyncio.Semaphore(min(64, concurrency))
 
+    async def close_transport(obj):
+        """安全关闭 session：构造失败或已关闭时 obj 可能是 None。"""
+        try:
+            if obj is not None:
+                await obj.close()
+        except BaseException:                                      # noqa: BLE001
+            pass
+
     async def acquire_ip(tid: int, wait: float = 60.0):
         if mock:
             return 'socks5://127.0.0.1:9', time.monotonic() + 3600
@@ -319,20 +327,29 @@ async def run(args) -> int:
                 return
             state['device_in_use'].add(slot)
             served = 0
-            transport = gs.AsyncGsaSession(route)
-            await transport.open()
+            try:
+                transport = gs.AsyncGsaSession(route)
+                await transport.open()
+            except BaseException:                                  # noqa: BLE001
+                transport = None
+                return
             while not stop.is_set():
                 if (not route or served >= args.per_ip
                         or (expires and expires <= time.monotonic())):
-                    await transport.close()
+                    await close_transport(transport)
+                    transport = None
                     if ip_pool and route:
                         ip_pool.release(tid, route, expires, healthy=served > 0)
                     route, expires = await acquire_ip(tid)
                     if not route:
                         await asyncio.sleep(0.5)
                         continue
-                    transport = gs.AsyncGsaSession(route)
-                    await transport.open()
+                    try:
+                        transport = gs.AsyncGsaSession(route)
+                        await transport.open()
+                    except BaseException:                          # noqa: BLE001
+                        transport = None
+                        continue
                     served = 0
                 try:
                     email, password = queue.get_nowait()
@@ -381,14 +398,19 @@ async def run(args) -> int:
                             retry_reason = why if attempts > 1 else ''
                             break
                         retry_reason = why
-                        await transport.close()
+                        await close_transport(transport)
+                        transport = None
                         if ip_pool:
                             ip_pool.release(tid, route, expires, healthy=False)
                         route, expires = await acquire_ip(tid, 20)
                         if not route:
                             break
-                        transport = gs.AsyncGsaSession(route)
-                        await transport.open()
+                        try:
+                            transport = gs.AsyncGsaSession(route)
+                            await transport.open()
+                        except BaseException:                      # noqa: BLE001
+                            transport = None
+                            break
                         if str(kind) == 'env':
                             cached_otp = await fetch_otp(context, route)
                             otp_used = 1
@@ -438,8 +460,8 @@ async def run(args) -> int:
         finally:
             state['device_in_use'].discard(slot)
             state['device_registering'].discard(slot)
-            if transport is not None:
-                await transport.close()
+            await close_transport(transport)
+            transport = None
             if ip_pool and route:
                 ip_pool.release(tid, route, expires, healthy=True)
 
@@ -503,7 +525,15 @@ async def run(args) -> int:
                for tid in range(concurrency)]
     payload = None
     try:
-        await asyncio.gather(*workers)
+        # 给一个远大于单条预算的宽限；超时就强制收尾，避免 gather 永久挂住
+        await asyncio.wait_for(asyncio.gather(*workers, return_exceptions=True),
+                              timeout=max(120.0, args.item_timeout * 20))
+    except asyncio.TimeoutError:
+        state['worker_errors'].append('gather: timeout, 强制收尾')
+        stop.set()
+        for w in workers:
+            w.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
     finally:
         # 无论 workers 是正常结束、抛异常还是被取消，收尾都要走完
         stop.set()
