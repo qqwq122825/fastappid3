@@ -89,6 +89,16 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, pool.stats['discarded'])
         self.assertNotIn('quarantined', pool.stats)
 
+    def test_bad_proxy_discard_only_removes_exact_host_and_port(self):
+        pool = IpPool('http://invalid/{num}', threads=1)
+        now = time.monotonic()
+        bad = 'socks5h://147.182.194.69:8563'
+        sibling = 'socks5h://147.182.194.69:8573'
+        accepted = pool._accept([bad, sibling], now=now)
+        pool.release(0, accepted[0][0], accepted[0][1], healthy=False)
+        self.assertNotIn(bad, pool._seen)
+        self.assertIn(sibling, pool._seen)
+
     def test_live_state_lock_uses_waiter_queue(self):
         gate = _new_state_lock()
         self.assertIsInstance(gate, threading.Semaphore)
@@ -153,7 +163,8 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
 
     def test_missing_proxy_is_safe_to_record(self):
         self.assertEqual('', _proxy_host(None))
-        self.assertEqual('127.0.0.1', _proxy_host('http://127.0.0.1:8080'))
+        self.assertEqual('127.0.0.1:8080',
+                         _proxy_host('http://user:secret@127.0.0.1:8080'))
 
     def test_cpu_display_distinguishes_current_from_average(self):
         import web

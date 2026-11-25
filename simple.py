@@ -69,8 +69,21 @@ def _shared_device_info(pool, profile, cache, gate, timeout, *, proxy=None,
 
 
 def _proxy_host(proxy):
-    """Return a display-only proxy host; an exhausted pool may yield None."""
-    return str(proxy).split('//')[-1].split(':')[0] if proxy else ''
+    """Return a credential-free endpoint label while preserving its port.
+
+    Supplier gateway hosts expose independent proxy exits on different ports,
+    so hiding the port made unrelated endpoints look identical in diagnostics.
+    """
+    if not proxy:
+        return ''
+    try:
+        parsed = urllib.parse.urlsplit(str(proxy))
+        host = parsed.hostname or ''
+        if ':' in host and not host.startswith('['):
+            host = f'[{host}]'
+        return f'{host}:{parsed.port}' if parsed.port is not None else host
+    except (TypeError, ValueError):
+        return str(proxy).split('@')[-1]
 
 
 def load_accounts(path, limit, shuffle=True):
