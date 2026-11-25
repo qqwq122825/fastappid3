@@ -56,10 +56,10 @@ def ensure_open_file_limit(threads, resource_module=None):
 
 
 def anisette_concurrency_limit(threads, configured=0):
-    """Bound only public-header refreshes; Apple worker concurrency is unchanged."""
+    """Use full worker concurrency unless an explicit public-header cap is set."""
     threads = max(1, int(threads))
     configured = int(configured or 0)
-    return configured if configured > 0 else min(100, threads)
+    return configured if configured > 0 else threads
 
 
 def anisette_retry_delay(previous, jitter=None):
@@ -527,7 +527,7 @@ def main():
     ap.add_argument('--register-workers', type=int, default=0,
                     help='并发注册设备数上限，0=每个工作线程可独立注册')
     ap.add_argument('--anisette-workers', type=int, default=0,
-                    help='并发请求公共头的上限，0=自动（最多100）')
+                    help='并发请求公共头的上限，0=跟随本进程线程数（不额外限制）')
     ap.add_argument('--verify-web', action='store_true', dest='verify_web',
                     help='GSA 返回 au=repair 时，用 web 协议(idmsa)细分一次')
     ap.add_argument('--web-timeout', type=float, default=10.0, dest='web_timeout')
