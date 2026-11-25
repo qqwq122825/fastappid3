@@ -6,7 +6,9 @@ import time
 import unittest
 
 from fastcheck.protocols import gsa_async
+from fastcheck.status import result_bucket
 from gsafast.ippool import IpPool
+from simple_async import _attempt_slice
 
 
 class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
@@ -66,6 +68,17 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
     def test_multi_process_uses_async_worker(self):
         import run_mp
         self.assertTrue(run_mp.WORKER.endswith('simple_async.py'))
+
+    def test_transport_http_zero_is_classified_as_timeout(self):
+        row = gsa_async._result(
+            'error', 'init timeout', time.time(), kind='network', http=0)
+        self.assertEqual(0, row['http'])
+        self.assertEqual('timeout', result_bucket(row))
+
+    def test_retry_attempts_share_item_budget_evenly(self):
+        self.assertAlmostEqual(20 / 3, _attempt_slice(20, 2, 1), places=4)
+        self.assertAlmostEqual(20 / 3, _attempt_slice(40 / 3, 2, 2), places=4)
+        self.assertAlmostEqual(20 / 3, _attempt_slice(20 / 3, 2, 3), places=4)
 
 
 if __name__ == '__main__':

@@ -64,6 +64,20 @@ def _mock_identity() -> dict:
     }
 
 
+def _attempt_slice(remaining: float, retries: int, attempt: int) -> float:
+    """Share the remaining item budget fairly across the attempts left.
+
+    The old ``remaining / 2`` rule produced a 10s -> 5s -> 2.5s staircase for
+    a 20-second item budget.  A third proxy therefore received less time than
+    a healthy GSA round trip normally needs.  Equal slices preserve the same
+    hard per-item deadline while giving every configured proxy attempt a real
+    chance to complete.
+    """
+    total_attempts = max(1, int(retries) + 1)
+    attempts_left = max(1, total_attempts - int(attempt) + 1)
+    return max(1.0, float(remaining) / attempts_left)
+
+
 async def run(args) -> int:
     from fastcheck.devices import DevicePool, count_registered_devices
     from fastcheck.protocols import gsa_async as gs
@@ -278,15 +292,19 @@ async def run(args) -> int:
                             retry_reason = 'budget'
                             budget_hit = True
                             break
+                        attempt_budget = _attempt_slice(
+                            remaining, args.retry, attempts)
                         try:
                             result = await asyncio.wait_for(
                                 gs.check(email, password, route,
-                                         timeout=max(2.0, min(args.timeout, remaining / 2)),
+                                         timeout=max(2.0, min(args.timeout,
+                                                              attempt_budget)),
                                          retries=args.retries, identity=cached_otp,
-                                         session=transport), timeout=remaining)
+                                         session=transport),
+                                timeout=attempt_budget)
                         except asyncio.TimeoutError:
-                            result = {'status': 'timeout', 'kind': 'budget',
-                                      'detail': '单条预算耗尽', 'http': 0}
+                            result = {'status': 'timeout', 'kind': 'timeout',
+                                      'detail': '本次代理连接超时', 'http': 0}
                         status = refine_status(result, result_bucket(result))
                         kind, why = retry_kind(result, status)
                         if kind is None or attempts > args.retry:

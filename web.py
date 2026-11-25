@@ -561,7 +561,11 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get('Content-Length') or 0)
         if length > 64 * 1024 * 1024:          # 上传上限 64MB
             return self._json({'error': '上传内容过大（上限 64MB）'})
-        raw = self.rfile.read(length) if length else b'{}'
+        # POST /api/stop has no request body.  Keep the transport body empty
+        # while validating Content-Length; substituting ``{}`` before this
+        # check made a valid zero-byte request look like an interrupted upload
+        # (expected 0 bytes, received 2 bytes).
+        raw = self.rfile.read(length) if length else b''
         if len(raw) != length:
             return self._json({'error':
                 f'上传中断：应收到 {length} 字节，实际收到 {len(raw)} 字节，请重试'})
@@ -590,7 +594,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(self._upload({'name': name, 'content': content}))
 
         try:
-            payload = json.loads(raw.decode('utf-8'))
+            payload = json.loads((raw or b'{}').decode('utf-8'))
         except ValueError:
             return self._json({'error': '请求体不是合法 JSON'})
 

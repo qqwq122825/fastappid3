@@ -128,14 +128,17 @@ class AsyncGsaSession:
 
 
 def _result(status: str, detail: str, started: float, *, kind: str = "",
-            stage: str = "", http: int = 0) -> dict:
+            stage: str = "", http: int | None = None) -> dict:
     result = {
         "status": status, "detail": detail,
         "ms": int((time.time() - started) * 1000),
         "kind": kind or ("" if status != "error" else sync._error_kind(detail)),
         "stage": stage,
     }
-    if http:
+    # HTTP 0 is meaningful: the proxy/transport failed before any response.
+    # Keeping it lets result_bucket classify the row as a timeout instead of
+    # leaking it into the unrelated "undetermined/other" bucket.
+    if http is not None:
         result["http"] = http
     return result
 
