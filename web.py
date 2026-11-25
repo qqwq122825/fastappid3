@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import threading
@@ -27,6 +28,8 @@ UPLOAD_DIR = os.path.join(HERE, 'data', 'uploads')
 DEFAULT_ACCOUNTS = os.path.join(HERE, 'data', 'accounts.txt')
 ACCOUNT_STATE = os.path.join(HERE, 'data', 'current-accounts.json')
 TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
+DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
+DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -684,6 +687,30 @@ def _reset_run_artifacts(processes):
     _LIVE_CACHE.update(at=0.0, data=None)
 
 
+def clear_devices():
+    """Remove only this project's persistent device pool while it is idle."""
+    if is_running():
+        return {'error': '任务运行中，请先停止任务再清空设备'}
+    root = os.path.realpath(DEVICE_ROOT)
+    data_root = os.path.realpath(os.path.join(HERE, 'data'))
+    if root == data_root or not root.startswith(data_root + os.sep):
+        return {'error': '设备目录不安全，已拒绝清空'}
+    if os.path.islink(DEVICE_ROOT):
+        return {'error': '设备目录是符号链接，已拒绝清空'}
+    if not os.path.exists(root):
+        return {'ok': True, 'cleared': 0}
+    from fastcheck.devices import count_registered_devices
+    cleared = count_registered_devices(root, DEVICE_ORIGIN)
+    tombstone = f'{root}.clearing-{os.getpid()}-{time.time_ns()}'
+    os.replace(root, tombstone)
+    try:
+        shutil.rmtree(tombstone)
+    except OSError as exc:
+        return {'error': f'设备目录已移出，但清理失败：{type(exc).__name__}'}
+    _LIVE_CACHE.update(at=0.0, data=None)
+    return {'ok': True, 'cleared': cleared}
+
+
 def stop_job():
     record = _active_task_record()
     if not record:
@@ -1093,6 +1120,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith('/api/stop'):
             with _LOCK:
                 return self._json(stop_job())
+        if self.path.startswith('/api/clear-devices'):
+            with _LOCK:
+                return self._json(clear_devices())
         return self._json({'error': 'unknown endpoint'})
 
     def _upload(self, payload):
@@ -1311,6 +1341,7 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
         <button class="btn primary" id="start" style="flex:1">开始</button>
         <button class="btn danger" id="stop" disabled>停止</button>
         <button class="btn ghost" id="refresh">刷新</button>
+        <button class="btn danger" id="clearDevices">清空设备</button>
       </div>
       <div class="hint" id="hint" style="margin-top:10px"></div>
     </div>
@@ -1597,9 +1628,27 @@ async function stop(){
   $('hint').style.color = res.error ? 'var(--red)' : 'var(--dim)';
   await tick();
 }
+async function clearDevices(){
+  if(!window.confirm('确定清空所有已注册设备？清空后下次任务需要重新注册。')) return;
+  const button = $('clearDevices');
+  button.disabled = true;
+  $('hint').textContent = '正在清空设备…';
+  $('hint').style.color = 'var(--dim)';
+  const res = await post('/api/clear-devices');
+  if(res.error){
+    $('hint').textContent = '✕ ' + res.error;
+    $('hint').style.color = 'var(--red)';
+  }else{
+    $('hint').textContent = `已清空 ${num(res.cleared)} 个已注册设备`;
+    $('hint').style.color = 'var(--green)';
+  }
+  button.disabled = false;
+  await tick();
+}
 $('start').onclick = start;
 $('stop').onclick = stop;
 $('refresh').onclick = () => { shownAccounts=null; tick(); };
+$('clearDevices').onclick = clearDevices;
 
 /* ---- 推荐提示 ---- */
 function refreshHint(){

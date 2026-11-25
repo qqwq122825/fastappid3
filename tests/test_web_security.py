@@ -187,6 +187,39 @@ class ConsoleRequestTests(unittest.TestCase):
         self.assertEqual({'ok': True}, response)
         stop.assert_called_once_with()
 
+    def test_clear_devices_endpoint_calls_idle_pool_cleanup(self):
+        handler = make_handler('/api/clear-devices', {}, cookie=self.cookie())
+        with patch.object(web, 'clear_devices', return_value={'ok': True, 'cleared': 3}) as clear:
+            response = handler._do_post()
+        self.assertEqual({'ok': True, 'cleared': 3}, response)
+        clear.assert_called_once_with()
+
+    def test_clear_devices_removes_only_project_device_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = os.path.join(directory, 'data')
+            root = os.path.join(data, 'devices-simple')
+            os.makedirs(os.path.join(root, 'fixture'))
+            with open(os.path.join(root, 'fixture', 'state.json'), 'w', encoding='utf-8') as handle:
+                handle.write('{}')
+            keep = os.path.join(data, 'accounts.txt')
+            with open(keep, 'w', encoding='utf-8') as handle:
+                handle.write('fixture')
+            with patch.object(web, 'HERE', directory), \
+                 patch.object(web, 'DEVICE_ROOT', root), \
+                 patch.object(web, 'is_running', return_value=False):
+                response = web.clear_devices()
+            self.assertTrue(response['ok'])
+            self.assertFalse(os.path.exists(root))
+            self.assertTrue(os.path.exists(keep))
+
+    def test_clear_devices_refuses_while_task_is_running(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(web, 'HERE', directory), \
+             patch.object(web, 'DEVICE_ROOT', os.path.join(directory, 'data', 'devices-simple')), \
+             patch.object(web, 'is_running', return_value=True):
+            response = web.clear_devices()
+        self.assertIn('任务运行中', response['error'])
+
     def test_new_multi_process_run_removes_stale_result_files(self):
         with tempfile.TemporaryDirectory() as directory, \
              patch.object(web, 'HERE', directory), \
@@ -336,6 +369,11 @@ new vm.Script(input.source, {filename: 'web-inline.js'}).runInContext(context);
         self.assertEqual([], reset['last']['recent'])
         self.assertIn('还没有结果', reset['rows'])
         self.assertEqual('实时刷新', reset['hint'])
+
+    def test_page_exposes_clear_devices_control(self):
+        self.assertIn('id="clearDevices"', web.PAGE)
+        self.assertIn("post('/api/clear-devices')", web.PAGE)
+        self.assertIn('确定清空所有已注册设备', web.PAGE)
 
 
 if __name__ == '__main__':
