@@ -65,9 +65,30 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((None, 0.0), pool.acquire_nowait(0))
         self.assertEqual(before, pool.stats['blocked'])
 
-    def test_multi_process_uses_async_worker(self):
+    def test_multi_process_uses_thread_worker(self):
         import run_mp
-        self.assertTrue(run_mp.WORKER.endswith('simple_async.py'))
+        self.assertTrue(run_mp.WORKER.endswith('simple.py'))
+
+    def test_single_process_uses_thread_worker(self):
+        from pathlib import Path
+        from unittest.mock import Mock, patch
+        import web
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'data').mkdir()
+            accounts = root / 'accounts.txt'
+            accounts.write_text('fixture@example.invalid----fixture\n')
+            state = dict(web.STATE, proc=None, take_pending=False,
+                         log=str(root / 'data' / 'run.log'))
+            with patch.object(web, 'HERE', directory), \
+                 patch.object(web, 'LIVE', str(root / 'data' / 'live.json')), \
+                 patch.object(web, 'STATE', state), \
+                 patch.object(web, 'is_running', return_value=False), \
+                 patch.object(web, 'proxy_api', return_value='http://fixture.invalid/{num}'), \
+                 patch.object(web.subprocess, 'Popen', return_value=Mock(pid=123)) as launch:
+                result = web.start_job(str(accounts), 2, 1)
+            self.assertTrue(result['ok'])
+            self.assertEqual('simple.py', Path(launch.call_args.args[0][1]).name)
 
     def test_transport_http_zero_is_classified_as_timeout(self):
         row = gsa_async._result(

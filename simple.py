@@ -456,6 +456,7 @@ def main():
                 'eta': round((results['total'] - done) / (done / elapsed), 0)
                        if done and elapsed else None,
                 'threads': args.threads, 'processes': 1, 'backend': SRP_MATH_BACKEND,
+                'engine': 'threading',
                 'accounts': args.accounts,
                 'cpu_seconds': round(cpu, 2),
                 'cpu_cores': round(cpu / elapsed, 3) if elapsed else 0,
