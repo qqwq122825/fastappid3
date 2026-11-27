@@ -104,6 +104,8 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('minmax(280px,330px) minmax(0,1fr)', web.PAGE)
         self.assertIn('.layout>*{min-width:0}', web.PAGE)
         self.assertIn('.scroll{max-height:520px;max-width:100%;overflow:auto}', web.PAGE)
+        self.assertIn('min-width:0;overflow:hidden', web.PAGE)
+        self.assertIn('.panel>.hd>span{min-width:0;max-width:100%', web.PAGE)
 
     def test_ip_pool_refill_scales_with_concurrency(self):
         large = IpPool('http://invalid/{num}', threads=1000)
