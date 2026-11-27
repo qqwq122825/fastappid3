@@ -55,11 +55,13 @@ def ensure_open_file_limit(threads, resource_module=None):
     return int(soft)
 
 
-def anisette_concurrency_limit(threads, configured=0):
-    """Use full worker concurrency unless an explicit public-header cap is set."""
+def anisette_concurrency_limit(threads, configured=0, proxied=False):
+    """Bound the proxy-tunnel startup wave while preserving explicit tuning."""
     threads = max(1, int(threads))
     configured = int(configured or 0)
-    return configured if configured > 0 else threads
+    if configured > 0:
+        return min(threads, configured)
+    return min(threads, 128) if proxied else threads
 
 
 def anisette_retry_delay(previous, jitter=None):
@@ -683,7 +685,8 @@ def main():
     # devices and never reserve an unregistered slot themselves.
     register_limit = _rw if _rw > 0 else max(1, args.threads)
     _aw = int(args.anisette_workers)
-    anisette_limit = anisette_concurrency_limit(args.threads, _aw)
+    anisette_limit = anisette_concurrency_limit(
+        args.threads, _aw, proxied=args.anisette_proxy)
     anisette_gate = threading.Semaphore(anisette_limit)
     print(f'公共头并发上限 {anisette_limit}'
           f'{"（自动）" if _aw <= 0 else ""}')
@@ -763,10 +766,18 @@ def main():
                'recent': collections.deque(maxlen=12),
                'device_ready': set(), 'device_in_use': set(),
                'device_registering': set(), 'register_errors': 0,
-               'register_error_types': {}, 'device_retired': 0}
+               'register_error_types': {}, 'device_retired': 0,
+               'workers_started': 0, 'public_header_waiting': 0,
+               'public_header_ready': 0}
     stop = threading.Event()
+    first_result = threading.Event()
     device_pool_cv = threading.Condition()
     device_inventory = {'ready': loaded_devices, 'registering': 0}
+    startup_runtime_lock = threading.Lock()
+    startup_runtime = {
+        'workers_started': 0, 'public_header_waiting': 0,
+        'public_header_ready': 0,
+    }
 
     SAMPLE_CAP = 4000          # 历史样本上限，超出只保留最近的一批
 
@@ -785,6 +796,9 @@ def main():
                 recent = list(results['recent'])
                 device_in_use = len(results['device_in_use'])
                 device_registering = len(results['device_registering'])
+                workers_started = results.get('workers_started', 0)
+                public_header_waiting = results.get('public_header_waiting', 0)
+                public_header_ready = results.get('public_header_ready', 0)
                 register_errors = results['register_errors']
                 register_error_types = dict(results['register_error_types'])
                 latency_hist = dict(results['latency_hist'])
@@ -814,6 +828,10 @@ def main():
                 'device_target': active_workers,
                 'device_registering': inventory_registering,
                 'device_in_use': device_in_use,
+                'workers_started': workers_started,
+                'public_header_waiting': public_header_waiting,
+                'public_header_ready': public_header_ready,
+                'public_header_limit': anisette_limit,
             })
             if pool_snapshot is not None:
                 startup_snapshot.update({
@@ -824,6 +842,11 @@ def main():
             if done:
                 startup_snapshot.update(
                     phase='running', message='业务校验已开始')
+            elif workers_started:
+                startup_snapshot.update(
+                    phase='public_header',
+                    message=(f'正在获取公共头（就绪 {public_header_ready}/'
+                             f'{workers_started}，并发上限 {anisette_limit}）'))
             elif active_workers and inventory_ready < active_workers:
                 startup_snapshot.update(
                     phase='device_register',
@@ -887,6 +910,45 @@ def main():
             except OSError:
                 pass
             stop.wait(1.0)
+
+    def startup_heartbeat():
+        """Publish a lightweight startup frame until the first result exists."""
+        while not stop.is_set() and not first_result.is_set():
+            with startup_runtime_lock:
+                runtime = dict(startup_runtime)
+            with device_pool_cv:
+                ready = int(device_inventory['ready'])
+                registering = int(device_inventory['registering'])
+            pool = ip_pool.snapshot() if ip_pool is not None else {}
+            workers_started = int(runtime['workers_started'])
+            header_ready = int(runtime['public_header_ready'])
+            header_waiting = int(runtime['public_header_waiting'])
+            if workers_started:
+                phase = 'public_header'
+                message = (f'正在获取公共头（就绪 {header_ready}/'
+                           f'{workers_started}，并发上限 {anisette_limit}）')
+            else:
+                phase = 'device_register'
+                message = f'代理池就绪，正在分配设备（{ready}/{active_workers}）'
+            snapshot = dict(
+                startup_state, phase=phase, message=message,
+                elapsed=round(time.monotonic() - startup_started, 1),
+                device_loaded=loaded_devices, device_ready=ready,
+                device_target=active_workers, device_registering=registering,
+                workers_started=workers_started,
+                public_header_waiting=header_waiting,
+                public_header_ready=header_ready,
+                public_header_limit=anisette_limit,
+                proxy_fetched=int(pool.get('fetched') or 0),
+                proxy_available=int(pool.get('available') or 0),
+                proxy_api_calls=int(pool.get('api_calls') or 0))
+            try:
+                write_startup_live(
+                    args.live, snapshot, total=len(rows), threads=args.threads,
+                    accounts=args.accounts, elapsed=snapshot['elapsed'])
+            except OSError:
+                pass
+            first_result.wait(0.5)
 
     def device_registrar(registrar_id):
         """Produce registered devices and publish them to the ready pool.
@@ -1000,6 +1062,9 @@ def main():
         with lock:
             worker_leases[tid] = slot_lease
             results['device_in_use'].add(slot)
+            results['workers_started'] += 1
+        with startup_runtime_lock:
+            startup_runtime['workers_started'] += 1
         boot['pool_ctor'] = (time.thread_time() - _b0) * 1000
         _b0 = time.thread_time()
         profile = device_profile(pool, slot) if not args.no_fix_os else None
@@ -1079,6 +1144,8 @@ def main():
         # 代理，避免把一个 60 秒代理固定缓存到整个长任务。
         _b0 = time.thread_time()
         cached_client = None
+        startup_header_pending = False
+        startup_header_ready = False
         if not args.no_client_cache and not args.anisette_proxy:
             from fastcheck.protocols.anisette_v3 import Client
             cached_client = Client(
@@ -1097,17 +1164,48 @@ def main():
             X-MMe-Client-Info；必须把 profile 里的型号补回 identity，
             否则 gs.check 会带着空的设备头去打 Apple。
             """
-            if cached_client is not None:
-                with anisette_gate:
-                    # anisette 超时单独控制：默认 30 秒，连不上时快速失败
-                    cached_client.deadline = time.monotonic() + max(args.anisette_timeout, 10)
-                    raw = cached_client.headers()
-            else:
-                with anisette_gate:
-                    raw = pool.fetch_headers(
-                        slot, info, max(args.timeout, 20), registered=True,
-                        proxy=proxy if args.anisette_proxy else None,
-                        provider_direct=not args.anisette_proxy)
+            nonlocal startup_header_pending, startup_header_ready
+            if not startup_header_ready and not startup_header_pending:
+                startup_header_pending = True
+                with lock:
+                    results['public_header_waiting'] += 1
+                with startup_runtime_lock:
+                    startup_runtime['public_header_waiting'] += 1
+            try:
+                if cached_client is not None:
+                    with anisette_gate:
+                        # anisette 超时单独控制：默认 30 秒，连不上时快速失败
+                        cached_client.deadline = time.monotonic() + max(args.anisette_timeout, 10)
+                        raw = cached_client.headers()
+                else:
+                    with anisette_gate:
+                        raw = pool.fetch_headers(
+                            slot, info, max(args.timeout, 20), registered=True,
+                            proxy=proxy if args.anisette_proxy else None,
+                            provider_direct=not args.anisette_proxy)
+            except BaseException:
+                if startup_header_pending:
+                    startup_header_pending = False
+                    with lock:
+                        results['public_header_waiting'] = max(
+                            0, results['public_header_waiting'] - 1)
+                    with startup_runtime_lock:
+                        startup_runtime['public_header_waiting'] = max(
+                            0, startup_runtime['public_header_waiting'] - 1)
+                raise
+            if startup_header_pending:
+                startup_header_pending = False
+                with lock:
+                    results['public_header_waiting'] = max(
+                        0, results['public_header_waiting'] - 1)
+                    if not startup_header_ready:
+                        results['public_header_ready'] += 1
+                with startup_runtime_lock:
+                    startup_runtime['public_header_waiting'] = max(
+                        0, startup_runtime['public_header_waiting'] - 1)
+                    if not startup_header_ready:
+                        startup_runtime['public_header_ready'] += 1
+                startup_header_ready = True
             if profile and isinstance(raw, dict):
                 raw = dict(raw)
                 raw['X-MMe-Client-Info'] = profile['client_info']
@@ -1488,6 +1586,7 @@ def main():
                     if len(write_buffer) >= 200:        # 200 条才落一次盘
                         batch = write_buffer[:]
                         write_buffer.clear()
+                first_result.set()
                 if budget_line is not None:
                     with budget_lock:
                         budget_sink.write(budget_line)
@@ -1534,6 +1633,9 @@ def main():
     results['started'] = started
     live_thread = threading.Thread(target=live_writer, name='live', daemon=True)
     live_thread.start()
+    startup_thread = threading.Thread(
+        target=startup_heartbeat, name='startup-live', daemon=True)
+    startup_thread.start()
     def worker_guarded(tid):
         def release_session():
             with lock:
@@ -1575,6 +1677,7 @@ def main():
     for thread in threads:
         thread.join()
     stop.set()
+    first_result.set()
     with device_pool_cv:
         device_pool_cv.notify_all()
     for thread in registrar_threads:
@@ -1591,6 +1694,7 @@ def main():
         pass
     stop.set()
     live_thread.join(timeout=3)      # 必须等写线程退出，否则它会覆盖最终状态
+    startup_thread.join(timeout=3)
     done_now = results['done']
     expected_now = len(rows)
     results['incomplete'] = max(0, expected_now - done_now)

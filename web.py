@@ -1502,6 +1502,7 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
           <div class="items">
             <span id="mStartupProxy">代理 IP：等待拉取</span>
             <span id="mStartupDevices">设备：等待读取</span>
+            <span id="mStartupHeaders">公共头：等待工作线程</span>
             <span id="mStartupProcesses">进程：等待启动</span>
           </div>
         </div>
@@ -1946,7 +1947,7 @@ async function tick(){
   const startup = d.startup || {};
   const startupLabels = {
     device_scan:'扫描设备', device_load:'读取设备', spawning:'启动进程',
-    proxy_fetch:'拉取代理', device_register:'注册设备', ready:'准备就绪',
+    proxy_fetch:'拉取代理', device_register:'注册设备', public_header:'获取公共头', ready:'准备就绪',
     running:'业务校验', complete:'任务完成', stopped:'任务停止'
   };
   const startupActive = Boolean(d.running && done === 0 && startup.phase);
@@ -1954,6 +1955,7 @@ async function tick(){
   $('mStartupPhase').textContent = `${startupLabels[startup.phase] || '正在初始化'} · ${startup.message || ''}`;
   $('mStartupProxy').textContent = `代理 IP：已拉取 ${num(startup.proxy_fetched)} / 目标 ${num(startup.proxy_target)} · 库存 ${num(startup.proxy_available)} · API ${num(startup.proxy_api_calls)} 次`;
   $('mStartupDevices').textContent = `设备：发现 ${num(startup.device_discovered)} · 读取 ${num(startup.device_loaded)} · 可用 ${num(startup.device_ready)} / 目标 ${num(startup.device_target)} · 注册中 ${num(startup.device_registering)}`;
+  $('mStartupHeaders').textContent = `公共头：工作线程 ${num(startup.workers_started)} · 等待 ${num(startup.public_header_waiting)} · 就绪 ${num(startup.public_header_ready)} · 并发上限 ${num(startup.public_header_limit)}`;
   $('mStartupProcesses').textContent = `进程：已就绪 ${num(startup.process_ready)} / ${num(startup.process_total)}`;
   const poolAvailable = pool.available == null ? null : Number(pool.available);
   const poolLow = pool.low_water == null ? null : Number(pool.low_water);

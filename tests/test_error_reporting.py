@@ -169,12 +169,16 @@ def test_multiprocess_merge_reports_child_startup_progress(tmp_path=None):
          'process_ready': 1, 'process_total': 2,
          'device_loaded': 400, 'device_ready': 420, 'device_target': 500,
          'device_registering': 10, 'proxy_fetched': 500,
-         'proxy_target': 500, 'proxy_available': 480, 'proxy_api_calls': 2},
+         'proxy_target': 500, 'proxy_available': 480, 'proxy_api_calls': 2,
+         'workers_started': 500, 'public_header_waiting': 128,
+         'public_header_ready': 20, 'public_header_limit': 128},
         {'phase': 'proxy_fetch', 'message': '正在拉取代理 IP',
          'process_ready': 1, 'process_total': 2,
          'device_loaded': 350, 'device_ready': 350, 'device_target': 500,
          'proxy_fetched': 300, 'proxy_target': 500,
-         'proxy_available': 300, 'proxy_api_calls': 1},
+         'proxy_available': 300, 'proxy_api_calls': 1,
+         'workers_started': 500, 'public_header_waiting': 128,
+         'public_header_ready': 10, 'public_header_limit': 128},
     )
     for index, startup in enumerate(payloads):
         path = tmp_path / f'live-startup-{index}.json'
@@ -192,6 +196,10 @@ def test_multiprocess_merge_reports_child_startup_progress(tmp_path=None):
     assert startup['device_ready'] == 770
     assert startup['proxy_fetched'] == 800
     assert startup['proxy_api_calls'] == 3
+    assert startup['workers_started'] == 1000
+    assert startup['public_header_waiting'] == 256
+    assert startup['public_header_ready'] == 30
+    assert startup['public_header_limit'] == 256
 
 
 def test_multiprocess_merge_uses_global_latency_distribution(tmp_path=None):

@@ -256,8 +256,11 @@ def merge(jobs, started, expected_total=0, wall_started=None):
     for key in ('device_discovered', 'device_loaded', 'device_ready',
                 'device_target', 'device_registering', 'device_in_use',
                 'proxy_target', 'proxy_fetched', 'proxy_available',
-                'proxy_api_calls'):
+                'proxy_api_calls', 'workers_started',
+                'public_header_waiting', 'public_header_ready'):
         startup[key] = sum(int(row.get(key) or 0) for row in startup_rows)
+    startup['public_header_limit'] = sum(
+        int(row.get('public_header_limit') or 0) for row in startup_rows)
     return {
         'started': time.strftime('%H:%M:%S', time.localtime(wall_started)),
         'elapsed': round(elapsed, 1),

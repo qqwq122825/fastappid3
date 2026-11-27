@@ -11,7 +11,8 @@ from fastcheck.protocols import gsa_async
 from fastcheck.status import result_bucket
 from gsafast.ippool import IpPool
 from simple_async import _attempt_slice
-from simple import _new_state_lock, _proxy_host, _shared_device_info
+from simple import (anisette_concurrency_limit, _new_state_lock, _proxy_host,
+                    _shared_device_info)
 
 
 class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
@@ -67,6 +68,13 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         before = pool.stats['blocked']
         self.assertEqual((None, 0.0), pool.acquire_nowait(0))
         self.assertEqual(before, pool.stats['blocked'])
+
+    def test_proxied_public_header_startup_wave_is_bounded(self):
+        self.assertEqual(128, anisette_concurrency_limit(1000, proxied=True))
+        self.assertEqual(1000, anisette_concurrency_limit(1000, proxied=False))
+        self.assertEqual(64, anisette_concurrency_limit(
+            1000, configured=64, proxied=True))
+        self.assertEqual(80, anisette_concurrency_limit(80, proxied=True))
 
     def test_ip_pool_refill_scales_with_concurrency(self):
         large = IpPool('http://invalid/{num}', threads=1000)
@@ -415,13 +423,15 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         import web
         for marker in ('id="startupPanel"', 'id="mStartupPhase"',
                        'id="mStartupProxy"', 'id="mStartupDevices"',
-                       'id="mStartupProcesses"'):
+                       'id="mStartupHeaders"', 'id="mStartupProcesses"'):
             self.assertIn(marker, web.PAGE)
         self.assertIn("device_scan:'扫描设备'", web.PAGE)
         self.assertIn("proxy_fetch:'拉取代理'", web.PAGE)
         self.assertIn("device_register:'注册设备'", web.PAGE)
+        self.assertIn("public_header:'获取公共头'", web.PAGE)
         self.assertIn('startup.proxy_fetched', web.PAGE)
         self.assertIn('startup.device_loaded', web.PAGE)
+        self.assertIn('startup.public_header_waiting', web.PAGE)
 
     def test_start_publishes_device_scan_before_worker_spawn(self):
         from pathlib import Path
