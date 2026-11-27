@@ -244,6 +244,37 @@ class ConsoleRequestTests(unittest.TestCase):
             response = web.clear_devices()
         self.assertIn('任务运行中', response['error'])
 
+    def test_idle_state_reports_persistent_device_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = os.path.join(directory, 'devices-simple')
+            key = hashlib.sha256(web.DEVICE_ORIGIN.encode()).hexdigest()[:24]
+            devices = os.path.join(root, key, 'devices')
+            for slot in ('01', '02', '03'):
+                os.makedirs(os.path.join(devices, slot))
+            live = os.path.join(directory, 'live.json')
+            with open(live, 'w', encoding='utf-8') as handle:
+                json.dump({'finished': True, 'device_registered': 999}, handle)
+            with patch.object(web, 'LIVE', live), \
+                 patch.object(web, 'DEVICE_ROOT', root), \
+                 patch.object(web, '_active_task_record', return_value=None):
+                state = web._live_state_uncached()
+            self.assertEqual(3, state['device_registered'])
+            self.assertEqual(3, state['device_ready'])
+            self.assertEqual(3, state['device_total'])
+            self.assertEqual('2026.11.28.2', state['version'])
+
+    def test_linux_process_group_cpu_sums_parent_and_children(self):
+        parent = '1 (parent) S 0 77 0 0 0 0 0 0 0 0 200 100 0 0 0 0 0 0 0 0\n'
+        child = '2 (child) S 1 77 0 0 0 0 0 0 0 0 50 25 0 0 0 0 0 0 0 0\n'
+        other = '3 (other) S 1 88 0 0 0 0 0 0 0 0 900 900 0 0 0 0 0 0 0 0\n'
+        with patch.object(web.os.path, 'isdir', return_value=True), \
+             patch.object(web.os, 'listdir', return_value=['1', '2', '3']), \
+             patch.object(web.os, 'sysconf', return_value=100), \
+             patch('builtins.open', side_effect=[io.StringIO(parent),
+                                                 io.StringIO(child),
+                                                 io.StringIO(other)]):
+            self.assertEqual(3.75, web._process_group_cpu_seconds(77))
+
     def test_new_multi_process_run_removes_stale_result_files(self):
         with tempfile.TemporaryDirectory() as directory, \
              patch.object(web, 'HERE', directory), \

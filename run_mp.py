@@ -257,6 +257,7 @@ def merge(jobs, started, expected_total=0, wall_started=None):
                 'device_target', 'device_registering', 'device_in_use',
                 'proxy_target', 'proxy_fetched', 'proxy_available',
                 'proxy_api_calls', 'workers_started',
+                'threads_created', 'accounts_claimed', 'business_inflight',
                 'public_header_waiting', 'public_header_ready',
                 'public_header_retries'):
         startup[key] = sum(int(row.get(key) or 0) for row in startup_rows)

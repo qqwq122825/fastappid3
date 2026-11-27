@@ -78,10 +78,20 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
 
     def test_worker_ramp_reaches_full_concurrency_without_dropping_threads(self):
         batches = startup_worker_batches(1000)
-        self.assertEqual(8, len(batches[0]))
-        self.assertEqual([8] + [64] * 15 + [32],
-                         [len(batch) for batch in batches])
+        self.assertEqual([256, 256, 256, 232], [len(batch) for batch in batches])
         self.assertEqual(list(range(1000)), [i for batch in batches for i in batch])
+
+    def test_worker_launch_has_no_first_header_gate(self):
+        from pathlib import Path
+        import simple
+        source = Path(simple.__file__).read_text(encoding='utf-8')
+        launch = source[source.index('batches = startup_worker_batches(active_workers)'):
+                        source.index('for thread in threads:', source.index(
+                            'batches = startup_worker_batches(active_workers)'))]
+        self.assertNotIn('first_public_header.wait', launch)
+        self.assertIn('worker_start_gate.set()', launch)
+        self.assertLess(launch.index('threads[index].start()'),
+                        launch.index('worker_start_gate.set()'))
 
     def test_public_header_has_independent_timeout_and_thread_retry(self):
         from pathlib import Path
@@ -463,6 +473,9 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('startup.proxy_fetched', web.PAGE)
         self.assertIn('startup.device_loaded', web.PAGE)
         self.assertIn('startup.public_header_waiting', web.PAGE)
+        self.assertIn('startup.threads_created', web.PAGE)
+        self.assertIn('startup.business_inflight', web.PAGE)
+        self.assertIn('id="versionTag">v2026.11.28.2', web.PAGE)
 
     def test_start_publishes_device_scan_before_worker_spawn(self):
         from pathlib import Path

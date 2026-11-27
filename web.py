@@ -31,6 +31,7 @@ ACCOUNT_STATE = os.path.join(HERE, 'data', 'current-accounts.json')
 TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
+APP_VERSION = '2026.11.28.2'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -416,21 +417,51 @@ def _process_cpu_seconds(pid):
     return None
 
 
-def _process_cpu_now(pid):
-    """Return rolling cores used by PID; unlike live.json this is current."""
+def _process_group_cpu_seconds(pgid):
+    """Sum CPU time for every live member of a Linux process group."""
+    if not os.path.isdir('/proc'):
+        return None
+    ticks = float(os.sysconf('SC_CLK_TCK'))
+    total = 0.0
+    found = False
+    try:
+        entries = os.listdir('/proc')
+    except OSError:
+        return None
+    for name in entries:
+        if not name.isdigit():
+            continue
+        try:
+            raw = open(f'/proc/{name}/stat', encoding='utf-8').read()
+            fields = raw.rsplit(') ', 1)[1].split()
+            if int(fields[2]) != int(pgid):
+                continue
+            total += (float(fields[11]) + float(fields[12])) / ticks
+            found = True
+        except (OSError, ValueError, IndexError):
+            continue
+    return total if found else None
+
+
+def _process_cpu_now(pid, pgid=None):
+    """Return rolling cores for the whole task process group when available."""
     now = time.monotonic()
+    identity = int(pgid or pid)
     with _PROCESS_CPU_LOCK:
-        if _PROCESS_CPU['pid'] == int(pid) and _PROCESS_CPU['at'] is not None \
+        if _PROCESS_CPU['pid'] == identity and _PROCESS_CPU['at'] is not None \
                 and now - _PROCESS_CPU['at'] < 0.75:
             return _PROCESS_CPU['cores']
-        seconds = _process_cpu_seconds(pid)
+        seconds = (_process_group_cpu_seconds(pgid) if pgid is not None
+                   else _process_cpu_seconds(pid))
+        if seconds is None and pgid is not None:
+            seconds = _process_cpu_seconds(pid)
         if seconds is None:
             return None
         cores = None
-        if (_PROCESS_CPU['pid'] == int(pid) and _PROCESS_CPU['at'] is not None
+        if (_PROCESS_CPU['pid'] == identity and _PROCESS_CPU['at'] is not None
                 and now > _PROCESS_CPU['at'] and seconds >= _PROCESS_CPU['seconds']):
             cores = (seconds - _PROCESS_CPU['seconds']) / (now - _PROCESS_CPU['at'])
-        _PROCESS_CPU.update(pid=int(pid), at=now, seconds=seconds, cores=cores)
+        _PROCESS_CPU.update(pid=identity, at=now, seconds=seconds, cores=cores)
         return cores
 
 
@@ -615,8 +646,16 @@ def _live_state_uncached():
     live = _multiprocess_ip_pool(live)
     live['running'] = running
     live['pid'] = int(record['pid']) if running else None
+    live['version'] = APP_VERSION
+    if not running:
+        # live.json 是上一轮的快照，停机时应以磁盘上的持久设备池为准。
+        # 只数本项目设备目录，不导入工作进程依赖，页面首次打开也能立即显示。
+        idle_devices = _count_device_slots()
+        live.update(device_total=idle_devices,
+                    device_registered=idle_devices, device_ready=idle_devices,
+                    device_in_use=0, device_registering=0)
     if running:
-        current_cores = _process_cpu_now(record['pid'])
+        current_cores = _process_cpu_now(record['pid'], record.get('pgid'))
         if current_cores is not None:
             live['proc_cpu_now'] = round(current_cores, 2)
     live['accounts'] = STATE['accounts']
@@ -653,13 +692,7 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
     # browser polls immediately after the Start response, so it must never sit
     # on an empty/stale live.json while imports, account slicing or process
     # creation are still happening.
-    device_key = hashlib.sha256(DEVICE_ORIGIN.encode()).hexdigest()[:24]
-    device_dir = os.path.join(DEVICE_ROOT, device_key, 'devices')
-    try:
-        discovered_devices = sum(1 for item in os.scandir(device_dir)
-                                 if item.is_dir())
-    except OSError:
-        discovered_devices = 0
+    discovered_devices = _count_device_slots()
     initial_live = {
         'started': time.strftime('%H:%M:%S'), 'elapsed': 0,
         'total': total, 'done': 0, 'rate': 0, 'per_hour': 0,
@@ -749,7 +782,17 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
     return {'ok': True, 'pid': proc.pid, 'threads': threads, 'processes': processes,
             'limit': limit, 'total': total, 'total_threads': total_threads,
             'warmup_hint': (f'已启动 {processes} 进程 × {threads} 线程 = {total_threads} 并发；'
-                            f'首轮注册设备约 {max(4, total_threads // 16)} 秒后才会有速度')}
+                            '线程已并发启动，设备、代理、公共头进展实时显示')}
+
+
+def _count_device_slots():
+    """Return the current persistent device count without worker imports."""
+    device_key = hashlib.sha256(DEVICE_ORIGIN.encode()).hexdigest()[:24]
+    device_dir = os.path.join(DEVICE_ROOT, device_key, 'devices')
+    try:
+        return sum(1 for item in os.scandir(device_dir) if item.is_dir())
+    except OSError:
+        return 0
 
 
 def _reset_run_artifacts(processes):
@@ -1408,6 +1451,7 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
 <div class="top">
   <h1>GSA 校验控制台</h1>
   <span class="tag">极简模型</span>
+  <span class="tag" id="versionTag">v__APP_VERSION__</span>
   <div class="right">
     <span id="stateTag"><span class="dot" style="background:#9ca3af"></span>未开始</span>
     <span><span id="runtimeLabel">已运行</span> <b id="runtime">--:--:--</b></span>
@@ -1956,7 +2000,9 @@ async function tick(){
   const rkText = Object.keys(rk).length
     ? ' · ' + Object.entries(rk).map(([k,v]) => `${k}:${v}`).join(' ') : '';
   $('mRetry').textContent = `重试 ${num(d.retried)}${rkText}`;
-  $('mDevices').textContent = `设备池 已注册 ${num(d.device_registered ?? d.device_ready)} / 使用中 ${num(d.device_in_use)} / 注册中 ${num(d.device_registering)}`;
+  $('mDevices').textContent = d.running
+    ? `设备池 已注册 ${num(d.device_registered ?? d.device_ready)} / 使用中 ${num(d.device_in_use)} / 注册中 ${num(d.device_registering)}`
+    : `设备池 总设备 ${num(d.device_total ?? d.device_registered ?? d.device_ready)} / 当前空闲`;
   const pool = d.ip_pool || {};
   const startup = d.startup || {};
   const startupLabels = {
@@ -1969,7 +2015,7 @@ async function tick(){
   $('mStartupPhase').textContent = `${startupLabels[startup.phase] || '正在初始化'} · ${startup.message || ''}`;
   $('mStartupProxy').textContent = `代理 IP：已拉取 ${num(startup.proxy_fetched)} / 目标 ${num(startup.proxy_target)} · 库存 ${num(startup.proxy_available)} · API ${num(startup.proxy_api_calls)} 次`;
   $('mStartupDevices').textContent = `设备：发现 ${num(startup.device_discovered)} · 读取 ${num(startup.device_loaded)} · 可用 ${num(startup.device_ready)} / 目标 ${num(startup.device_target)} · 注册中 ${num(startup.device_registering)}`;
-  $('mStartupHeaders').textContent = `公共头：工作线程 ${num(startup.workers_started)} · 等待 ${num(startup.public_header_waiting)} · 就绪 ${num(startup.public_header_ready)} · 超时重取 ${num(startup.public_header_retries)} · 并发上限 ${num(startup.public_header_limit)}`;
+  $('mStartupHeaders').textContent = `线程：已创建 ${num(startup.threads_created)} / ${num(threads*processes)} · 已占设备 ${num(startup.workers_started)} · 公共头等待 ${num(startup.public_header_waiting)} · 就绪 ${num(startup.public_header_ready)} · 业务请求中 ${num(startup.business_inflight)} · 超时重取 ${num(startup.public_header_retries)} · 并发上限 ${num(startup.public_header_limit)}`;
   $('mStartupProcesses').textContent = `进程：已就绪 ${num(startup.process_ready)} / ${num(startup.process_total)}`;
   const poolAvailable = pool.available == null ? null : Number(pool.available);
   const poolLow = pool.low_water == null ? null : Number(pool.low_water);
@@ -2130,6 +2176,7 @@ async function loadAccounts(path){
 }
 loadAccounts(); tick(); setInterval(tick, 1000);
 </script></body></html>"""
+PAGE = PAGE.replace('__APP_VERSION__', APP_VERSION)
 
 
 def main():

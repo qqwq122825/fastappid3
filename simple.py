@@ -64,19 +64,18 @@ def anisette_concurrency_limit(threads, configured=0, proxied=False):
     return threads
 
 
-def startup_worker_batches(total, batch_size=64, pilot_size=8):
-    """Return a tiny pilot followed by full-concurrency ramp batches.
+def startup_worker_batches(total, batch_size=256, pilot_size=0):
+    """Split thread creation into scheduler-friendly batches without gating.
 
-    Cold-starting hundreds of provider requests at exactly the same instant
-    delays the first visible result.  The pilot proves the public-header path
-    first; later batches still reach every requested worker.
+    Every batch is started immediately.  ``pilot_size`` remains accepted for
+    compatibility, but the normal path has no first-public-header barrier.
     """
     total = max(0, int(total))
     batch_size = max(1, int(batch_size))
-    pilot_size = min(total, max(1, int(pilot_size)))
     if not total:
         return []
-    batches = [range(0, pilot_size)]
+    pilot_size = min(total, max(0, int(pilot_size or 0)))
+    batches = [range(0, pilot_size)] if pilot_size else []
     batches.extend(range(start, min(total, start + batch_size))
                    for start in range(pilot_size, total, batch_size))
     return batches
@@ -778,7 +777,8 @@ def main():
                'device_ready': set(), 'device_in_use': set(),
                'device_registering': set(), 'register_errors': 0,
                'register_error_types': {}, 'device_retired': 0,
-               'workers_started': 0, 'public_header_waiting': 0,
+               'threads_created': 0, 'workers_started': 0,
+               'accounts_claimed': 0, 'public_header_waiting': 0,
                'public_header_ready': 0, 'public_header_retries': 0}
     stop = threading.Event()
     first_result = threading.Event()
@@ -787,7 +787,8 @@ def main():
     device_inventory = {'ready': loaded_devices, 'registering': 0}
     startup_runtime_lock = threading.Lock()
     startup_runtime = {
-        'workers_started': 0, 'public_header_waiting': 0,
+        'threads_created': 0, 'workers_started': 0,
+        'accounts_claimed': 0, 'public_header_waiting': 0,
         'public_header_ready': 0, 'public_header_retries': 0,
     }
 
@@ -809,6 +810,8 @@ def main():
                 device_in_use = len(results['device_in_use'])
                 device_registering = len(results['device_registering'])
                 workers_started = results.get('workers_started', 0)
+                threads_created = results.get('threads_created', 0)
+                accounts_claimed = results.get('accounts_claimed', 0)
                 public_header_waiting = results.get('public_header_waiting', 0)
                 public_header_ready = results.get('public_header_ready', 0)
                 public_header_retries = results.get('public_header_retries', 0)
@@ -842,6 +845,9 @@ def main():
                 'device_registering': inventory_registering,
                 'device_in_use': device_in_use,
                 'workers_started': workers_started,
+                'threads_created': threads_created,
+                'accounts_claimed': accounts_claimed,
+                'business_inflight': max(0, accounts_claimed - done),
                 'public_header_waiting': public_header_waiting,
                 'public_header_ready': public_header_ready,
                 'public_header_retries': public_header_retries,
@@ -935,6 +941,8 @@ def main():
                 registering = int(device_inventory['registering'])
             pool = ip_pool.snapshot() if ip_pool is not None else {}
             workers_started = int(runtime['workers_started'])
+            threads_created = int(runtime['threads_created'])
+            accounts_claimed = int(runtime['accounts_claimed'])
             header_ready = int(runtime['public_header_ready'])
             header_waiting = int(runtime['public_header_waiting'])
             if workers_started:
@@ -950,6 +958,9 @@ def main():
                 device_loaded=loaded_devices, device_ready=ready,
                 device_target=active_workers, device_registering=registering,
                 workers_started=workers_started,
+                threads_created=threads_created,
+                accounts_claimed=accounts_claimed,
+                business_inflight=max(0, accounts_claimed),
                 public_header_waiting=header_waiting,
                 public_header_ready=header_ready,
                 public_header_retries=results.get('public_header_retries', 0),
@@ -1297,9 +1308,15 @@ def main():
                     continue
                 otp_ms = (time.perf_counter() - t_otp) * 1000
                 otp_cpu = (time.thread_time() - c0_otp) * 1000
+                was_retry = bool(retry_tasks)
                 task = retry_tasks.pop() if retry_tasks else take_task()
                 if task is None:
                     break
+                if not was_retry:
+                    with lock:
+                        results['accounts_claimed'] += 1
+                    with startup_runtime_lock:
+                        startup_runtime['accounts_claimed'] += 1
                 email, password = task
                 task_key = (email, password)
                 local_retry_count = local_retries.get(task_key, 0)
@@ -1655,7 +1672,13 @@ def main():
     startup_thread = threading.Thread(
         target=startup_heartbeat, name='startup-live', daemon=True)
     startup_thread.start()
+    worker_start_gate = threading.Event()
+
     def worker_guarded(tid):
+        # Start every OS thread first while it immediately blocks (and releases
+        # the GIL).  Only then release the process-local cohort together.  This
+        # prevents early network workers from starving creation of later ones.
+        worker_start_gate.wait()
         def release_session():
             with lock:
                 slot_lease = worker_leases.pop(tid, None)
@@ -1686,22 +1709,14 @@ def main():
     threads = [threading.Thread(target=worker_guarded, args=(i,), name=f'w{i}', daemon=True)
                for i in range(active_workers)]
     batches = startup_worker_batches(active_workers)
-    if batches:
-        first_batch = batches[0]
-        for index in first_batch:
+    for batch in batches:
+        for index in batch:
             threads[index].start()
-        if len(batches) > 1:
-            print(f'启动探路批 {len(first_batch)} 个工作线程；首个公共头就绪后快速扩容至 '
-                  f'{active_workers}（不限制最终并发）')
-            first_public_header.wait(
-                min(10.0, max(2.0, float(args.anisette_timeout))))
-            for batch in batches[1:]:
-                for index in batch:
-                    threads[index].start()
-                # Once one public header succeeds, reach full concurrency fast.
-                # A slow provider still gets a short stagger instead of the
-                # original synchronized cold-start storm.
-                stop.wait(0.05 if first_public_header.is_set() else 0.25)
+            with lock:
+                results['threads_created'] += 1
+            with startup_runtime_lock:
+                startup_runtime['threads_created'] += 1
+    worker_start_gate.set()
     for thread in threads:
         thread.join()
     stop.set()
