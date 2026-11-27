@@ -1717,8 +1717,25 @@ def main():
             with startup_runtime_lock:
                 startup_runtime['threads_created'] += 1
     worker_start_gate.set()
+    # Registration/header work that no longer owns an account must not keep a
+    # completed task alive.  Poll the cohort until all workers exit or every
+    # account has a result; then signal the remaining daemon threads and give
+    # them one short shared grace period instead of joining them indefinitely.
+    while any(thread.is_alive() for thread in threads):
+        with lock:
+            all_results_written = results['done'] >= len(rows)
+        if all_results_written:
+            stop.set()
+            with device_pool_cv:
+                device_pool_cv.notify_all()
+            break
+        stop.wait(0.05)
+    join_deadline = time.monotonic() + 2.0
     for thread in threads:
-        thread.join()
+        remaining = join_deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        thread.join(timeout=remaining)
     stop.set()
     first_result.set()
     first_public_header.set()

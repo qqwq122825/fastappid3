@@ -503,6 +503,16 @@ class ErrorReportingTest(unittest.TestCase):
     def test_worker_registers_missing_device_before_claiming_account(self):
         test_missing_device_is_registered_by_the_business_worker()
 
+    def test_completed_results_do_not_wait_forever_for_registration_tail(self):
+        source = (Path(__file__).resolve().parent.parent / 'simple.py').read_text(
+            encoding='utf-8')
+        launch = source[source.index('worker_start_gate.set()'):
+                        source.index('first_result.set()', source.index(
+                            'worker_start_gate.set()'))]
+        self.assertIn("results['done'] >= len(rows)", launch)
+        self.assertIn('join_deadline = time.monotonic() + 2.0', launch)
+        self.assertNotIn('for thread in threads:\n        thread.join()\n', launch)
+
     def test_ready_device_publication_wakes_consumer(self):
         test_business_worker_waits_until_producer_publishes_ready_device()
 

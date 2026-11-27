@@ -31,7 +31,7 @@ ACCOUNT_STATE = os.path.join(HERE, 'data', 'current-accounts.json')
 TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
-APP_VERSION = '2026.11.28.2'
+APP_VERSION = '2026.11.28.3'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
