@@ -1314,7 +1314,9 @@ display:flex;align-items:center;gap:12px;position:sticky;top:0;z-index:20}
 .top .right{margin-left:auto;display:flex;align-items:center;gap:14px;font-size:12px;color:var(--dim)}
 .dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:5px;vertical-align:middle}
 
-.layout{display:grid;grid-template-columns:330px 1fr;gap:16px;padding:16px 24px;align-items:start}
+.layout{display:grid;grid-template-columns:minmax(280px,330px) minmax(0,1fr);
+gap:16px;padding:16px 24px;align-items:start;width:100%;max-width:100vw}
+.layout>*{min-width:0}
 @media(max-width:1080px){.layout{grid-template-columns:1fr}}
 
 .panel{background:var(--card);border:1px solid var(--line);border-radius:10px}
@@ -1355,10 +1357,10 @@ justify-content:space-between;gap:10px}
 .chk{display:flex;align-items:center;gap:7px;font-size:13px;color:var(--fg)}
 .hint{font-size:11px;color:var(--dim);line-height:1.5;margin-top:5px}
 
-.stats{display:grid;grid-template-columns:repeat(11,1fr);gap:0;
+.stats{display:grid;grid-template-columns:repeat(11,minmax(0,1fr));gap:0;
 background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden}
-@media(max-width:1500px){.stats{grid-template-columns:repeat(6,1fr)}}
-@media(max-width:760px){.stats{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:1500px){.stats{grid-template-columns:repeat(6,minmax(0,1fr))}}
+@media(max-width:760px){.stats{grid-template-columns:repeat(2,minmax(0,1fr))}}
 .stat{padding:12px 14px;border-right:1px solid var(--line)}
 .stat:last-child{border-right:0}
 .stat .k{font-size:11px;color:var(--dim);margin-bottom:4px;white-space:nowrap}
@@ -1392,7 +1394,7 @@ font-feature-settings:"tnum" 1,"lnum" 1}
 .b-amber{background:#fef3c7;color:#92400e}
 .b-gray{background:#f3f4f6;color:#4b5563}
 .b-blue{background:#dbeafe;color:#1e40af}
-.scroll{max-height:520px;overflow:auto}
+.scroll{max-height:520px;max-width:100%;overflow:auto}
 .mono,.stat .v,.tbl td,.tbl th{font-family:inherit;
 font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1,"lnum" 1}
 #gate{position:fixed;inset:0;background:rgba(17,24,39,.55);z-index:99;display:none;

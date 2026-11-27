@@ -99,6 +99,12 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("anisette_timeout:+$('anito').value", web.PAGE)
         self.assertIn('startup.public_header_retries', web.PAGE)
 
+    def test_page_grid_cannot_expand_past_the_viewport(self):
+        import web
+        self.assertIn('minmax(280px,330px) minmax(0,1fr)', web.PAGE)
+        self.assertIn('.layout>*{min-width:0}', web.PAGE)
+        self.assertIn('.scroll{max-height:520px;max-width:100%;overflow:auto}', web.PAGE)
+
     def test_ip_pool_refill_scales_with_concurrency(self):
         large = IpPool('http://invalid/{num}', threads=1000)
         self.assertEqual(1000, large.refill_batch)

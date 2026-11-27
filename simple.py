@@ -699,10 +699,6 @@ def main():
     if SRP_MATH_BACKEND != 'gmpy2':
         print('  警告：gmpy2 未生效，SRP 单次约 9.8ms 而不是 2.2ms')
 
-    _rw = int(args.register_workers)
-    # Registration is a producer stage.  Business workers only lease ready
-    # devices and never reserve an unregistered slot themselves.
-    register_limit = _rw if _rw > 0 else max(1, args.threads)
     _aw = int(args.anisette_workers)
     anisette_limit = anisette_concurrency_limit(
         args.threads, _aw, proxied=args.anisette_proxy)
@@ -749,12 +745,8 @@ def main():
     task_queue_lock = threading.Lock()
     active_workers = min(max(0, len(rows)), max(1, args.threads))
     missing_devices = max(0, active_workers - loaded_devices)
-    standby_registrars = (0 if active_workers <= 0 else
-                          max(1, min(active_workers, max(8, active_workers // 10))))
-    registrar_count = (0 if args.no_register else min(
-        register_limit, max(missing_devices, standby_registrars)))
     print(f'账号进入共享待领队列 {len(rows)} 条；启动 {active_workers} 个工作线程；'
-          f'设备注册生产者 {registrar_count} 个')
+          f'缺设备线程自行注册 {0 if args.no_register else missing_devices} 台')
 
     def pending_task_count():
         with task_queue_lock:
@@ -973,112 +965,110 @@ def main():
                 pass
             first_result.wait(0.5)
 
-    def device_registrar(registrar_id):
-        """Produce registered devices and publish them to the ready pool.
+    def register_worker_device(tid):
+        """Let the business thread create and keep its own missing device.
 
-        A producer keeps ownership of one pending slot until that slot is
-        demonstrably ready.  A request timeout therefore cannot orphan a
-        completed device or make a business worker reserve another slot.
+        Persisted slots are already partitioned by run_mp.  When this process
+        has no idle assigned slot, the waiting business thread reserves the
+        next process-local slot, registers it with its own SOCKS5 route, marks
+        it ready, and keeps the lease until its task loop ends.  The account
+        queue is untouched until the registered public header is available.
         """
-        owner = -int(registrar_id) - 1
-        while not stop.is_set():
-            with device_pool_cv:
-                while (not stop.is_set()
-                       and device_inventory['ready']
-                           + device_inventory['registering'] >= active_workers):
-                    device_pool_cv.wait(0.5)
-                if stop.is_set():
-                    return
-                device_inventory['registering'] += 1
-
-            lease = device_pool.reserve_new_worker_slot()
-            slot = lease.slot
-            profile = device_profile(device_pool, slot) if not args.no_fix_os else None
-            with lock:
-                results['device_registering'].add(slot)
-            failures = 0
-            success = False
-            proxy = None
-            proxy_exp = 0.0
-            try:
-                while not stop.is_set():
-                    # A timed-out provider call may still have atomically
-                    # persisted a complete identity.  Publish that exact slot
-                    # instead of abandoning it and allocating another.
-                    if device_pool.inspect(slot).get('state') == 'ready':
-                        device_pool.mark_worker_slot_ready(slot)
-                        success = True
-                        break
-                    if args.anisette_proxy:
-                        if ip_pool is not None:
-                            proxy, proxy_exp = ip_pool.acquire(
-                                owner, wait=max(1.0, float(args.register_timeout)))
-                        elif proxy is None:
-                            proxy = (fetch_one_ip(args.api) if args.no_precheck
-                                     else fetch_usable_ip(args.api, args.precheck_timeout))
-                            proxy_exp = (time.monotonic() + args.ip_ttl
-                                         if proxy else 0.0)
-                        if not proxy:
-                            with lock:
-                                results['register_errors'] += 1
-                                kinds = results['register_error_types']
-                                kinds['no_proxy'] = kinds.get('no_proxy', 0) + 1
-                            failures += 1
-                            stop.wait(min(8.0, 0.25 * (2 ** min(failures, 5))))
-                            continue
-                    try:
-                        info = _shared_device_info(
-                            device_pool, profile, info_cache, info_gate,
-                            max(1.0, float(args.register_timeout)), proxy=proxy,
-                            provider_direct=proxy is None)
-                        device_pool.fetch_headers(
-                            slot, info, max(1.0, float(args.register_timeout)),
-                            registered=False, proxy=proxy,
-                            provider_direct=proxy is None)
-                        device_pool.mark_worker_slot_ready(slot)
-                        if ip_pool is not None and proxy:
-                            ip_pool.release(owner, proxy, proxy_exp, healthy=True)
-                        proxy = None
-                        success = True
-                        break
-                    except Exception as exc:                       # noqa: BLE001
-                        if ip_pool is not None and proxy:
-                            ip_pool.release(owner, proxy, proxy_exp, healthy=False)
-                        proxy = None
-                        stage = str(getattr(exc, 'stage', '') or type(exc).__name__)
-                        http = int(getattr(exc, 'http', 0) or 0)
-                        reason = f'{stage}:HTTP{http}' if http else stage
+        if args.no_register or stop.is_set() or pending_task_count() <= 0:
+            return None
+        owner = int(tid)
+        with device_pool_cv:
+            device_inventory['registering'] += 1
+        lease = device_pool.reserve_new_worker_slot()
+        slot = lease.slot
+        profile = device_profile(device_pool, slot) if not args.no_fix_os else None
+        with lock:
+            results['device_registering'].add(slot)
+        failures = 0
+        success = False
+        proxy = None
+        proxy_exp = 0.0
+        try:
+            while not stop.is_set() and pending_task_count() > 0:
+                # A timed-out provider call may still have atomically persisted
+                # a complete identity, so always inspect the same reserved slot.
+                if device_pool.inspect(slot).get('state') == 'ready':
+                    device_pool.mark_worker_slot_ready(slot)
+                    success = True
+                    break
+                if args.anisette_proxy:
+                    if ip_pool is not None:
+                        proxy, proxy_exp = ip_pool.acquire(
+                            owner, wait=max(1.0, float(args.register_timeout)))
+                    elif proxy is None:
+                        proxy = (fetch_one_ip(args.api) if args.no_precheck
+                                 else fetch_usable_ip(args.api, args.precheck_timeout))
+                        proxy_exp = (time.monotonic() + args.ip_ttl
+                                     if proxy else 0.0)
+                    if not proxy:
                         with lock:
                             results['register_errors'] += 1
                             kinds = results['register_error_types']
-                            kinds[reason] = kinds.get(reason, 0) + 1
+                            kinds['no_proxy'] = kinds.get('no_proxy', 0) + 1
                         failures += 1
-                        stop.wait(min(8.0, 0.25 * (2 ** min(failures, 5)))
-                                  + random.uniform(0.0, 0.25))
-            finally:
-                if ip_pool is not None and proxy:
-                    ip_pool.release(owner, proxy, proxy_exp, healthy=False)
-                with lock:
-                    results['device_registering'].discard(slot)
-                    if success:
-                        results['device_ready'].add(slot)
-                lease.close()  # ready devices become idle and leasable here
-                with device_pool_cv:
-                    device_inventory['registering'] -= 1
-                    if success:
-                        device_inventory['ready'] += 1
-                    device_pool_cv.notify_all()
+                        stop.wait(min(8.0, 0.25 * (2 ** min(failures, 5))))
+                        continue
+                try:
+                    info = _shared_device_info(
+                        device_pool, profile, info_cache, info_gate,
+                        max(1.0, float(args.register_timeout)), proxy=proxy,
+                        provider_direct=proxy is None)
+                    device_pool.fetch_headers(
+                        slot, info, max(1.0, float(args.register_timeout)),
+                        registered=False, proxy=proxy,
+                        provider_direct=proxy is None)
+                    device_pool.mark_worker_slot_ready(slot)
+                    if ip_pool is not None and proxy:
+                        ip_pool.release(owner, proxy, proxy_exp, healthy=True)
+                    proxy = None
+                    success = True
+                    break
+                except Exception as exc:                       # noqa: BLE001
+                    if ip_pool is not None and proxy:
+                        ip_pool.release(owner, proxy, proxy_exp, healthy=False)
+                    proxy = None
+                    stage = str(getattr(exc, 'stage', '') or type(exc).__name__)
+                    http = int(getattr(exc, 'http', 0) or 0)
+                    reason = f'{stage}:HTTP{http}' if http else stage
+                    with lock:
+                        results['register_errors'] += 1
+                        kinds = results['register_error_types']
+                        kinds[reason] = kinds.get(reason, 0) + 1
+                    failures += 1
+                    stop.wait(min(8.0, 0.25 * (2 ** min(failures, 5)))
+                              + random.uniform(0.0, 0.25))
+        finally:
+            if ip_pool is not None and proxy:
+                ip_pool.release(owner, proxy, proxy_exp, healthy=False)
+            with lock:
+                results['device_registering'].discard(slot)
+                if success:
+                    results['device_ready'].add(slot)
+            with device_pool_cv:
+                device_inventory['registering'] -= 1
+                if success:
+                    device_inventory['ready'] += 1
+                device_pool_cv.notify_all()
+        if success:
+            return lease
+        lease.close()
+        return None
 
     def worker(tid):
         if pending_task_count() <= 0:
             return
-        preferred_slot = args.slot_base + tid + 1
-        # ---- 1) 设备：业务线程只消费生产者发布的 ready 设备 ----
+        # ---- 1) 设备：先拿本进程已分配设备，拿不到就由本线程注册 ----
         boot = {}
         _b0 = time.thread_time()
         pool = device_pool
-        slot_lease = wait_for_ready_device(
-            pool, device_pool_cv, stop, pending_task_count)
+        slot_lease = pool.acquire_ready_worker_slot()
+        if slot_lease is None:
+            slot_lease = register_worker_device(tid)
         if slot_lease is None:
             return
         slot = slot_lease.slot
@@ -1693,12 +1683,6 @@ def main():
             if outcome != 'rotate':
                 break
 
-    registrar_threads = [
-        threading.Thread(target=device_registrar, args=(i,),
-                         name=f'device-registrar-{i}', daemon=True)
-        for i in range(registrar_count)]
-    for thread in registrar_threads:
-        thread.start()
     threads = [threading.Thread(target=worker_guarded, args=(i,), name=f'w{i}', daemon=True)
                for i in range(active_workers)]
     batches = startup_worker_batches(active_workers)
@@ -1725,8 +1709,6 @@ def main():
     first_public_header.set()
     with device_pool_cv:
         device_pool_cv.notify_all()
-    for thread in registrar_threads:
-        thread.join(timeout=3)
     wall = time.perf_counter() - started
     with lock:
         if write_buffer:

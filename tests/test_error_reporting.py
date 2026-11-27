@@ -388,11 +388,11 @@ def test_public_header_cache_is_bound_to_device_usage_and_ttl():
     assert cache.take(7, 3) is None                  # expired
 
 
-def test_device_registration_is_a_producer_consumer_stage():
+def test_missing_device_is_registered_by_the_business_worker():
     import inspect
     import simple
     source = inspect.getsource(simple.main)
-    producer = source[source.index('    def device_registrar'):source.index('    def worker(tid):')]
+    producer = source[source.index('    def register_worker_device'):source.index('    def worker(tid):')]
     worker = source[source.index('    def worker(tid):'):source.index("    results['started'] = started")]
     header = source.index('identity = device_headers.take')
     claim = source.index('task = retry_tasks.pop() if retry_tasks else take_task()')
@@ -401,9 +401,10 @@ def test_device_registration_is_a_producer_consumer_stage():
     assert 'reserve_new_worker_slot()' in producer
     assert 'registered=False' in producer
     assert 'mark_worker_slot_ready(slot)' in producer
-    assert 'wait_for_ready_device(' in worker
-    assert 'reserve_new_worker_slot()' not in worker
-    assert 'registered=False' not in worker
+    assert 'slot_lease = pool.acquire_ready_worker_slot()' in worker
+    assert 'slot_lease = register_worker_device(tid)' in worker
+    assert 'device-registrar-' not in source
+    assert worker.index('register_worker_device(tid)') < worker.index('identity = fetch_otp()')
 
 
 def test_business_worker_waits_until_producer_publishes_ready_device(tmp_path=None):
@@ -499,8 +500,8 @@ class ErrorReportingTest(unittest.TestCase):
     def test_process_device_header_cache(self):
         test_public_header_cache_is_bound_to_device_usage_and_ttl()
 
-    def test_device_setup_waits_before_claiming_account(self):
-        test_device_registration_is_a_producer_consumer_stage()
+    def test_worker_registers_missing_device_before_claiming_account(self):
+        test_missing_device_is_registered_by_the_business_worker()
 
     def test_ready_device_publication_wakes_consumer(self):
         test_business_worker_waits_until_producer_publishes_ready_device()
