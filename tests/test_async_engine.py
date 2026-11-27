@@ -11,8 +11,8 @@ from fastcheck.protocols import gsa_async
 from fastcheck.status import result_bucket
 from gsafast.ippool import IpPool
 from simple_async import _attempt_slice
-from simple import (anisette_concurrency_limit, _new_state_lock, _proxy_host,
-                    _shared_device_info)
+from simple import (anisette_concurrency_limit, startup_worker_batches,
+                    _new_state_lock, _proxy_host, _shared_device_info)
 
 
 class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
@@ -69,12 +69,18 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((None, 0.0), pool.acquire_nowait(0))
         self.assertEqual(before, pool.stats['blocked'])
 
-    def test_proxied_public_header_startup_wave_is_bounded(self):
-        self.assertEqual(128, anisette_concurrency_limit(1000, proxied=True))
+    def test_public_header_concurrency_is_not_implicitly_capped(self):
+        self.assertEqual(1000, anisette_concurrency_limit(1000, proxied=True))
         self.assertEqual(1000, anisette_concurrency_limit(1000, proxied=False))
         self.assertEqual(64, anisette_concurrency_limit(
             1000, configured=64, proxied=True))
         self.assertEqual(80, anisette_concurrency_limit(80, proxied=True))
+
+    def test_worker_ramp_reaches_full_concurrency_without_dropping_threads(self):
+        batches = startup_worker_batches(1000, 128)
+        self.assertEqual(128, len(batches[0]))
+        self.assertEqual(104, len(batches[-1]))
+        self.assertEqual(list(range(1000)), [i for batch in batches for i in batch])
 
     def test_ip_pool_refill_scales_with_concurrency(self):
         large = IpPool('http://invalid/{num}', threads=1000)

@@ -1431,7 +1431,7 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
       <div class="field">
         <label>并发</label>
         <div class="row2">
-          <div><input type="number" id="processes" value="2" min="1" max="8" placeholder="进程数">
+          <div><input type="number" id="processes" value="4" min="1" max="8" placeholder="进程数">
             <div class="hint">进程数</div></div>
           <div><input type="number" id="threads" value="1000" min="1" max="2000" placeholder="线程/进程">
             <div class="hint">每进程线程</div></div>

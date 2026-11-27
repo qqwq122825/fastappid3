@@ -56,12 +56,20 @@ def ensure_open_file_limit(threads, resource_module=None):
 
 
 def anisette_concurrency_limit(threads, configured=0, proxied=False):
-    """Bound the proxy-tunnel startup wave while preserving explicit tuning."""
+    """Keep full concurrency unless the operator explicitly sets a limit."""
     threads = max(1, int(threads))
     configured = int(configured or 0)
     if configured > 0:
         return min(threads, configured)
-    return min(threads, 128) if proxied else threads
+    return threads
+
+
+def startup_worker_batches(total, batch_size=128):
+    """Return worker-index batches for a fast first-result ramp."""
+    total = max(0, int(total))
+    batch_size = max(1, int(batch_size))
+    return [range(start, min(total, start + batch_size))
+            for start in range(0, total, batch_size)]
 
 
 def anisette_retry_delay(previous, jitter=None):
@@ -1672,8 +1680,21 @@ def main():
         thread.start()
     threads = [threading.Thread(target=worker_guarded, args=(i,), name=f'w{i}', daemon=True)
                for i in range(active_workers)]
-    for thread in threads:
-        thread.start()
+    batches = startup_worker_batches(active_workers, 128)
+    if batches:
+        first_batch = batches[0]
+        for index in first_batch:
+            threads[index].start()
+        if len(batches) > 1:
+            print(f'启动首批 {len(first_batch)} 个工作线程；首条结果后快速扩容至 '
+                  f'{active_workers}（不限制最终并发）')
+            first_result.wait(min(30.0, max(5.0, float(args.item_timeout))))
+            for batch in batches[1:]:
+                for index in batch:
+                    threads[index].start()
+                # Give the first completed requests a scheduling window while
+                # still reaching full concurrency within about one second.
+                stop.wait(0.05 if first_result.is_set() else 0.25)
     for thread in threads:
         thread.join()
     stop.set()
