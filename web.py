@@ -31,7 +31,7 @@ ACCOUNT_STATE = os.path.join(HERE, 'data', 'current-accounts.json')
 TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
-APP_VERSION = '2026.11.28.3'
+APP_VERSION = '2026.11.28.4'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -466,8 +466,7 @@ def _process_cpu_now(pid, pgid=None):
 
 
 _LIVE_CACHE = {'at': 0.0, 'data': None}
-_RESULT_PROGRESS = {'key': None, 'offset': 0, 'done': 0, 'tail': b'',
-                    'by_status': {}, 'recent': collections.deque(maxlen=12)}
+_RESULT_PROGRESS = {}
 _RESULT_PROGRESS_LOCK = threading.Lock()
 
 
@@ -485,16 +484,17 @@ def _result_progress(path):
         key = (os.path.realpath(path), stat.st_dev, stat.st_ino)
     except OSError:
         return {'done': 0, 'by_status': {}, 'recent': []}
+    cache_key = os.path.realpath(path)
     with _RESULT_PROGRESS_LOCK:
-        if (_RESULT_PROGRESS['key'] != key
-                or stat.st_size < _RESULT_PROGRESS['offset']):
-            _RESULT_PROGRESS.update(key=key, offset=0, done=0, tail=b'',
-                                    by_status={},
-                                    recent=collections.deque(maxlen=12))
+        state = _RESULT_PROGRESS.get(cache_key)
+        if state is None or state['key'] != key or stat.st_size < state['offset']:
+            state = {'key': key, 'offset': 0, 'done': 0, 'tail': b'',
+                     'by_status': {}, 'recent': collections.deque(maxlen=12)}
+            _RESULT_PROGRESS[cache_key] = state
         try:
             with open(path, 'rb') as handle:
-                handle.seek(_RESULT_PROGRESS['offset'])
-                data = _RESULT_PROGRESS['tail']
+                handle.seek(state['offset'])
+                data = state['tail']
                 while True:
                     chunk = handle.read(1024 * 1024)
                     if not chunk:
@@ -511,18 +511,31 @@ def _result_progress(path):
                             continue
                         if not isinstance(row, dict):
                             continue
-                        _RESULT_PROGRESS['done'] += 1
+                        state['done'] += 1
                         status = str(row.get('status') or 'unknown')
-                        by_status = _RESULT_PROGRESS['by_status']
+                        by_status = state['by_status']
                         by_status[status] = by_status.get(status, 0) + 1
-                        _RESULT_PROGRESS['recent'].append(row)
-                _RESULT_PROGRESS['offset'] = handle.tell()
-                _RESULT_PROGRESS['tail'] = data
+                        state['recent'].append(row)
+                state['offset'] = handle.tell()
+                state['tail'] = data
         except OSError:
             pass
-        return {'done': _RESULT_PROGRESS['done'],
-                'by_status': dict(_RESULT_PROGRESS['by_status']),
-                'recent': list(_RESULT_PROGRESS['recent'])}
+        return {'done': state['done'],
+                'by_status': dict(state['by_status']),
+                'recent': list(state['recent'])}
+
+
+def _multiprocess_result_progress(processes, data_dir=None):
+    """Incrementally merge current mp-p*.jsonl files for a live fallback."""
+    directory = data_dir or os.path.join(HERE, 'data')
+    done, by_status, recent = 0, {}, []
+    for index in range(max(1, int(processes or 1))):
+        child = _result_progress(os.path.join(directory, f'mp-p{index}.jsonl'))
+        done += int(child['done'])
+        for key, value in child['by_status'].items():
+            by_status[key] = by_status.get(key, 0) + int(value)
+        recent.extend(child['recent'][-4:])
+    return {'done': done, 'by_status': by_status, 'recent': recent[-12:]}
 
 
 def _expected_total(record):
@@ -604,8 +617,12 @@ def _live_state_uncached():
         stale = time.time() - os.path.getmtime(LIVE) > 3.0
     except OSError:
         stale = True
-    progress = (_result_progress(record.get('run_out') or STATE.get('run_out'))
-                if running else None)
+    processes = int((record or {}).get('processes') or STATE.get('processes') or 1)
+    if running and processes > 1:
+        progress = _multiprocess_result_progress(processes)
+    else:
+        progress = (_result_progress(record.get('run_out') or STATE.get('run_out'))
+                    if running else None)
     if running and stale:
         live_done = int(live.get('done') or 0)
         done = max(live_done, int(progress['done']))
@@ -638,11 +655,20 @@ def _live_state_uncached():
     # already persisted in the current result file.  A starved live writer can
     # resume with an older snapshot after the fallback has advanced farther.
     if running and int(progress['done']) > int(live.get('done') or 0):
-        live['done'] = int(progress['done'])
+        done = int(progress['done'])
+        started_at = float(record.get('started_at') or STATE.get('started_at')
+                           or time.time())
+        elapsed = max(float(live.get('elapsed') or 0),
+                      time.time() - started_at, 0.001)
+        rate = done / elapsed
+        live.update(done=done, elapsed=round(elapsed, 1),
+                    rate=round(rate, 2), per_hour=round(rate * 3600),
+                    eta=round(max(0, _expected_total(record) - done) / rate, 0),
+                    live_fallback=True)
         live['by_status'] = progress['by_status']
         live['recent'] = progress['recent']
         live['total'] = max(int(live.get('total') or 0),
-                            _expected_total(record), int(progress['done']))
+                            _expected_total(record), done)
     live = _multiprocess_ip_pool(live)
     live['running'] = running
     live['pid'] = int(record['pid']) if running else None
@@ -808,6 +834,8 @@ def _reset_run_artifacts(processes):
         except OSError:
             pass
     _LIVE_CACHE.update(at=0.0, data=None)
+    with _RESULT_PROGRESS_LOCK:
+        _RESULT_PROGRESS.clear()
 
 
 def clear_devices():

@@ -828,13 +828,13 @@ def main():
                     cached['p90'] = histogram_value_at(
                         latency_hist, int(count * .9)) if count else None
                     cached['done'] = done
-            # “已注册”是磁盘上持久化且完成注册的设备总数，不是
-            # 本轮已完成初始化的工作线程数。
-            device_registered = count_registered_devices(
-                args.device_root, 'https://new.ani.sidestore.io')
             with device_pool_cv:
                 inventory_ready = int(device_inventory['ready'])
                 inventory_registering = int(device_inventory['registering'])
+            # 高频实时帧只能使用本进程内存计数。旧实现让四个子进程每秒
+            # 各自遍历整个持久设备池并读取数千个 JSON，结果业务继续写入
+            # 而 live writer 卡在磁盘扫描，页面长期显示 0。
+            device_registered = inventory_ready
             pool_snapshot = ip_pool.snapshot() if ip_pool is not None else None
             startup_snapshot = dict(startup_state)
             startup_snapshot.update({
@@ -905,6 +905,7 @@ def main():
                 'otp_fetch': results.get('otp_fetch', 0),
                 'device_ready': device_registered,  # 兼容旧页面/旧汇总器
                 'device_registered': device_registered,
+                'device_registered_scope': 'process',
                 'device_in_use': device_in_use,
                 'device_registering': device_registering,
                 'device_retired': results.get('device_retired', 0),

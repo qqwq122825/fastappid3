@@ -216,11 +216,14 @@ def merge(jobs, started, expected_total=0, wall_started=None):
         budget_hit += payload.get('budget_hit') or 0
         for key, value in (payload.get('by_retry') or {}).items():
             by_retry[key] = by_retry.get(key, 0) + value
-        # 每个子进程看到的都是同一个全局持久化设备池，取最大值
-        # 即可；求和会在 2 进程时把“已注册”重复计数两次。
-        device_ready = max(device_ready,
-                           payload.get('device_registered',
-                                       payload.get('device_ready') or 0) or 0)
+        child_device_ready = payload.get(
+            'device_registered', payload.get('device_ready') or 0) or 0
+        if payload.get('device_registered_scope') == 'process':
+            # 新版子进程只报告自己的不相交设备分区，汇总时应求和。
+            device_ready += child_device_ready
+        else:
+            # 兼容旧版：每个子进程都扫描并报告同一个全局总数。
+            device_ready = max(device_ready, child_device_ready)
         device_in_use += payload.get('device_in_use') or 0
         device_registering += payload.get('device_registering') or 0
         register_errors += payload.get('register_errors') or 0

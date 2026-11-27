@@ -253,6 +253,14 @@ def test_registered_devices_are_persisted_total_not_live_workers(tmp_path=None):
     assert result["device_registered"] == 2  # 全局总数不随进程数翻倍
     assert result["device_in_use"] == 2      # 使用中则是各进程之和
 
+    for index, job in enumerate(jobs):
+        Path(job['live']).write_text(json.dumps({
+            'finished': False, 'done': 1, 'device_registered': index + 2,
+            'device_registered_scope': 'process',
+        }), encoding='utf-8')
+    result = merge(jobs, time.monotonic() - 1, expected_total=2)
+    assert result['device_registered'] == 5  # 新版分区口径必须求和
+
 
 def test_memory_device_store_loads_once_and_writes_through(tmp_path=None):
     if tmp_path is None:
@@ -512,6 +520,14 @@ class ErrorReportingTest(unittest.TestCase):
         self.assertIn("results['done'] >= len(rows)", launch)
         self.assertIn('join_deadline = time.monotonic() + 2.0', launch)
         self.assertNotIn('for thread in threads:\n        thread.join()\n', launch)
+
+    def test_live_writer_uses_process_local_device_inventory(self):
+        source = (Path(__file__).resolve().parent.parent / 'simple.py').read_text(
+            encoding='utf-8')
+        writer = source[source.index('def live_writer():'):
+                        source.index('def startup_heartbeat():')]
+        self.assertIn("'device_registered_scope': 'process'", writer)
+        self.assertNotIn('count_registered_devices(', writer)
 
     def test_ready_device_publication_wakes_consumer(self):
         test_business_worker_waits_until_producer_publishes_ready_device()

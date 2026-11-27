@@ -405,6 +405,44 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(result['running'])
             self.assertEqual(123, result['pid'])
 
+    def test_multiprocess_result_files_recover_fresh_but_frozen_live_state(self):
+        from pathlib import Path
+        from unittest.mock import patch
+        import web
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = root / 'data'
+            data.mkdir()
+            live_file = root / 'live.json'
+            accounts = root / 'accounts.txt'
+            accounts.write_text(''.join(
+                f'user{i}@example.invalid----fixture\n' for i in range(5)))
+            live_file.write_text(json.dumps({'done': 0, 'elapsed': 1,
+                                             'total': 5, 'processes': 2}))
+            (data / 'mp-p0.jsonl').write_text(''.join(json.dumps({
+                'email': f'a{i}@example.invalid', 'status': 'wrong_password'}) + '\n'
+                for i in range(2)))
+            (data / 'mp-p1.jsonl').write_text(''.join(json.dumps({
+                'email': f'b{i}@example.invalid', 'status': 'locked'}) + '\n'
+                for i in range(3)))
+            record = {'pid': 123, 'pgid': 123, 'started_at': 1,
+                      'threads': 2, 'processes': 2, 'total': 5,
+                      'accounts': str(accounts), 'run_out': str(root / 'unused.jsonl')}
+            state = dict(web.STATE, accounts=str(accounts), total=5, processes=2)
+            with patch.object(web, 'HERE', directory), \
+                 patch.object(web, 'LIVE', str(live_file)), \
+                 patch.object(web, 'STATE', state), \
+                 patch.object(web, '_active_task_record', return_value=record), \
+                 patch.object(web, '_process_cpu_now', return_value=None), \
+                 patch.object(web.time, 'time', return_value=11):
+                web._RESULT_PROGRESS.clear()
+                result = web._live_state_uncached()
+            self.assertEqual(5, result['done'])
+            self.assertEqual({'wrong_password': 2, 'locked': 3},
+                             result['by_status'])
+            self.assertTrue(result['live_fallback'])
+            self.assertEqual(1800, result['per_hour'])
+
     def test_browser_live_endpoint_uses_resilient_state(self):
         from unittest.mock import patch
         import web
@@ -441,7 +479,7 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
                 result = web._live_state_uncached()
             self.assertEqual(3, result['done'])
             self.assertEqual({'wrong_password': 3}, result['by_status'])
-            self.assertFalse(result.get('live_fallback', False))
+            self.assertTrue(result['live_fallback'])
 
     def test_result_table_formats_duration_as_seconds(self):
         import web
@@ -475,7 +513,7 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('startup.public_header_waiting', web.PAGE)
         self.assertIn('startup.threads_created', web.PAGE)
         self.assertIn('startup.business_inflight', web.PAGE)
-        self.assertIn('id="versionTag">v2026.11.28.3', web.PAGE)
+        self.assertIn('id="versionTag">v2026.11.28.4', web.PAGE)
 
     def test_start_publishes_device_scan_before_worker_spawn(self):
         from pathlib import Path
