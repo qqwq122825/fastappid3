@@ -31,7 +31,7 @@ ACCOUNT_STATE = os.path.join(HERE, 'data', 'current-accounts.json')
 TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
-APP_VERSION = '2026.11.28.4'
+APP_VERSION = '2026.11.28.5'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -669,6 +669,22 @@ def _live_state_uncached():
         live['recent'] = progress['recent']
         live['total'] = max(int(live.get('total') or 0),
                             _expected_total(record), done)
+    if not running and int(live.get('processes') or 1) > 1:
+        # run_mp 或子进程若被外部终止，最后一张 live.json 可能仍是 0，
+        # 但四个结果文件已经持久化了数万条。空闲页也应恢复这些已确认结果，
+        # 而不是把真实进度重新显示成 0。
+        archived = _multiprocess_result_progress(int(live.get('processes') or 1))
+        if int(archived['done']) > int(live.get('done') or 0):
+            done = int(archived['done'])
+            total = max(int(live.get('total') or 0), done)
+            elapsed = max(float(live.get('elapsed') or 0), 0.001)
+            rate = done / elapsed
+            live.update(done=done, total=total,
+                        by_status=archived['by_status'], recent=archived['recent'],
+                        rate=round(rate, 2), per_hour=round(rate * 3600),
+                        incomplete=max(0, total - done), finished=True,
+                        status='complete' if done >= total else 'incomplete',
+                        live_fallback=True)
     live = _multiprocess_ip_pool(live)
     live['running'] = running
     live['pid'] = int(record['pid']) if running else None

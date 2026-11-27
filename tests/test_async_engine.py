@@ -443,6 +443,33 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(result['live_fallback'])
             self.assertEqual(1800, result['per_hour'])
 
+    def test_finished_multiprocess_page_recovers_persisted_partial_results(self):
+        from pathlib import Path
+        from unittest.mock import patch
+        import web
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = root / 'data'
+            data.mkdir()
+            live_file = root / 'live.json'
+            live_file.write_text(json.dumps({
+                'done': 0, 'elapsed': 10, 'total': 10, 'processes': 2,
+                'finished': False}))
+            (data / 'mp-p0.jsonl').write_text(
+                json.dumps({'status': 'wrong_password'}) + '\n')
+            (data / 'mp-p1.jsonl').write_text(''.join(
+                json.dumps({'status': 'locked'}) + '\n' for _ in range(2)))
+            with patch.object(web, 'HERE', directory), \
+                 patch.object(web, 'LIVE', str(live_file)), \
+                 patch.object(web, '_active_task_record', return_value=None):
+                web._RESULT_PROGRESS.clear()
+                result = web._live_state_uncached()
+            self.assertEqual(3, result['done'])
+            self.assertEqual(7, result['incomplete'])
+            self.assertEqual('incomplete', result['status'])
+            self.assertTrue(result['finished'])
+            self.assertTrue(result['live_fallback'])
+
     def test_browser_live_endpoint_uses_resilient_state(self):
         from unittest.mock import patch
         import web
@@ -513,7 +540,7 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('startup.public_header_waiting', web.PAGE)
         self.assertIn('startup.threads_created', web.PAGE)
         self.assertIn('startup.business_inflight', web.PAGE)
-        self.assertIn('id="versionTag">v2026.11.28.4', web.PAGE)
+        self.assertIn('id="versionTag">v2026.11.28.5', web.PAGE)
 
     def test_start_publishes_device_scan_before_worker_spawn(self):
         from pathlib import Path
