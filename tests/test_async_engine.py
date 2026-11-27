@@ -77,6 +77,22 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(200, small.refill_batch)
         self.assertEqual(50, small.low_water)
 
+    def test_ip_pool_warm_reports_live_progress(self):
+        pool = IpPool('http://invalid/{num}', threads=2, initial_max=4,
+                      batch=2)
+        calls = []
+        next_port = iter((9001, 9002, 9003, 9004))
+        pool._fetch = lambda count: [
+            f'socks5h://127.0.0.1:{next(next_port)}'
+            for _ in range(count)
+        ]
+        warmed = pool.warm(extra=1, progress=calls.append)
+        self.assertEqual(4, warmed)
+        self.assertEqual('start', calls[0]['stage'])
+        self.assertEqual('complete', calls[-1]['stage'])
+        self.assertEqual([0, 2, 4, 4], [row['fetched'] for row in calls])
+        self.assertTrue(all(row['target'] == 4 for row in calls))
+
     def test_supplier_wakeup_does_not_bypass_refill_interval(self):
         pool = IpPool('http://invalid/{num}', threads=1,
                       refill_interval=.5)
@@ -394,6 +410,50 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(2, web.PAGE.count(
             "const seconds = r.ms == null ? '--' : (Number(r.ms) / 1000).toFixed(2);"))
         self.assertEqual(2, web.PAGE.count('${seconds}</td>'))
+
+    def test_startup_progress_is_visible_before_first_result(self):
+        import web
+        for marker in ('id="startupPanel"', 'id="mStartupPhase"',
+                       'id="mStartupProxy"', 'id="mStartupDevices"',
+                       'id="mStartupProcesses"'):
+            self.assertIn(marker, web.PAGE)
+        self.assertIn("device_scan:'扫描设备'", web.PAGE)
+        self.assertIn("proxy_fetch:'拉取代理'", web.PAGE)
+        self.assertIn("device_register:'注册设备'", web.PAGE)
+        self.assertIn('startup.proxy_fetched', web.PAGE)
+        self.assertIn('startup.device_loaded', web.PAGE)
+
+    def test_start_publishes_device_scan_before_worker_spawn(self):
+        from pathlib import Path
+        from unittest.mock import Mock, patch
+        import web
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            accounts = root / 'accounts.txt'
+            accounts.write_text('user@example.invalid----password\n', encoding='utf-8')
+            live = root / 'live.json'
+            device_root = root / 'devices-simple'
+            device_key = __import__('hashlib').sha256(
+                web.DEVICE_ORIGIN.encode()).hexdigest()[:24]
+            (device_root / device_key / 'devices' / '1').mkdir(parents=True)
+            proc = Mock(pid=os.getpid())
+            state = dict(web.STATE, log=str(root / 'run.log'), proc=None)
+            with patch.object(web, 'STATE', state), \
+                 patch.object(web, 'LIVE', str(live)), \
+                 patch.object(web, 'DEVICE_ROOT', str(device_root)), \
+                 patch.object(web, 'PYTHON', '/fake/python'), \
+                 patch.object(web, 'proxy_api', return_value='http://proxy/{num}'), \
+                 patch.object(web, '_write_task_record'), \
+                 patch.object(web, 'is_running', return_value=False), \
+                 patch.object(web.subprocess, 'Popen', return_value=proc) as popen:
+                result = web.start_job(str(accounts), 10, 0, processes=2)
+                first = json.loads(live.read_text(encoding='utf-8'))
+            self.assertTrue(result['ok'])
+            self.assertEqual('device_scan', first['startup']['phase'])
+            self.assertEqual(1, first['startup']['device_discovered'])
+            self.assertEqual(2, first['startup']['process_total'])
+            self.assertEqual(0, first['startup']['proxy_fetched'])
+            popen.assert_called_once()
 
     def test_result_search_control_queries_backend(self):
         import web

@@ -649,6 +649,37 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
     run_out = os.path.join(HERE, 'data', f'run-{int(time.time())}.jsonl')
     STATE['run_out'] = run_out
     STATE['started_at'] = time.time()
+    # Publish a synchronous first frame before spawning Python workers.  The
+    # browser polls immediately after the Start response, so it must never sit
+    # on an empty/stale live.json while imports, account slicing or process
+    # creation are still happening.
+    device_key = hashlib.sha256(DEVICE_ORIGIN.encode()).hexdigest()[:24]
+    device_dir = os.path.join(DEVICE_ROOT, device_key, 'devices')
+    try:
+        discovered_devices = sum(1 for item in os.scandir(device_dir)
+                                 if item.is_dir())
+    except OSError:
+        discovered_devices = 0
+    initial_live = {
+        'started': time.strftime('%H:%M:%S'), 'elapsed': 0,
+        'total': total, 'done': 0, 'rate': 0, 'per_hour': 0,
+        'threads': threads, 'processes': processes,
+        'by_status': {}, 'recent': [], 'finished': False,
+        'startup': {
+            'phase': 'device_scan', 'message': '已接收任务，正在读取设备池',
+            'process_ready': 0, 'process_total': processes,
+            'device_discovered': discovered_devices,
+            'device_loaded': 0, 'device_ready': 0,
+            'device_target': min(total, threads * processes),
+            'device_registering': 0,
+            'proxy_target': 0, 'proxy_fetched': 0,
+            'proxy_available': 0, 'proxy_api_calls': 0,
+        },
+    }
+    live_tmp = LIVE + '.tmp'
+    with open(live_tmp, 'w', encoding='utf-8') as handle:
+        json.dump(initial_live, handle, ensure_ascii=False)
+    os.replace(live_tmp, LIVE)
     if processes > 1:
         # 多进程分配账号与设备槽位；每个子进程内使用简单线程。
         cmd = [PYTHON, os.path.join(HERE, 'run_mp.py'),
@@ -1339,6 +1370,10 @@ font-feature-settings:"tnum" 1,"lnum" 1}
 .prog .bar>i{display:block;height:100%;width:0;background:var(--blue);transition:width .4s}
 .prog .meta{display:flex;justify-content:space-between;font-size:12px;color:var(--dim);
 margin-top:7px;font-family:inherit;font-variant-numeric:tabular-nums}
+.startup{display:none;margin-bottom:12px;padding:10px 12px;border:1px solid #bfdbfe;
+background:#eff6ff;border-radius:8px;color:#1e3a8a;font-size:12px;line-height:1.7}
+.startup.show{display:block}.startup b{font-size:13px}.startup .items{display:flex;
+gap:18px;flex-wrap:wrap;color:#475569;margin-top:3px}
 
 .tbl{width:100%;border-collapse:collapse;font-size:12.5px}
 .tbl th{text-align:left;padding:9px 12px;color:var(--dim);font-weight:500;
@@ -1462,6 +1497,14 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
     <div class="panel" style="margin-bottom:16px">
       <div class="hd"><b>进度与结果</b><span class="hint" id="modeHint">本地执行</span></div>
       <div class="bd" style="padding-bottom:0">
+        <div class="startup" id="startupPanel">
+          <b id="mStartupPhase">正在初始化</b>
+          <div class="items">
+            <span id="mStartupProxy">代理 IP：等待拉取</span>
+            <span id="mStartupDevices">设备：等待读取</span>
+            <span id="mStartupProcesses">进程：等待启动</span>
+          </div>
+        </div>
         <div class="stats">
           <div class="stat"><div class="k">总数</div><div class="v" id="sTotal">0</div></div>
           <div class="stat"><div class="k">完成</div><div class="v v-blue" id="sDone">0</div></div>
@@ -1900,6 +1943,18 @@ async function tick(){
   $('mRetry').textContent = `重试 ${num(d.retried)}${rkText}`;
   $('mDevices').textContent = `设备池 已注册 ${num(d.device_registered ?? d.device_ready)} / 使用中 ${num(d.device_in_use)} / 注册中 ${num(d.device_registering)}`;
   const pool = d.ip_pool || {};
+  const startup = d.startup || {};
+  const startupLabels = {
+    device_scan:'扫描设备', device_load:'读取设备', spawning:'启动进程',
+    proxy_fetch:'拉取代理', device_register:'注册设备', ready:'准备就绪',
+    running:'业务校验', complete:'任务完成', stopped:'任务停止'
+  };
+  const startupActive = Boolean(d.running && done === 0 && startup.phase);
+  $('startupPanel').classList.toggle('show', startupActive);
+  $('mStartupPhase').textContent = `${startupLabels[startup.phase] || '正在初始化'} · ${startup.message || ''}`;
+  $('mStartupProxy').textContent = `代理 IP：已拉取 ${num(startup.proxy_fetched)} / 目标 ${num(startup.proxy_target)} · 库存 ${num(startup.proxy_available)} · API ${num(startup.proxy_api_calls)} 次`;
+  $('mStartupDevices').textContent = `设备：发现 ${num(startup.device_discovered)} · 读取 ${num(startup.device_loaded)} · 可用 ${num(startup.device_ready)} / 目标 ${num(startup.device_target)} · 注册中 ${num(startup.device_registering)}`;
+  $('mStartupProcesses').textContent = `进程：已就绪 ${num(startup.process_ready)} / ${num(startup.process_total)}`;
   const poolAvailable = pool.available == null ? null : Number(pool.available);
   const poolLow = pool.low_water == null ? null : Number(pool.low_water);
   const poolHigh = pool.high_water == null ? null : Number(pool.high_water);
@@ -1936,7 +1991,7 @@ async function tick(){
   $('mEta').textContent = d.eta == null ? '--' : `剩 ${Math.round(d.eta)} 秒`;
 
   $('stateTag').innerHTML = d.running
-    ? '<span class="dot" style="background:var(--blue)"></span>运行中'
+    ? `<span class="dot" style="background:var(--blue)"></span>${startupActive ? '启动中 · '+(startupLabels[startup.phase] || '初始化') : '运行中'}`
     : d.finished
       ? `<span class="dot" style="background:var(--green)"></span>${d.status==='complete'?'已完成':'部分完成'}`
       : '<span class="dot" style="background:#9ca3af"></span>已停止';
@@ -1945,8 +2000,9 @@ async function tick(){
     $('start').disabled = d.running;
     $('stop').disabled = !d.running;
   }
-  $('modeHint').textContent = d.incomplete
-    ? `⚠ 缺 ${num(d.incomplete)} 条` : '本地执行';
+  $('modeHint').textContent = startupActive
+    ? (startup.message || '正在初始化')
+    : d.incomplete ? `⚠ 缺 ${num(d.incomplete)} 条` : '本地执行';
 
   LAST = d;
   const want = $('filter').value;

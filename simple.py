@@ -478,6 +478,25 @@ def final_progress_fields(results):
             'recent': list(results.get('recent') or [])}
 
 
+def write_startup_live(path, startup, **fields):
+    """Atomically publish startup progress before the regular live writer exists."""
+    payload = {
+        'started': time.strftime('%H:%M:%S'), 'elapsed': 0,
+        'total': 0, 'done': 0, 'rate': 0, 'per_hour': 0, 'eta': None,
+        'threads': 0, 'processes': 1, 'backend': None, 'engine': 'threading',
+        'cpu_seconds': 0, 'cpu_cores': 0, 'cpu_per_account': 0,
+        'by_status': {}, 'recent': [], 'finished': False,
+        'startup': dict(startup or {}),
+    }
+    payload.update(fields)
+    target = os.path.abspath(path)
+    os.makedirs(os.path.dirname(target) or '.', exist_ok=True)
+    tmp = target + '.startup.tmp'
+    with open(tmp, 'w', encoding='utf-8') as handle:
+        json.dump(payload, handle, ensure_ascii=False)
+    os.replace(tmp, target)
+
+
 class ProcessDeviceHeaderCache:
     """Short-lived public headers bound to one process-owned device slot."""
 
@@ -573,6 +592,29 @@ def main():
     ap.add_argument('--out', default='./data/simple-run.jsonl')
     ap.add_argument('--live', default='./data/live.json', help='实时状态文件，供页面读取')
     args = ap.parse_args()
+    startup_started = time.monotonic()
+    startup_state = {
+        'phase': 'device_scan', 'message': '正在扫描持久化设备',
+        'process_ready': 1, 'process_total': 1,
+        'device_discovered': 0, 'device_loaded': 0,
+        'device_ready': 0, 'device_target': max(0, int(args.threads)),
+        'device_registering': 0,
+        'proxy_target': 0, 'proxy_fetched': 0, 'proxy_available': 0,
+        'proxy_api_calls': 0, 'proxy_round': 0,
+    }
+
+    def publish_startup(phase=None, message=None, **updates):
+        if phase is not None:
+            startup_state['phase'] = phase
+        if message is not None:
+            startup_state['message'] = message
+        startup_state.update(updates)
+        startup_state['elapsed'] = round(time.monotonic() - startup_started, 1)
+        write_startup_live(
+            args.live, startup_state, threads=args.threads,
+            accounts=args.accounts, elapsed=startup_state['elapsed'])
+
+    publish_startup()
     nofile_limit = ensure_open_file_limit(args.threads)
 
     _here = os.path.dirname(os.path.abspath(__file__))
@@ -598,6 +640,9 @@ def main():
     elif args.device_slots.strip() not in ('', '-'):
         assigned_slots = [int(value) for value in args.device_slots.split(',')
                           if value.strip() and int(value) > 0]
+    publish_startup(
+        'device_load', '正在读取已注册设备',
+        device_discovered=len(assigned_slots))
     new_slot_start = int(args.new_slot_start or 0)
     if new_slot_start <= 0:
         new_slot_start = max(assigned_slots or [args.slot_base]) + 1
@@ -611,6 +656,7 @@ def main():
     loaded_devices = device_pool.configure_worker_slots(
         assigned_slots, new_slot_start=new_slot_start,
         new_slot_step=args.new_slot_step)
+    publish_startup(device_loaded=loaded_devices, device_ready=loaded_devices)
 
     os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
     if args.offset or args.limit:
@@ -620,6 +666,10 @@ def main():
         rows = full[start:start + args.limit] if args.limit else full[start:]
     else:
         rows = load_accounts(args.accounts, 0)
+    startup_device_target = min(max(0, len(rows)), max(1, args.threads))
+    publish_startup(
+        'proxy_fetch', '正在预热代理 IP', total=len(rows),
+        device_target=startup_device_target)
     print(f'账号 {len(rows)} 条（offset={args.offset}）| 线程 {args.threads} '
           f'| 本进程设备 {loaded_devices} 台 | 新槽位 {new_slot_start} '
           f'步长 {max(1, args.new_slot_step)} | SRP {SRP_MATH_BACKEND}')
@@ -644,10 +694,31 @@ def main():
                          per_ip=args.per_ip, batch=args.ip_batch,
                          refill_interval=args.ip_interval,
                          rotate=(args.per_ip <= 1))
-        warmed = ip_pool.warm(extra=1)
+        proxy_target = min(ip_pool.initial_max, int(ip_pool.threads * 2))
+        publish_startup(proxy_target=proxy_target)
+
+        def proxy_warm_progress(progress):
+            fetched = int(progress.get('fetched') or 0)
+            publish_startup(
+                'proxy_fetch',
+                f'正在拉取代理 IP（{fetched}/{int(progress.get("target") or proxy_target)}）',
+                proxy_target=int(progress.get('target') or proxy_target),
+                proxy_fetched=fetched, proxy_available=fetched,
+                proxy_api_calls=int(progress.get('api_calls') or 0),
+                proxy_round=int(progress.get('round') or 0),
+                proxy_last_fetch_ms=progress.get('last_fetch_ms'))
+
+        warmed = ip_pool.warm(extra=1, progress=proxy_warm_progress)
         ip_pool.start()
+        publish_startup(
+            'device_register', '代理池就绪，正在准备设备',
+            proxy_fetched=warmed, proxy_available=warmed)
         print(f'IP 池: 预热 {warmed} 条（每线程先分 1 条，其余共享） '
               f'ttl={args.ip_ttl:.0f}s 单次上限={args.ip_batch}')
+    else:
+        publish_startup(
+            'device_register', '未启用代理池，正在准备设备',
+            proxy_target=0, proxy_fetched=0, proxy_available=0)
 
     # 设备与公共头准备好之前不分配账号。共享队列仅在真正准备发业务
     # 请求时弹出一条，因此注册等待/失败不会污染任何账号结果。
@@ -731,6 +802,35 @@ def main():
             # 本轮已完成初始化的工作线程数。
             device_registered = count_registered_devices(
                 args.device_root, 'https://new.ani.sidestore.io')
+            with device_pool_cv:
+                inventory_ready = int(device_inventory['ready'])
+                inventory_registering = int(device_inventory['registering'])
+            pool_snapshot = ip_pool.snapshot() if ip_pool is not None else None
+            startup_snapshot = dict(startup_state)
+            startup_snapshot.update({
+                'elapsed': round(elapsed, 1),
+                'device_loaded': loaded_devices,
+                'device_ready': inventory_ready,
+                'device_target': active_workers,
+                'device_registering': inventory_registering,
+                'device_in_use': device_in_use,
+            })
+            if pool_snapshot is not None:
+                startup_snapshot.update({
+                    'proxy_fetched': int(pool_snapshot.get('fetched') or 0),
+                    'proxy_available': int(pool_snapshot.get('available') or 0),
+                    'proxy_api_calls': int(pool_snapshot.get('api_calls') or 0),
+                })
+            if done:
+                startup_snapshot.update(
+                    phase='running', message='业务校验已开始')
+            elif active_workers and inventory_ready < active_workers:
+                startup_snapshot.update(
+                    phase='device_register',
+                    message=f'正在准备设备（{inventory_ready}/{active_workers}）')
+            else:
+                startup_snapshot.update(
+                    phase='ready', message='代理和设备已就绪，正在启动工作线程')
             ms = None
             payload = {
                 'started': time.strftime('%H:%M:%S', time.localtime(wall_started)),
@@ -751,7 +851,8 @@ def main():
                 'proc_cpu_cores': round((time.process_time() - proc_cpu_start) / elapsed, 3)
                                    if elapsed else 0,
                 'ip_fail': results['ip_fail'],
-                'ip_pool': ip_pool.snapshot() if ip_pool is not None else None,
+                'ip_pool': pool_snapshot,
+                'startup': startup_snapshot,
                 'retried': results.get('retried', 0),
                 'budget_hit': results.get('budget_hit', 0),
                 'by_retry': results.get('by_retry') or {},
@@ -1516,6 +1617,10 @@ def main():
         final['device_registering'] = len(results['device_registering'])
         final['register_errors'] = results['register_errors']
         final['register_error_types'] = dict(results['register_error_types'])
+        final['startup'] = dict(final.get('startup') or {},
+                                phase='complete' if results['incomplete'] == 0 else 'stopped',
+                                message='任务已完成' if results['incomplete'] == 0 else '任务未完整完成',
+                                elapsed=round(wall, 1))
         with open(args.live, 'w', encoding='utf-8') as handle:
             json.dump(final, handle, ensure_ascii=False)
     except OSError:

@@ -23,8 +23,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 if os.path.isdir(os.path.join(HERE, 'fastcheck')):
     sys.path.insert(0, HERE)
-from simple import (histogram_median, histogram_value_at,
-                    proxy_api_default)      # noqa: E402  凭据统一从 secrets/env 读
+from simple import (histogram_median, histogram_value_at, proxy_api_default,
+                    write_startup_live)     # noqa: E402  凭据统一从 secrets/env 读
 from fastcheck.devices import registered_device_slots  # noqa: E402
 PYTHON = os.path.join(HERE, '.venv', 'bin', 'python')
 DATA = os.path.join(HERE, 'data')
@@ -140,7 +140,9 @@ def merge(jobs, started, expected_total=0, wall_started=None):
                 'device_ready': 0, 'device_registered': 0, 'device_in_use': 0,
                 'device_registering': 0, 'register_errors': 0,
                 'register_error_types': {}, 'retried': 0,
-                'by_retry': {}, 'budget_hit': 0}
+                'by_retry': {}, 'budget_hit': 0,
+                'startup': {'phase': 'complete', 'message': '没有待处理账号',
+                            'process_ready': 0, 'process_total': 0}}
     done = total = 0
     cpu = 0.0
     proc_cpu = 0.0
@@ -158,6 +160,7 @@ def merge(jobs, started, expected_total=0, wall_started=None):
     by_retry = {}
     device_ready = device_in_use = device_registering = register_errors = 0
     register_error_types = {}
+    startup_rows = []
     finished = True
     finished_flag = True
     for job in jobs:
@@ -170,6 +173,7 @@ def merge(jobs, started, expected_total=0, wall_started=None):
                 'supplier_alive': None,
             })
             continue
+        startup_rows.append(payload.get('startup') or {})
         done += payload.get('done') or 0
         cpu += payload.get('cpu_seconds') or 0
         proc_cpu += payload.get('proc_cpu_seconds') or 0
@@ -231,6 +235,29 @@ def merge(jobs, started, expected_total=0, wall_started=None):
     elapsed = time.monotonic() - started
     total = expected_total or sum(j.get('limit') or 0 for j in jobs)
     recent.sort(key=lambda r: r.get('t') or 0)
+    phase_priority = {
+        'device_scan': 0, 'device_load': 1, 'spawning': 2,
+        'proxy_fetch': 3, 'device_register': 4, 'ready': 5,
+        'running': 6, 'complete': 7, 'stopped': 7,
+    }
+    phases = [str(row.get('phase') or 'spawning') for row in startup_rows]
+    startup_phase = ('running' if done else
+                     min(phases, key=lambda value: phase_priority.get(value, 2))
+                     if phases else 'spawning')
+    startup_messages = [str(row.get('message') or '') for row in startup_rows
+                        if row.get('message')]
+    startup = {
+        'phase': startup_phase,
+        'message': ('业务校验已开始' if done else
+                    startup_messages[0] if startup_messages else '正在启动子进程'),
+        'process_ready': len(startup_rows),
+        'process_total': len(jobs),
+    }
+    for key in ('device_discovered', 'device_loaded', 'device_ready',
+                'device_target', 'device_registering', 'device_in_use',
+                'proxy_target', 'proxy_fetched', 'proxy_available',
+                'proxy_api_calls'):
+        startup[key] = sum(int(row.get(key) or 0) for row in startup_rows)
     return {
         'started': time.strftime('%H:%M:%S', time.localtime(wall_started)),
         'elapsed': round(elapsed, 1),
@@ -283,6 +310,7 @@ def merge(jobs, started, expected_total=0, wall_started=None):
         'accounts': os.path.join(DATA, 'accounts-placeholder'),
         'finished': finished and finished_flag,
         'processes': len(jobs),
+        'startup': startup,
     }
 
 
@@ -332,11 +360,32 @@ def main():
 
     total = count_accounts(args.accounts)
     jobs = build_jobs(args, total)
+    startup_started = time.monotonic()
+    write_startup_live(
+        LIVE, {
+            'phase': 'device_scan', 'message': '正在扫描持久化设备',
+            'process_ready': 0, 'process_total': len(jobs),
+            'device_discovered': 0, 'device_loaded': 0,
+            'device_ready': 0, 'device_target': len(jobs) * args.threads,
+            'proxy_target': 0, 'proxy_fetched': 0, 'proxy_available': 0,
+        }, total=total, threads=args.threads, processes=len(jobs),
+        elapsed=round(time.monotonic() - startup_started, 1))
     persisted_slots = registered_device_slots(
         args.device_root, 'https://new.ani.sidestore.io')
     # Stable disjoint ownership for this run: process 0 gets slots 0,N,2N...;
     # process 1 gets 1,N+1...  No device crosses processes.
     assign_device_slots(jobs, persisted_slots, args.slot_base)
+    write_startup_live(
+        LIVE, {
+            'phase': 'spawning', 'message': '设备读取完成，正在启动工作进程',
+            'process_ready': 0, 'process_total': len(jobs),
+            'device_discovered': len(persisted_slots),
+            'device_loaded': len(persisted_slots),
+            'device_ready': len(persisted_slots),
+            'device_target': len(jobs) * args.threads,
+            'proxy_target': 0, 'proxy_fetched': 0, 'proxy_available': 0,
+        }, total=total, threads=args.threads, processes=len(jobs),
+        elapsed=round(time.monotonic() - startup_started, 1))
     need_slots = args.slot_base + len(jobs) * args.threads
     print(f'账号总数 {total}，切成 {len(jobs)} 个进程 × {args.threads} 线程 '
           f'= {len(jobs)*args.threads} 并发，设备池容量按需扩展（参考槽位 1-{need_slots}）')
@@ -381,6 +430,10 @@ def main():
                 payload['finished'] = complete
                 payload['status'] = 'complete' if complete else 'incomplete'
                 payload['incomplete'] = max(0, payload['total'] - payload['done'])
+                payload['startup'] = dict(
+                    payload.get('startup') or {},
+                    phase='complete' if complete else 'stopped',
+                    message='任务已完成' if complete else '任务未完整完成')
                 with open(LIVE, 'w', encoding='utf-8') as handle:
                     json.dump(payload, handle, ensure_ascii=False)
                 break
@@ -418,6 +471,10 @@ def main():
     payload['finished'] = complete
     payload['status'] = 'complete' if complete else 'incomplete'
     payload['incomplete'] = max(0, payload['total'] - payload['done'])
+    payload['startup'] = dict(
+        payload.get('startup') or {},
+        phase='complete' if complete else 'stopped',
+        message='任务已完成' if complete else '任务未完整完成')
     with open(LIVE, 'w', encoding='utf-8') as handle:
         json.dump(payload, handle, ensure_ascii=False)
     print(f'\n完成 {payload["done"]}/{payload["total"]}  '

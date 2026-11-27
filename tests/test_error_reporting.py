@@ -159,6 +159,41 @@ def test_multiprocess_merge_keeps_each_process_ip_pool(tmp_path=None):
     assert [item['process'] for item in merged['by_process']] == [1, 2]
 
 
+def test_multiprocess_merge_reports_child_startup_progress(tmp_path=None):
+    if tmp_path is None:
+        with tempfile.TemporaryDirectory() as directory:
+            return test_multiprocess_merge_reports_child_startup_progress(Path(directory))
+    jobs = []
+    payloads = (
+        {'phase': 'device_register', 'message': '正在准备设备',
+         'process_ready': 1, 'process_total': 2,
+         'device_loaded': 400, 'device_ready': 420, 'device_target': 500,
+         'device_registering': 10, 'proxy_fetched': 500,
+         'proxy_target': 500, 'proxy_available': 480, 'proxy_api_calls': 2},
+        {'phase': 'proxy_fetch', 'message': '正在拉取代理 IP',
+         'process_ready': 1, 'process_total': 2,
+         'device_loaded': 350, 'device_ready': 350, 'device_target': 500,
+         'proxy_fetched': 300, 'proxy_target': 500,
+         'proxy_available': 300, 'proxy_api_calls': 1},
+    )
+    for index, startup in enumerate(payloads):
+        path = tmp_path / f'live-startup-{index}.json'
+        path.write_text(json.dumps({
+            'done': 0, 'finished': False, 'startup': startup,
+        }), encoding='utf-8')
+        jobs.append({'index': index, 'live': str(path),
+                     'threads': 500, 'limit': 1})
+    result = merge(jobs, time.monotonic() - 1, expected_total=2)
+    startup = result['startup']
+    assert startup['phase'] == 'proxy_fetch'
+    assert startup['process_ready'] == 2
+    assert startup['process_total'] == 2
+    assert startup['device_loaded'] == 750
+    assert startup['device_ready'] == 770
+    assert startup['proxy_fetched'] == 800
+    assert startup['proxy_api_calls'] == 3
+
+
 def test_multiprocess_merge_uses_global_latency_distribution(tmp_path=None):
     if tmp_path is None:
         with tempfile.TemporaryDirectory() as directory:

@@ -122,7 +122,7 @@ class IpPool:
         return fresh
 
     # ---------------------------------------------------------------- 预热
-    def warm(self, extra=0):
+    def warm(self, extra=0, progress=None):
         """启动预热：默认按 threads × 1.2 备料，上限 initial_max。
 
         实测每个入口端口背后是独立出口 IP，且同一网关 400 并发 100% 通过，
@@ -133,13 +133,30 @@ class IpPool:
         target = min(self.initial_max, requested if extra else int(self.threads * 1.2))
         fresh = []
         rounds = 0
+
+        def report(stage):
+            if progress is None:
+                return
+            try:
+                progress({
+                    'stage': stage, 'round': rounds, 'target': target,
+                    'fetched': len(fresh), 'api_calls': self.stats['api_calls'],
+                    'last_fetch_ms': self.stats['last_fetch_ms'],
+                })
+            except Exception:
+                # Observability must never break proxy acquisition.
+                pass
+
+        report('start')
         while len(fresh) < target and rounds < 8 and not self._stop.is_set():
             want = min(self.batch, target - len(fresh))
             values = self._fetch(want)
             rounds += 1
             if not values:
+                report('fetch')
                 break
             fresh.extend(self._accept(values))
+            report('fetch')
         fresh = fresh[:target]
         with self._cv:
             for index, item in enumerate(fresh):
@@ -152,6 +169,7 @@ class IpPool:
             self._cv.notify_all()
         self.log('ip_warmed', requested=requested, target=target,
                  fresh=len(fresh), rounds=rounds)
+        report('complete')
         return len(fresh)
 
     # ---------------------------------------------------------------- 补货
