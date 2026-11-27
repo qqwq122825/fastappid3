@@ -590,7 +590,7 @@ def main():
                     help='关闭 Client 复用（每条都新建，用于对照）')
     ap.add_argument('--anisette-proxy', action='store_true',
                     help='公共头也走代理（机房 IP 直连 sidestore 被墙时必须开）')
-    ap.add_argument('--anisette-timeout', type=float, default=30.0,
+    ap.add_argument('--anisette-timeout', type=float, default=20.0,
                     dest='anisette_timeout',
                     help='anisette 单次请求超时；连不上时会快速失败')
     ap.add_argument('--register-timeout', type=float, default=20.0,
@@ -621,6 +621,7 @@ def main():
         'device_registering': 0,
         'proxy_target': 0, 'proxy_fetched': 0, 'proxy_available': 0,
         'proxy_api_calls': 0, 'proxy_round': 0,
+        'public_header_retries': 0,
     }
 
     def publish_startup(phase=None, message=None, **updates):
@@ -786,7 +787,7 @@ def main():
                'device_registering': set(), 'register_errors': 0,
                'register_error_types': {}, 'device_retired': 0,
                'workers_started': 0, 'public_header_waiting': 0,
-               'public_header_ready': 0}
+               'public_header_ready': 0, 'public_header_retries': 0}
     stop = threading.Event()
     first_result = threading.Event()
     first_public_header = threading.Event()
@@ -795,7 +796,7 @@ def main():
     startup_runtime_lock = threading.Lock()
     startup_runtime = {
         'workers_started': 0, 'public_header_waiting': 0,
-        'public_header_ready': 0,
+        'public_header_ready': 0, 'public_header_retries': 0,
     }
 
     SAMPLE_CAP = 4000          # 历史样本上限，超出只保留最近的一批
@@ -818,6 +819,7 @@ def main():
                 workers_started = results.get('workers_started', 0)
                 public_header_waiting = results.get('public_header_waiting', 0)
                 public_header_ready = results.get('public_header_ready', 0)
+                public_header_retries = results.get('public_header_retries', 0)
                 register_errors = results['register_errors']
                 register_error_types = dict(results['register_error_types'])
                 latency_hist = dict(results['latency_hist'])
@@ -850,6 +852,7 @@ def main():
                 'workers_started': workers_started,
                 'public_header_waiting': public_header_waiting,
                 'public_header_ready': public_header_ready,
+                'public_header_retries': public_header_retries,
                 'public_header_limit': anisette_limit,
             })
             if pool_snapshot is not None:
@@ -957,6 +960,7 @@ def main():
                 workers_started=workers_started,
                 public_header_waiting=header_waiting,
                 public_header_ready=header_ready,
+                public_header_retries=results.get('public_header_retries', 0),
                 public_header_limit=anisette_limit,
                 proxy_fetched=int(pool.get('fetched') or 0),
                 proxy_available=int(pool.get('available') or 0),
@@ -1193,16 +1197,21 @@ def main():
             try:
                 if cached_client is not None:
                     with anisette_gate:
-                        # anisette 超时单独控制：默认 30 秒，连不上时快速失败
-                        cached_client.deadline = time.monotonic() + max(args.anisette_timeout, 10)
+                        # 同一个配置值，每个工作线程拥有独立 deadline。
+                        cached_client.deadline = (time.monotonic()
+                                                  + max(1.0, args.anisette_timeout))
                         raw = cached_client.headers()
                 else:
                     with anisette_gate:
                         raw = pool.fetch_headers(
-                            slot, info, max(args.timeout, 20), registered=True,
+                            slot, info, max(1.0, args.anisette_timeout), registered=True,
                             proxy=proxy if args.anisette_proxy else None,
                             provider_direct=not args.anisette_proxy)
             except BaseException:
+                # 只淘汰当前线程失败的 SOCKS5 路由。外层循环会为同一
+                # 线程重新拿代理、重新取公共头，而且尚未消费任何账号。
+                with lock:
+                    results['public_header_retries'] += 1
                 if startup_header_pending:
                     startup_header_pending = False
                     with lock:

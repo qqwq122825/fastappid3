@@ -83,6 +83,22 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
                          [len(batch) for batch in batches])
         self.assertEqual(list(range(1000)), [i for batch in batches for i in batch])
 
+    def test_public_header_has_independent_timeout_and_thread_retry(self):
+        from pathlib import Path
+        import simple
+        source = Path(simple.__file__).read_text(encoding='utf-8')
+        self.assertIn("default=20.0,\n                    dest='anisette_timeout'", source)
+        self.assertIn('max(1.0, args.anisette_timeout), registered=True', source)
+        self.assertIn("results['public_header_retries'] += 1", source)
+        self.assertLess(source.index('identity = fetch_otp()'),
+                        source.index('task = retry_tasks.pop() if retry_tasks else take_task()'))
+
+    def test_web_exposes_public_header_timeout(self):
+        import web
+        self.assertIn('id="anito" value="20"', web.PAGE)
+        self.assertIn("anisette_timeout:+$('anito').value", web.PAGE)
+        self.assertIn('startup.public_header_retries', web.PAGE)
+
     def test_ip_pool_refill_scales_with_concurrency(self):
         large = IpPool('http://invalid/{num}', threads=1000)
         self.assertEqual(1000, large.refill_batch)

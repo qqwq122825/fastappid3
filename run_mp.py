@@ -257,7 +257,8 @@ def merge(jobs, started, expected_total=0, wall_started=None):
                 'device_target', 'device_registering', 'device_in_use',
                 'proxy_target', 'proxy_fetched', 'proxy_available',
                 'proxy_api_calls', 'workers_started',
-                'public_header_waiting', 'public_header_ready'):
+                'public_header_waiting', 'public_header_ready',
+                'public_header_retries'):
         startup[key] = sum(int(row.get(key) or 0) for row in startup_rows)
     startup['public_header_limit'] = sum(
         int(row.get('public_header_limit') or 0) for row in startup_rows)
@@ -339,7 +340,7 @@ def main():
                     help='外层重试：http=0 / 5xx / -22421 时换环境重来')
     ap.add_argument('--anisette-proxy', action='store_true', dest='anisette_proxy',
                     help='公共头走代理（机房 IP 直连 sidestore 被墙时必须开）')
-    ap.add_argument('--anisette-timeout', type=float, default=30.0, dest='anisette_timeout')
+    ap.add_argument('--anisette-timeout', type=float, default=20.0, dest='anisette_timeout')
     ap.add_argument('--register-timeout', type=float, default=20.0, dest='register_timeout',
                     help='设备初始化总超时，耗尽后剩余账号记为超时')
     ap.add_argument('--device-max-uses', type=int, default=100, dest='device_max_uses',
