@@ -1,5 +1,6 @@
 import json
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -11,7 +12,8 @@ from simple import (ProcessDeviceHeaderCache, classify_web, classify_web_method,
                     final_progress_fields, refine_repair_web_status,
                     finalize_retry_exhausted, local_exception_result,
                     local_exception_used_proxy, retry_kind,
-                    wait_for_proxy_when_tasks_remain, web_retryable)
+                    wait_for_proxy_when_tasks_remain, wait_for_ready_device,
+                    web_retryable)
 
 
 class RepairWebClassificationTests(unittest.TestCase):
@@ -343,17 +345,50 @@ def test_public_header_cache_is_bound_to_device_usage_and_ttl():
     assert cache.take(7, 3) is None                  # expired
 
 
-def test_device_and_public_header_precede_account_claim():
+def test_device_registration_is_a_producer_consumer_stage():
     import inspect
     import simple
     source = inspect.getsource(simple.main)
+    producer = source[source.index('    def device_registrar'):source.index('    def worker(tid):')]
+    worker = source[source.index('    def worker(tid):'):source.index("    results['started'] = started")]
     header = source.index('identity = device_headers.take')
     claim = source.index('task = retry_tasks.pop() if retry_tasks else take_task()')
     assert header < claim
     assert 'record_setup_timeout' not in source
-    assert 'register_limit = _rw if _rw > 0 else max(1, args.threads)' in source
-    assert 'replacement = pool.acquire_ready_worker_slot()' in source
-    assert "action = 'reuse_idle' if reused_ready else 'register_new'" in source
+    assert 'reserve_new_worker_slot()' in producer
+    assert 'registered=False' in producer
+    assert 'mark_worker_slot_ready(slot)' in producer
+    assert 'wait_for_ready_device(' in worker
+    assert 'reserve_new_worker_slot()' not in worker
+    assert 'registered=False' not in worker
+
+
+def test_business_worker_waits_until_producer_publishes_ready_device(tmp_path=None):
+    if tmp_path is None:
+        with tempfile.TemporaryDirectory() as directory:
+            return test_business_worker_waits_until_producer_publishes_ready_device(
+                Path(directory))
+    origin = 'https://new.ani.sidestore.io'
+    pool = PersistentDevicePool(tmp_path, origin, max_devices=1, in_memory=True)
+    pool.configure_worker_slots([], new_slot_start=1)
+    pending = pool.reserve_new_worker_slot()
+    slot = pending.slot
+    pending.close()
+    condition = threading.Condition()
+    stop = threading.Event()
+    leases = []
+    consumer = threading.Thread(target=lambda: leases.append(
+        wait_for_ready_device(pool, condition, stop, lambda: 1, timeout=0.02)))
+    consumer.start()
+    time.sleep(0.05)
+    assert leases == []
+    pool.mark_worker_slot_ready(slot)
+    with condition:
+        condition.notify_all()
+    consumer.join(1)
+    assert len(leases) == 1 and leases[0] is not None
+    assert leases[0].ready and leases[0].slot == slot
+    leases[0].close()
 
 
 def test_unregistered_worker_slot_is_not_leasable(tmp_path=None):
@@ -422,7 +457,10 @@ class ErrorReportingTest(unittest.TestCase):
         test_public_header_cache_is_bound_to_device_usage_and_ttl()
 
     def test_device_setup_waits_before_claiming_account(self):
-        test_device_and_public_header_precede_account_claim()
+        test_device_registration_is_a_producer_consumer_stage()
+
+    def test_ready_device_publication_wakes_consumer(self):
+        test_business_worker_waits_until_producer_publishes_ready_device()
 
     def test_pending_device_is_not_reused(self):
         test_unregistered_worker_slot_is_not_leasable()
