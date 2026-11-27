@@ -77,9 +77,10 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(80, anisette_concurrency_limit(80, proxied=True))
 
     def test_worker_ramp_reaches_full_concurrency_without_dropping_threads(self):
-        batches = startup_worker_batches(1000, 128)
-        self.assertEqual(128, len(batches[0]))
-        self.assertEqual(104, len(batches[-1]))
+        batches = startup_worker_batches(1000)
+        self.assertEqual(8, len(batches[0]))
+        self.assertEqual([8] + [64] * 15 + [32],
+                         [len(batch) for batch in batches])
         self.assertEqual(list(range(1000)), [i for batch in batches for i in batch])
 
     def test_ip_pool_refill_scales_with_concurrency(self):

@@ -64,12 +64,22 @@ def anisette_concurrency_limit(threads, configured=0, proxied=False):
     return threads
 
 
-def startup_worker_batches(total, batch_size=128):
-    """Return worker-index batches for a fast first-result ramp."""
+def startup_worker_batches(total, batch_size=64, pilot_size=8):
+    """Return a tiny pilot followed by full-concurrency ramp batches.
+
+    Cold-starting hundreds of provider requests at exactly the same instant
+    delays the first visible result.  The pilot proves the public-header path
+    first; later batches still reach every requested worker.
+    """
     total = max(0, int(total))
     batch_size = max(1, int(batch_size))
-    return [range(start, min(total, start + batch_size))
-            for start in range(0, total, batch_size)]
+    pilot_size = min(total, max(1, int(pilot_size)))
+    if not total:
+        return []
+    batches = [range(0, pilot_size)]
+    batches.extend(range(start, min(total, start + batch_size))
+                   for start in range(pilot_size, total, batch_size))
+    return batches
 
 
 def anisette_retry_delay(previous, jitter=None):
@@ -779,6 +789,7 @@ def main():
                'public_header_ready': 0}
     stop = threading.Event()
     first_result = threading.Event()
+    first_public_header = threading.Event()
     device_pool_cv = threading.Condition()
     device_inventory = {'ready': loaded_devices, 'registering': 0}
     startup_runtime_lock = threading.Lock()
@@ -1214,6 +1225,7 @@ def main():
                     if not startup_header_ready:
                         startup_runtime['public_header_ready'] += 1
                 startup_header_ready = True
+                first_public_header.set()
             if profile and isinstance(raw, dict):
                 raw = dict(raw)
                 raw['X-MMe-Client-Info'] = profile['client_info']
@@ -1680,25 +1692,28 @@ def main():
         thread.start()
     threads = [threading.Thread(target=worker_guarded, args=(i,), name=f'w{i}', daemon=True)
                for i in range(active_workers)]
-    batches = startup_worker_batches(active_workers, 128)
+    batches = startup_worker_batches(active_workers)
     if batches:
         first_batch = batches[0]
         for index in first_batch:
             threads[index].start()
         if len(batches) > 1:
-            print(f'启动首批 {len(first_batch)} 个工作线程；首条结果后快速扩容至 '
+            print(f'启动探路批 {len(first_batch)} 个工作线程；首个公共头就绪后快速扩容至 '
                   f'{active_workers}（不限制最终并发）')
-            first_result.wait(min(30.0, max(5.0, float(args.item_timeout))))
+            first_public_header.wait(
+                min(10.0, max(2.0, float(args.anisette_timeout))))
             for batch in batches[1:]:
                 for index in batch:
                     threads[index].start()
-                # Give the first completed requests a scheduling window while
-                # still reaching full concurrency within about one second.
-                stop.wait(0.05 if first_result.is_set() else 0.25)
+                # Once one public header succeeds, reach full concurrency fast.
+                # A slow provider still gets a short stagger instead of the
+                # original synchronized cold-start storm.
+                stop.wait(0.05 if first_public_header.is_set() else 0.25)
     for thread in threads:
         thread.join()
     stop.set()
     first_result.set()
+    first_public_header.set()
     with device_pool_cv:
         device_pool_cv.notify_all()
     for thread in registrar_threads:
