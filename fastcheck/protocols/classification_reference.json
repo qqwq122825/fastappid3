@@ -35,8 +35,7 @@
     "wrong_password": {
       "label": "错误",
       "english_reasons": [
-        "Enter the correct password for this Apple Account.",
-        "Your account information was entered incorrectly."
+        "Enter the correct password for this Apple Account."
       ]
     },
     "need_2fa": {
@@ -82,7 +81,8 @@
     "not_found": {
       "label": "不存在",
       "english_reasons": [
-        "The account does not exist."
+        "The account does not exist.",
+        "Your account information was entered incorrectly."
       ]
     }
   },

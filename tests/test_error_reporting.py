@@ -96,19 +96,21 @@ def test_programming_exception_remains_visible_undetermined():
     assert "secret account" not in result["detail"]
 
 
-def test_account_information_incorrect_retries_then_becomes_wrong_password():
+def test_account_information_incorrect_is_terminal_not_found():
     result = {
         "status": "error",
         "http": 200,
         "apple_message": "Your account information was entered incorrectly.",
     }
     bucket = result_bucket(result)
-    assert bucket == "timeout"
-    assert retry_kind(result, bucket)[0] is not None
+    assert bucket == "not_found"
+    assert retry_kind(result, bucket)[0] is None
+    assert gsa_status.classify(-20101, result["apple_message"])[0] == "not_found"
 
     finalize_retry_exhausted(result)
     assert result["retry_exhausted"] == "account_information_incorrect"
-    assert result_bucket(result) == "wrong_password"
+    assert result["status"] == "not_found"
+    assert result_bucket(result) == "not_found"
     assert retry_kind(result, result_bucket(result))[0] is None
 
 
@@ -608,7 +610,7 @@ class ErrorReportingTest(unittest.TestCase):
         test_direct_local_exception_does_not_blame_task_proxy()
 
     def test_account_information_retry_exhaustion(self):
-        test_account_information_incorrect_retries_then_becomes_wrong_password()
+        test_account_information_incorrect_is_terminal_not_found()
 
     def test_transport_exception(self):
         test_transport_exception_becomes_retryable_timeout()

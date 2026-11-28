@@ -18,7 +18,7 @@ _APPLE_REASON_BUCKETS = (
     ('this apple account has been locked', 'locked'),
     ('enter the correct password for this apple account', 'wrong_password'),
     ('this apple account is not active', 'not_active'),
-    ('your account information was entered incorrectly', 'timeout'),
+    ('your account information was entered incorrectly', 'not_found'),
     ('the account does not exist', 'not_found'),
 )
 
@@ -85,7 +85,7 @@ def result_bucket(result):
     except (TypeError, ValueError):
         apple_ec = None
     if result.get('retry_exhausted') == 'account_information_incorrect':
-        return 'wrong_password'
+        return 'not_found'
     if result.get('kind') == 'timeout' or status == 'timeout':
         return 'timeout'
     # 请求没有拿到任何 HTTP 响应时，协议层统一记录 http=0。它不是业务

@@ -840,7 +840,7 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('startup.public_header_waiting', web.PAGE)
         self.assertIn('startup.threads_created', web.PAGE)
         self.assertIn('startup.business_inflight', web.PAGE)
-        self.assertIn('id="versionTag">v2026.11.29.2', web.PAGE)
+        self.assertIn('id="versionTag">v2026.11.29.3', web.PAGE)
         self.assertIn('const MAX_UPLOAD_BYTES = 256 * 1024 * 1024;', web.PAGE)
         self.assertIn('if(file.size > MAX_UPLOAD_BYTES)', web.PAGE)
         self.assertIn('<div class="v v-green" id="sRate">0</div>', web.PAGE)

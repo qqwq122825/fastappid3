@@ -425,11 +425,11 @@ def retry_kind(result, bucket):
 
 
 def finalize_retry_exhausted(result):
-    """Turn Apple's ambiguous account-information reason into the final verdict."""
+    """Keep legacy account-information rows in the explicit not-found bucket."""
     from fastcheck.status import account_information_incorrect
     if account_information_incorrect(result):
         result['retry_exhausted'] = 'account_information_incorrect'
-        result['status'] = 'wrong_password'
+        result['status'] = 'not_found'
     return result
 
 

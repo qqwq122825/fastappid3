@@ -534,7 +534,7 @@ def classify(ec, em: str) -> tuple[str, str]:
     if "the account does not exist" in em_l:
         return "not_found", em
     if "your account information was entered incorrectly" in em_l:
-        return "error", em
+        return "not_found", em
     if any(s in em_l for s in ("password was entered incorrectly",
                               "enter the correct password for this apple account",
                               "incorrect username or password",
