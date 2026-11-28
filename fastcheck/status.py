@@ -1,5 +1,6 @@
 """Mutually exclusive result counts and a one-second terminal status panel."""
 from difflib import SequenceMatcher
+from functools import lru_cache
 import shutil
 import sys
 import time
@@ -40,12 +41,32 @@ def _apple_reason_matches(text, phrase, threshold=0.90):
         None, phrase, candidate, autojunk=False).ratio() >= threshold)
 
 
+@lru_cache(maxsize=512)
+def _cached_apple_reason_bucket(text):
+    """Classify one normalized Apple reason without repeating fuzzy work.
+
+    Official messages are stable and repeat across many accounts.  Check all
+    exact phrases first so a common reason near the end of the table does not
+    pay for several SequenceMatcher calls.  Only genuinely unknown/changed
+    prose reaches the fuzzy fallback, and that result is cached too.
+    """
+    for phrase, bucket in _APPLE_REASON_BUCKETS:
+        if phrase in text:
+            return bucket
+    for phrase, bucket in _APPLE_REASON_BUCKETS:
+        if _apple_reason_matches(text, phrase):
+            return bucket
+    return None
+
+
 def apple_reason_bucket(result):
     """Classify only explicit English account reasons returned by Apple."""
     values = (result.get('apple_message'), result.get('reason'), result.get('detail'))
-    texts = [_normalized_apple_reason(value) for value in values if value]
-    for phrase, bucket in _APPLE_REASON_BUCKETS:
-        if any(_apple_reason_matches(text, phrase) for text in texts):
+    for value in values:
+        if not value:
+            continue
+        bucket = _cached_apple_reason_bucket(_normalized_apple_reason(value))
+        if bucket:
             return bucket
     return None
 

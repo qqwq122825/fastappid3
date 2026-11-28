@@ -4,14 +4,17 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fastcheck.devices import DevicePool as PersistentDevicePool, count_registered_devices
 from fastcheck.protocols import gsa_status
+from fastcheck import status as status_module
 from fastcheck.status import result_bucket
 from simple import (ProcessDeviceHeaderCache, classify_web, classify_web_method,
                     final_progress_fields, refine_repair_web_status,
                     finalize_retry_exhausted, local_exception_result,
                     local_exception_used_proxy, retry_kind,
+                    retry_attempt_state, should_defer_web_retry,
                     wait_for_proxy_when_tasks_remain, wait_for_ready_device,
                     web_retryable)
 
@@ -105,6 +108,55 @@ def test_account_information_incorrect_retries_then_becomes_wrong_password():
     assert result["retry_exhausted"] == "account_information_incorrect"
     assert result_bucket(result) == "wrong_password"
     assert retry_kind(result, result_bucket(result))[0] is None
+
+
+def test_exact_apple_reason_does_not_invoke_fuzzy_matcher():
+    status_module._cached_apple_reason_bucket.cache_clear()
+    row = {
+        "status": "error",
+        "http": 200,
+        "apple_message": "Enter the correct password for this Apple Account.",
+    }
+    with patch.object(status_module, "SequenceMatcher",
+                      side_effect=AssertionError("exact reason used fuzzy matcher")):
+        assert result_bucket(row) == "wrong_password"
+
+
+def test_unknown_apple_reason_is_cached_after_first_classification():
+    status_module._cached_apple_reason_bucket.cache_clear()
+    row = {
+        "status": "error",
+        "http": 200,
+        "apple_message": "An unexpected response happened while validating this account",
+    }
+    assert result_bucket(row) == "undetermined"
+    first = status_module._cached_apple_reason_bucket.cache_info()
+    assert result_bucket(row) == "undetermined"
+    second = status_module._cached_apple_reason_bucket.cache_info()
+    assert second.hits == first.hits + 1
+
+
+def test_gsa_and_web_retry_budgets_are_independent():
+    assert retry_attempt_state({}) == ('gsa', 1, 0)
+    assert retry_attempt_state({'retry_phase': 'gsa', 'attempts': 3}) == (
+        'gsa', 4, 0)
+    # Resuming Web preserves all four GSA attempts and does not increment them.
+    assert retry_attempt_state({
+        'retry_phase': 'web', 'attempts': 4, 'web_attempts': 3,
+    }) == ('web', 4, 3)
+    assert should_defer_web_retry('web_timeout', 1, 3)
+    assert should_defer_web_retry('web_unavailable', 3, 3)
+    assert not should_defer_web_retry('web_timeout', 4, 3)
+    assert not should_defer_web_retry('need_2fa', 1, 3)
+
+
+def test_web_resume_branch_does_not_repeat_gsa():
+    source = (Path(__file__).resolve().parent.parent / 'simple.py').read_text(
+        encoding='utf-8')
+    branch = source[source.index('if web_resume:'):
+                    source.index('else:', source.index('if web_resume:'))]
+    assert 'gs.check(' not in branch
+    assert "context.get('gsa_result')" in branch
 
 
 def test_proxy_starvation_keeps_pending_worker_alive():
@@ -467,6 +519,18 @@ def test_unregistered_worker_slot_is_not_leasable(tmp_path=None):
 
 
 class ErrorReportingTest(unittest.TestCase):
+    def test_exact_reason_uses_fast_path(self):
+        test_exact_apple_reason_does_not_invoke_fuzzy_matcher()
+
+    def test_unknown_reason_cache(self):
+        test_unknown_apple_reason_is_cached_after_first_classification()
+
+    def test_independent_gsa_and_web_retry_budgets(self):
+        test_gsa_and_web_retry_budgets_are_independent()
+
+    def test_web_retry_resumes_without_gsa(self):
+        test_web_resume_branch_does_not_repeat_gsa()
+
     def test_requests_total_timeout(self):
         test_requests_timeout_uses_independent_connect_and_read_limits()
 

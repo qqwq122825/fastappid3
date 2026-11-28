@@ -511,6 +511,22 @@ def web_retryable(status):
     return status in ('web_timeout', 'web_unavailable')
 
 
+def retry_attempt_state(context):
+    """Return phase and independent GSA/Web attempt counters for one dequeue."""
+    context = context if isinstance(context, dict) else {}
+    phase = str(context.get('retry_phase') or 'gsa')
+    gsa_attempts = (int(context.get('attempts') or 0)
+                    + (0 if phase == 'web' else 1))
+    web_attempts = int(context.get('web_attempts') or 0)
+    return phase, gsa_attempts, web_attempts
+
+
+def should_defer_web_retry(status, attempts, retries, stopped=False):
+    """Give Web its own initial request plus ``retries`` queued retries."""
+    return (web_retryable(status) and int(attempts) <= max(0, int(retries))
+            and not bool(stopped))
+
+
 def fetch_usable_ip(api, timeout=8.0, attempts=4):
     for _ in range(attempts):
         proxy = fetch_one_ip(api)
@@ -1384,6 +1400,22 @@ def main():
         cpu_start = time.thread_time()
         mine = 0
         device_exhausted = False
+
+        def consume_current_device():
+            """Charge one completed GSA account to this worker's device once."""
+            nonlocal device_exhausted
+            if pool.consume_worker_slot(slot, args.device_max_uses):
+                device_headers.invalidate(slot)
+                with lock:
+                    results['device_retired'] += 1
+                    results['device_ready'].discard(slot)
+                    results['device_in_use'].discard(slot)
+                with device_pool_cv:
+                    device_inventory['ready'] = max(
+                        0, device_inventory['ready'] - 1)
+                    device_pool_cv.notify_all()
+                device_exhausted = True
+
         while not stop.is_set():
             ready_wait = task_queue.ready_wait()
             if ready_wait is None:
@@ -1477,79 +1509,98 @@ def main():
                 t0 = float(context.get('started_at') or time.perf_counter())
                 cpu0 = time.thread_time()
                 previous_cpu_ms = float(context.get('thread_cpu_ms') or 0.0)
-                attempts = int(context.get('attempts') or 0) + 1
+                retry_phase, attempts, web_attempts = retry_attempt_state(context)
+                web_resume = retry_phase == 'web'
+                # GSA and Web each own their full retry budget.  Resuming a
+                # deferred Web check must not consume another GSA attempt.
                 retry_reason = str(context.get('retry_reason') or '')
                 attempt_ms = list(context.get('attempt_ms') or [])
+                device_consumed = bool(context.get('device_consumed'))
+                device_meta = dict(context.get('device_meta') or {})
                 ip_wait_none = False             # 重试里是否因为「等不到 IP」而中断
                 gsa_started = False
                 deferred_retry = False
-                try:
-                    t_chk = time.perf_counter()
-                    c0_chk = time.thread_time()
-                    # 每次领取只发一次校验。链路/环境异常进入共享延迟
-                    # 队列，不再让当前 OS 线程原地睡眠或连续重试。
-                    per_hop = max(1.0, float(args.timeout))
-                    _a0 = time.perf_counter()
-                    gsa_started = True
-                    mark_worker_stage(tid, 'apple_check')
-                    result = gs.check(email, password, proxy,
-                                      timeout=per_hop,
-                                      retries=0, identity=identity)
-                    attempt_ms.append(round((time.perf_counter() - _a0) * 1000, 1))
-                    probe_status = refine_status(result, result_bucket(result))
-                    kind, why = retry_kind(result, probe_status)
-                    if kind is not None:
-                        proxy_failed = True
-                    chk_ms = (time.perf_counter() - t_chk) * 1000
-                    chk_cpu = (time.thread_time() - c0_chk) * 1000
-                    if kind is not None and attempts <= args.retry and not stop.is_set():
-                        retry_reason = why
-                        if kind == RETRY_ENV:
-                            device_headers.invalidate(slot)
-                        proxy_failed = True
-                        context = {
-                            'attempts': attempts,
-                            'retry_reason': retry_reason,
-                            'attempt_ms': attempt_ms,
-                            'retry_ip_ms': retry_ip_ms,
-                            'proxy_entries': proxy_entries,
-                            'started_at': t0,
-                            'thread_cpu_ms': (previous_cpu_ms
-                                              + (time.thread_time() - cpu0) * 1000),
-                        }
-                        task_queue.defer(
-                            (email, password), context, DELAYED_RETRY_SECONDS)
-                        deferred_retry = True
-                    elif kind is not None and attempts > args.retry:
-                        retry_reason = why
-                        finalize_retry_exhausted(result)
-                except Exception as exc:                            # noqa: BLE001
-                    otp_ms = chk_ms = 0.0
-                    otp_cpu = chk_cpu = 0.0
-                    result = local_exception_result(exc)
-                    # 本地链路异常也进同一个 3 秒延迟队列；任意空闲
-                    # 线程都可接手，当前线程立即去领其他账号。
-                    if (result.get('status') == 'timeout' and attempts <= args.retry
-                            and not stop.is_set()):
-                        device_headers.invalidate(slot)
-                        used_proxy = local_exception_used_proxy(
-                            gsa_started, args.anisette_proxy)
-                        if used_proxy:
+                probe_status = None
+                classification_dirty = False
+                if web_resume:
+                    # A previous GSA au=repair result already proved that only
+                    # the Web refinement remains.  Keep that verdict and go
+                    # straight to Web; do not spend another GSA attempt.
+                    result = dict(context.get('gsa_result') or {})
+                    probe_status = str(context.get('gsa_status') or 'need_2fa')
+                    chk_ms = float(context.get('chk_ms') or 0.0)
+                    chk_cpu = 0.0
+                else:
+                    try:
+                        t_chk = time.perf_counter()
+                        c0_chk = time.thread_time()
+                        # 每次领取只发一次校验。链路/环境异常进入共享延迟
+                        # 队列，不再让当前 OS 线程原地睡眠或连续重试。
+                        per_hop = max(1.0, float(args.timeout))
+                        _a0 = time.perf_counter()
+                        gsa_started = True
+                        mark_worker_stage(tid, 'apple_check')
+                        result = gs.check(email, password, proxy,
+                                          timeout=per_hop,
+                                          retries=0, identity=identity)
+                        attempt_ms.append(round((time.perf_counter() - _a0) * 1000, 1))
+                        probe_status = refine_status(result, result_bucket(result))
+                        kind, why = retry_kind(result, probe_status)
+                        if kind is not None:
                             proxy_failed = True
-                        retry_reason = 'local_http=0'
-                        context = {
-                            'attempts': attempts,
-                            'retry_reason': retry_reason,
-                            'attempt_ms': attempt_ms,
-                            'retry_ip_ms': retry_ip_ms,
-                            'proxy_entries': proxy_entries,
-                            'started_at': t0,
-                            'thread_cpu_ms': (previous_cpu_ms
-                                              + (time.thread_time() - cpu0) * 1000),
-                        }
-                        task_queue.defer(
-                            (email, password), context, DELAYED_RETRY_SECONDS)
-                        deferred_retry = True
+                        chk_ms = (time.perf_counter() - t_chk) * 1000
+                        chk_cpu = (time.thread_time() - c0_chk) * 1000
+                        if (kind is not None and attempts <= args.retry
+                                and not stop.is_set()):
+                            retry_reason = why
+                            if kind == RETRY_ENV:
+                                device_headers.invalidate(slot)
+                            proxy_failed = True
+                            context = {
+                                'retry_phase': 'gsa', 'attempts': attempts,
+                                'retry_reason': retry_reason,
+                                'attempt_ms': attempt_ms,
+                                'retry_ip_ms': retry_ip_ms,
+                                'proxy_entries': proxy_entries,
+                                'started_at': t0,
+                                'thread_cpu_ms': (previous_cpu_ms
+                                                  + (time.thread_time() - cpu0) * 1000),
+                            }
+                            task_queue.defer(
+                                (email, password), context, DELAYED_RETRY_SECONDS)
+                            deferred_retry = True
+                        elif kind is not None and attempts > args.retry:
+                            retry_reason = why
+                            finalize_retry_exhausted(result)
+                            classification_dirty = True
+                    except Exception as exc:                        # noqa: BLE001
+                        otp_ms = chk_ms = 0.0
+                        otp_cpu = chk_cpu = 0.0
+                        result = local_exception_result(exc)
+                        # 本地链路异常也进同一个 3 秒延迟队列；任意空闲
+                        # 线程都可接手，当前线程立即去领其他账号。
+                        if (result.get('status') == 'timeout'
+                                and attempts <= args.retry
+                                and not stop.is_set()):
+                            device_headers.invalidate(slot)
+                            used_proxy = local_exception_used_proxy(
+                                gsa_started, args.anisette_proxy)
+                            if used_proxy:
+                                proxy_failed = True
+                            retry_reason = 'local_http=0'
+                            context = {
+                                'retry_phase': 'gsa', 'attempts': attempts,
+                                'retry_reason': retry_reason,
+                                'attempt_ms': attempt_ms,
+                                'retry_ip_ms': retry_ip_ms,
+                                'proxy_entries': proxy_entries,
+                                'started_at': t0,
+                                'thread_cpu_ms': (previous_cpu_ms
+                                                  + (time.thread_time() - cpu0) * 1000),
+                            }
+                            task_queue.defer(
+                                (email, password), context, DELAYED_RETRY_SECONDS)
+                            deferred_retry = True
                 if deferred_retry:
                     # 不写结果、不增加 done；立即退出当前坏代理会话，
                     # 外层重新领代理后继续正常账号。
@@ -1558,7 +1609,13 @@ def main():
                 thread_cpu = previous_cpu_ms + (time.thread_time() - cpu0) * 1000
                 c0_tail = time.thread_time()
                 raw_status = str(result.get('status') or 'error')
-                status = refine_status(result, result_bucket(result))
+                # The normal path already classified this response above for
+                # retry routing.  Reuse it instead of running Apple reason
+                # matching twice.  Retry exhaustion mutates the result and
+                # exceptions create a new result, so only those paths redo it.
+                status = (probe_status if probe_status is not None
+                          and not classification_dirty else
+                          refine_status(result, result_bucket(result)))
                 bucket_cpu = (time.thread_time() - c0_tail) * 1000
                 try:
                     got_http = int(result.get('http') or 0)
@@ -1571,82 +1628,99 @@ def main():
                 web_detail = ''
                 web_method = None
                 web_auth = ''
-                web_attempts = 0
-                web_proxy_rotations = 0
+                web_proxy_rotations = int(context.get('web_proxy_rotations') or 0)
                 web_rotation_exhausted = False
-                web_ms = 0.0
+                web_ms = float(context.get('web_ms') or 0.0)
                 final_status = status
                 overridden = False
                 # 只对 au=repair 复核：GSA 的 au 是个大伞，只说"要继续验证"，
                 # 具体是验证码还是安全修复不明确，才值得用 web 细化一次。
                 # au=hsa/hsa2 本身就是明确的验证码流程，不做复核。
                 auth_type = str(result.get('auth_type') or '').strip().casefold()
-                wants_web = (bool(args.verify_web) and status == 'need_2fa'
-                             and auth_type == 'repair')
+                wants_web = (web_resume or
+                             (bool(args.verify_web) and status == 'need_2fa'
+                              and auth_type == 'repair'))
                 if wants_web:
                     from fastcheck.protocols import idmsa
                     wt0, wc0 = time.perf_counter(), time.thread_time()
                     web_trace = {}
-                    for web_attempt in range(max(0, int(args.retry)) + 1):
-                        web_trace = {}
+                    def remember_web_trace(entry):
+                        if not isinstance(entry, dict):
+                            return
+                        stage = str(entry.get('stage') or '')
+                        if stage in ('init', 'complete'):
+                            web_trace[stage] = {
+                                'http': entry.get('http'),
+                                'auth_type': entry.get('auth_type'),
+                            }
 
-                        def remember_web_trace(entry):
-                            if not isinstance(entry, dict):
-                                return
-                            stage = str(entry.get('stage') or '')
-                            if stage in ('init', 'complete'):
-                                web_trace[stage] = {
-                                    'http': entry.get('http'),
-                                    'auth_type': entry.get('auth_type'),
-                                }
-                        web_attempts += 1
-                        try:
-                            web = idmsa.check(email, password, proxy,
-                                              timeout=args.web_timeout, retries=0,
-                                              trace=remember_web_trace)
-                            web_ec = web.get('apple_ec')
-                            web_status = classify_web(web, web_trace)
-                            web_detail = str(web.get('detail') or '')[:120]
-                        except Exception as exc:                    # noqa: BLE001
-                            web = {}
-                            web_status = 'web_error'
-                            web_detail = type(exc).__name__
-                        if not web_retryable(web_status):
-                            break
-                        proxy_failed = True
-                        if web_attempt >= max(0, int(args.retry)) or stop.is_set():
-                            break
-                        replacement = None
-                        if ip_pool is not None:
-                            _t_ip = time.perf_counter()
-                            ip_pool.release(tid, proxy, proxy_exp, healthy=False)
-                            proxy = None
-                            proxy_exp = 0.0
-                            replacement, proxy_exp = ip_pool.acquire(tid, wait=20.0)
-                            retry_ip_ms.append(round((time.perf_counter() - _t_ip) * 1000, 1))
-                        elif args.api:
-                            replacement = (fetch_one_ip(args.api) if args.no_precheck
-                                           else fetch_usable_ip(args.api, args.precheck_timeout))
-                        if replacement is None:
-                            web_rotation_exhausted = True
-                            break
-                        proxy = replacement
-                        entry = _proxy_host(proxy)
-                        if entry:
-                            proxy_entries.append(entry)
-                        proxy_failed = False
-                        web_proxy_rotations += 1
-                    web_ms = round((time.perf_counter() - wt0) * 1000, 1)
+                    web_attempts += 1
+                    try:
+                        web = idmsa.check(email, password, proxy,
+                                          timeout=args.web_timeout, retries=0,
+                                          trace=remember_web_trace)
+                        web_ec = web.get('apple_ec')
+                        web_status = classify_web(web, web_trace)
+                        web_detail = str(web.get('detail') or '')[:120]
+                    except Exception as exc:                        # noqa: BLE001
+                        web = {}
+                        local_web = local_exception_result(exc)
+                        web_status = ('web_timeout'
+                                      if local_web.get('status') == 'timeout'
+                                      else 'web_error')
+                        web_detail = type(exc).__name__
+                    web_ms += (time.perf_counter() - wt0) * 1000
                     thread_cpu += (time.thread_time() - wc0) * 1000
                     elapsed = (time.perf_counter() - t0) * 1000
                     web_auth = web_auth_type(web, web_trace)
                     web_method = classify_web_method(web, web_trace)
+                    if web_retryable(web_status):
+                        proxy_failed = True
+                        retry_reason = f'web:{web_status}'
+                        if should_defer_web_retry(
+                                web_status, web_attempts, args.retry,
+                                stop.is_set()):
+                            # One Web attempt per queue visit.  The account
+                            # waits three seconds without occupying this OS
+                            # thread, and any free worker resumes Web directly.
+                            web_proxy_rotations += 1
+                            if not device_consumed:
+                                device_meta = pool.worker_slot_result_metadata(slot)
+                                consume_current_device()
+                                device_consumed = True
+                            context = {
+                                'retry_phase': 'web',
+                                'attempts': attempts,
+                                'retry_reason': retry_reason,
+                                'attempt_ms': attempt_ms,
+                                'retry_ip_ms': retry_ip_ms,
+                                'proxy_entries': proxy_entries,
+                                'started_at': t0,
+                                'thread_cpu_ms': thread_cpu,
+                                'gsa_result': dict(result),
+                                'gsa_status': status,
+                                'chk_ms': chk_ms,
+                                'web_attempts': web_attempts,
+                                'web_proxy_rotations': web_proxy_rotations,
+                                'web_ms': web_ms,
+                                'device_consumed': True,
+                                'device_meta': device_meta,
+                            }
+                            task_queue.defer(
+                                (email, password), context,
+                                DELAYED_RETRY_SECONDS)
+                            deferred_retry = True
+                        else:
+                            web_rotation_exhausted = True
                     # sa/non-sa 表示 Web 已完成 SRP 密码验证；与
                     # cluster-lab 一致归入“密码正确”。其他 Web
                     # 结果只做细分，不覆盖 GSA 结论。
                     final_status = refine_repair_web_status(status, web, web_trace)
                     overridden = final_status != status
-                device_meta = pool.worker_slot_result_metadata(slot)
+                if deferred_retry:
+                    break
+                device_meta = (device_meta or
+                               pool.worker_slot_result_metadata(slot))
                 proxy_entries, proxy_changed, proxy_change_count = \
                     proxy_entry_metrics(proxy_entries)
                 row = {'tid': tid, 'slot': slot, 'email': email,
@@ -1704,7 +1778,7 @@ def main():
                     elif otp_metric == 'fetch':
                         results['otp_fetch'] = results.get('otp_fetch', 0) + 1
                     seg['chk'].append(chk_ms)
-                    if attempts > 1:
+                    if attempts > 1 or web_attempts > 1:
                         results['retried'] = results.get('retried', 0) + 1
                         rk = results.setdefault('by_retry', {})
                         rk[retry_reason or '?'] = rk.get(retry_reason or '?', 0) + 1
@@ -1737,20 +1811,8 @@ def main():
                         sink.flush()
                 served += 1
                 mine += 1
-                if pool.consume_worker_slot(slot, args.device_max_uses):
-                    # The just-finished account is the final allowed use.
-                    # Discard the slot-bound public header before this worker
-                    # starts a fresh device session.
-                    device_headers.invalidate(slot)
-                    with lock:
-                        results['device_retired'] += 1
-                        results['device_ready'].discard(slot)
-                        results['device_in_use'].discard(slot)
-                    with device_pool_cv:
-                        device_inventory['ready'] = max(
-                            0, device_inventory['ready'] - 1)
-                        device_pool_cv.notify_all()
-                    device_exhausted = True
+                if not device_consumed:
+                    consume_current_device()
                 t_prev_end = time.perf_counter()
                 mark_worker_stage(tid, 'idle')
                 if proxy_failed or device_exhausted:
