@@ -261,7 +261,7 @@ class ConsoleRequestTests(unittest.TestCase):
             self.assertEqual(3, state['device_registered'])
             self.assertEqual(3, state['device_ready'])
             self.assertEqual(3, state['device_total'])
-            self.assertEqual('2026.11.28.5', state['version'])
+            self.assertEqual('2026.11.28.6', state['version'])
 
     def test_linux_process_group_cpu_sums_parent_and_children(self):
         parent = '1 (parent) S 0 77 0 0 0 0 0 0 0 0 200 100 0 0 0 0 0 0 0 0\n'

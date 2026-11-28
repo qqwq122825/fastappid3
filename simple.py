@@ -792,12 +792,67 @@ def main():
         'public_header_ready': 0, 'public_header_retries': 0,
     }
 
+    # 每个工作线程只写自己的两个定长槽位；live_writer 只读快照，避免为了
+    # 埋点再引入一个全局锁。current 能回答“现在卡在哪”，wall_seconds 能
+    # 回答“累计时间耗在哪”。这两个口径会同时写入 live.json 和
+    # live-*-stages.jsonl，便于服务器运行时直接对比。
+    worker_stage_names = (
+        'startup_gate', 'device', 'device_info', 'proxy_acquire',
+        'header_cache', 'header_fetch', 'account_queue', 'apple_check',
+        'retry_ip', 'retry_backoff', 'result_write', 'idle', 'done',
+    )
+    worker_stage_index = {name: index for index, name in enumerate(worker_stage_names)}
+    worker_stage = [worker_stage_index['startup_gate']] * active_workers
+    worker_stage_since = [time.perf_counter()] * active_workers
+    worker_stage_totals = [[0.0] * len(worker_stage_names)
+                           for _ in range(active_workers)]
+
+    def mark_worker_stage(tid, name):
+        if not (0 <= int(tid) < active_workers):
+            return
+        now = time.perf_counter()
+        previous = worker_stage[tid]
+        worker_stage_totals[tid][previous] += max(
+            0.0, now - worker_stage_since[tid])
+        worker_stage[tid] = worker_stage_index[name]
+        worker_stage_since[tid] = now
+
+    def worker_stage_snapshot():
+        now = time.perf_counter()
+        current = {name: 0 for name in worker_stage_names}
+        wall = [0.0] * len(worker_stage_names)
+        current_ages = [[] for _ in worker_stage_names]
+        for tid, stage_index in enumerate(worker_stage):
+            age = max(0.0, now - worker_stage_since[tid])
+            current[worker_stage_names[stage_index]] += 1
+            current_ages[stage_index].append(age)
+            totals = worker_stage_totals[tid]
+            for index, value in enumerate(totals):
+                wall[index] += value
+            wall[stage_index] += age
+        oldest_ms, p50_ms = {}, {}
+        for index, ages in enumerate(current_ages):
+            if ages:
+                ordered = sorted(ages)
+                name = worker_stage_names[index]
+                oldest_ms[name] = round(ordered[-1] * 1000, 1)
+                p50_ms[name] = round(ordered[len(ordered) // 2] * 1000, 1)
+        return {
+            'current': current,
+            'wall_seconds': {name: round(wall[index], 3)
+                             for index, name in enumerate(worker_stage_names)},
+            'current_p50_ms': p50_ms,
+            'current_oldest_ms': oldest_ms,
+        }
+
     SAMPLE_CAP = 4000          # 历史样本上限，超出只保留最近的一批
 
     def live_writer():
         """每秒把当前进度写成 JSON。分位数只在 done 变化时重算。"""
         wcpu0 = time.thread_time()
         path = args.live
+        stage_log_path = os.path.splitext(path)[0] + '-stages.jsonl'
+        stage_log_last = 0.0
         os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
         cached = {'done': -1, 'p50': None, 'p90': None}
         while not stop.is_set():
@@ -836,6 +891,7 @@ def main():
             # 而 live writer 卡在磁盘扫描，页面长期显示 0。
             device_registered = inventory_ready
             pool_snapshot = ip_pool.snapshot() if ip_pool is not None else None
+            worker_stages = worker_stage_snapshot()
             startup_snapshot = dict(startup_state)
             startup_snapshot.update({
                 'elapsed': round(elapsed, 1),
@@ -922,6 +978,7 @@ def main():
                 'latency_hist': latency_hist,
                 'sample_count': len(samples),
                 'recent': recent,
+                'worker_stages': worker_stages,
             }
             tmp = path + '.tmp'
             try:
@@ -930,6 +987,18 @@ def main():
                 os.replace(tmp, path)
             except OSError:
                 pass
+            if elapsed - stage_log_last >= 5.0:
+                stage_log_last = elapsed
+                try:
+                    with open(stage_log_path, 'a', encoding='utf-8') as handle:
+                        handle.write(json.dumps({
+                            'at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                            'elapsed': round(elapsed, 1), 'done': done,
+                            'rate': payload['rate'], 'per_hour': payload['per_hour'],
+                            'worker_stages': worker_stages,
+                        }, ensure_ascii=False) + '\n')
+                except OSError:
+                    pass
             stop.wait(1.0)
 
     def startup_heartbeat():
@@ -1075,6 +1144,7 @@ def main():
         if pending_task_count() <= 0:
             return
         # ---- 1) 设备：先拿本进程已分配设备，拿不到就由本线程注册 ----
+        mark_worker_stage(tid, 'device')
         boot = {}
         _b0 = time.thread_time()
         pool = device_pool
@@ -1132,6 +1202,7 @@ def main():
                 proxy = None
 
         # 设备已经由生产者注册完成；业务线程只准备进程共享的客户端信息。
+        mark_worker_stage(tid, 'device_info')
         _info_cpu = 0.0
         _w0 = time.perf_counter()
         info = None
@@ -1259,6 +1330,7 @@ def main():
             proxy_exp = 0.0
             t_ip = time.perf_counter()
             if ip_pool is not None:
+                mark_worker_stage(tid, 'proxy_acquire')
                 proxy, proxy_exp = ip_pool.acquire(tid, wait=60.0)
             ip_ms = (time.perf_counter() - t_ip) * 1000
             if proxy is None:
@@ -1286,8 +1358,10 @@ def main():
                 # 先确保设备公共头可用，再领取账号。公共头故障只影响线程，
                 # 不得生成账号结果或从队列移除账号。
                 try:
+                    mark_worker_stage(tid, 'header_cache')
                     identity = device_headers.take(slot, args.otp_reuse)
                     if identity is None:
+                        mark_worker_stage(tid, 'header_fetch')
                         identity = fetch_otp()
                         device_headers.bind_used(
                             slot, identity,
@@ -1305,10 +1379,12 @@ def main():
                     if args.anisette_proxy:
                         proxy_failed = True
                         break
+                    mark_worker_stage(tid, 'retry_backoff')
                     stop.wait(anisette_retry_delay(0))
                     continue
                 otp_ms = (time.perf_counter() - t_otp) * 1000
                 otp_cpu = (time.thread_time() - c0_otp) * 1000
+                mark_worker_stage(tid, 'account_queue')
                 was_retry = bool(retry_tasks)
                 task = retry_tasks.pop() if retry_tasks else take_task()
                 if task is None:
@@ -1358,6 +1434,7 @@ def main():
                         per_hop = max(1.0, float(args.timeout))
                         _a0 = time.perf_counter()
                         gsa_started = True
+                        mark_worker_stage(tid, 'apple_check')
                         result = gs.check(email, password, proxy,
                                           timeout=per_hop,
                                           retries=0, identity=identity)
@@ -1374,6 +1451,7 @@ def main():
                         retry_reason = why
                         # 换 IP：归还当前这条（标记为坏），取新的
                         if ip_pool is not None:
+                            mark_worker_stage(tid, 'retry_ip')
                             _t_ip = time.perf_counter()
                             ip_pool.release(tid, proxy, proxy_exp, healthy=False)
                             proxy, proxy_exp = ip_pool.acquire(tid, wait=20.0)
@@ -1419,8 +1497,10 @@ def main():
                             # 直连公共头故障与任务代理无关。像 gsa-console
                             # 一样延迟重试，并加随机抖动防止1000线程同时重连。
                             delay = anisette_retry_delay(previous)
+                            mark_worker_stage(tid, 'retry_backoff')
                             stop.wait(delay)
                         if ip_pool is not None and used_proxy:
+                            mark_worker_stage(tid, 'retry_ip')
                             proxy_failed = True
                             ip_pool.release(tid, proxy, proxy_exp, healthy=False)
                             replacement, proxy_exp = ip_pool.acquire(tid, wait=20.0)
@@ -1571,6 +1651,7 @@ def main():
                         'ip_wait_none': ip_wait_none,
                     }, ensure_ascii=False) + '\n'
                 batch = None
+                mark_worker_stage(tid, 'result_write')
                 with lock:
                     results['done'] += 1
                     results['cpu'] += thread_cpu / 1000.0
@@ -1649,6 +1730,7 @@ def main():
                         device_pool_cv.notify_all()
                     device_exhausted = True
                 t_prev_end = time.perf_counter()
+                mark_worker_stage(tid, 'idle')
                 if proxy_failed or device_exhausted:
                     break
             if ip_pool is not None:
@@ -1706,6 +1788,7 @@ def main():
             release_session()
             if outcome != 'rotate':
                 break
+        mark_worker_stage(tid, 'done')
 
     threads = [threading.Thread(target=worker_guarded, args=(i,), name=f'w{i}', daemon=True)
                for i in range(active_workers)]
@@ -1781,6 +1864,7 @@ def main():
         final['device_registering'] = len(results['device_registering'])
         final['register_errors'] = results['register_errors']
         final['register_error_types'] = dict(results['register_error_types'])
+        final['worker_stages'] = worker_stage_snapshot()
         final['startup'] = dict(final.get('startup') or {},
                                 phase='complete' if results['incomplete'] == 0 else 'stopped',
                                 message='任务已完成' if results['incomplete'] == 0 else '任务未完整完成',

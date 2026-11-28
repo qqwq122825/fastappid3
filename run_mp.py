@@ -26,7 +26,8 @@ if os.path.isdir(os.path.join(HERE, 'fastcheck')):
 from simple import (histogram_median, histogram_value_at, proxy_api_default,
                     write_startup_live)     # noqa: E402  凭据统一从 secrets/env 读
 from fastcheck.devices import registered_device_slots  # noqa: E402
-PYTHON = os.path.join(HERE, '.venv', 'bin', 'python')
+_LOCAL_PYTHON = os.path.join(HERE, '.venv', 'bin', 'python')
+PYTHON = _LOCAL_PYTHON if os.path.exists(_LOCAL_PYTHON) else sys.executable
 DATA = os.path.join(HERE, 'data')
 LIVE = os.path.join(DATA, 'live.json')
 WORKER = os.path.join(HERE, 'simple.py')
@@ -160,6 +161,10 @@ def merge(jobs, started, expected_total=0, wall_started=None):
     by_retry = {}
     device_ready = device_in_use = device_registering = register_errors = 0
     register_error_types = {}
+    worker_stage_current = {}
+    worker_stage_wall = {}
+    worker_stage_oldest = {}
+    worker_stage_p50 = {}
     startup_rows = []
     finished = True
     finished_flag = True
@@ -229,6 +234,17 @@ def merge(jobs, started, expected_total=0, wall_started=None):
         register_errors += payload.get('register_errors') or 0
         for key, value in (payload.get('register_error_types') or {}).items():
             register_error_types[key] = register_error_types.get(key, 0) + value
+        stages = payload.get('worker_stages') or {}
+        for key, value in (stages.get('current') or {}).items():
+            worker_stage_current[key] = worker_stage_current.get(key, 0) + int(value)
+        for key, value in (stages.get('wall_seconds') or {}).items():
+            worker_stage_wall[key] = worker_stage_wall.get(key, 0.0) + float(value)
+        for key, value in (stages.get('current_oldest_ms') or {}).items():
+            worker_stage_oldest[key] = max(worker_stage_oldest.get(key, 0.0),
+                                           float(value))
+        for key, value in (stages.get('current_p50_ms') or {}).items():
+            worker_stage_p50[key] = max(worker_stage_p50.get(key, 0.0),
+                                        float(value))
         ip_calls += pool.get('api_calls') or 0
         fetched += pool.get('fetched') or 0
         blocked += pool.get('blocked') or 0
@@ -314,6 +330,13 @@ def merge(jobs, started, expected_total=0, wall_started=None):
         'device_registering': device_registering,
         'register_errors': register_errors,
         'register_error_types': register_error_types,
+        'worker_stages': {
+            'current': worker_stage_current,
+            'wall_seconds': {key: round(value, 3)
+                             for key, value in worker_stage_wall.items()},
+            'current_p50_ms': worker_stage_p50,
+            'current_oldest_ms': worker_stage_oldest,
+        },
         'recent': recent[-12:],
         'accounts': os.path.join(DATA, 'accounts-placeholder'),
         'finished': finished and finished_flag,

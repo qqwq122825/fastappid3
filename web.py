@@ -31,7 +31,7 @@ ACCOUNT_STATE = os.path.join(HERE, 'data', 'current-accounts.json')
 TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
-APP_VERSION = '2026.11.28.5'
+APP_VERSION = '2026.11.28.6'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -1644,6 +1644,9 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
           <span id="mIpPool">IP池 库存 -- / 低水位 -- / 目标 --</span>
           <span id="mRegErr">注册换代理 --</span>
         </div>
+        <div class="meta" style="padding:10px 0 2px;border-top:1px solid var(--line);font-size:12px;color:var(--dim)">
+          <span id="mStages">线程阶段 --</span>
+        </div>
       </div>
     </div>
 
@@ -2044,6 +2047,12 @@ async function tick(){
   const rkText = Object.keys(rk).length
     ? ' · ' + Object.entries(rk).map(([k,v]) => `${k}:${v}`).join(' ') : '';
   $('mRetry').textContent = `重试 ${num(d.retried)}${rkText}`;
+  const stages = d.worker_stages || {};
+  const sc = stages.current || {};
+  const stageOther = ['startup_gate','device_info','header_cache','account_queue','result_write','idle']
+    .reduce((sum,key)=>sum+Number(sc[key]||0),0);
+  $('mStages').textContent = `线程阶段 校验 ${num(sc.apple_check)} · 公共头 ${num(sc.header_fetch)} · 代理 ${num(sc.proxy_acquire)} · 重试换IP ${num(sc.retry_ip)} · 退避 ${num(sc.retry_backoff)} · 设备 ${num(sc.device)} · 其他 ${num(stageOther)} · 完成 ${num(sc.done)}`;
+  $('mStages').title = JSON.stringify({累计秒:stages.wall_seconds||{}, 当前最久毫秒:stages.current_oldest_ms||{}});
   $('mDevices').textContent = d.running
     ? `设备池 已注册 ${num(d.device_registered ?? d.device_ready)} / 使用中 ${num(d.device_in_use)} / 注册中 ${num(d.device_registering)}`
     : `设备池 总设备 ${num(d.device_total ?? d.device_registered ?? d.device_ready)} / 当前空闲`;
