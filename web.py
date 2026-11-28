@@ -33,7 +33,7 @@ ACCOUNT_STATE = os.path.join(HERE, 'data', 'current-accounts.json')
 TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
-APP_VERSION = '2026.11.28.17'
+APP_VERSION = '2026.11.28.18'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -937,9 +937,7 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
     })
     total_threads = threads * processes
     return {'ok': True, 'pid': proc.pid, 'threads': threads, 'processes': processes,
-            'limit': limit, 'total': total, 'total_threads': total_threads,
-            'warmup_hint': (f'已启动 {processes} 进程 × {threads} 线程 = {total_threads} 并发；'
-                            '线程已并发启动，设备、代理、公共头进展实时显示')}
+            'limit': limit, 'total': total, 'total_threads': total_threads}
 
 
 def _count_device_slots():
@@ -1642,7 +1640,7 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
         <div style="display:flex;gap:8px;margin-top:6px">
           <button class="btn ghost" id="saveApi" style="flex:1">保存接口</button>
         </div>
-        <div class="hint" id="apiHint">程序会按需要的数量自动替换 num</div>
+        <div class="hint" id="apiHint"></div>
       </div>
 
       <div class="field">
@@ -2054,8 +2052,7 @@ async function start(){
     $('start').disabled = false;
   }else{
     resetResultsForNewTask(res.total);
-    $('hint').textContent = res.warmup_hint || '已启动';
-    $('hint').style.color = 'var(--green)';
+    $('hint').textContent = '';
   }
 }
 function resetResultsForNewTask(total){
