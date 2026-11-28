@@ -527,6 +527,67 @@ def should_defer_web_retry(status, attempts, retries, stopped=False):
             and not bool(stopped))
 
 
+def merge_result_events(results, events):
+    """Merge one process-local batch of completed worker events.
+
+    Workers build rows independently and never acquire the global statistics
+    lock.  The process-local merger calls this function once per batch while
+    holding that lock, so live snapshots remain coherent without making every
+    worker serialize behind a per-result critical section.
+    """
+    for event in events:
+        row = event['row']
+        final_status = event['final_status']
+        raw_status = event['raw_status']
+        results['done'] += 1
+        results['cpu'] += event['thread_cpu'] / 1000.0
+        results['by_status'][final_status] = (
+            results['by_status'].get(final_status, 0) + 1)
+        results.setdefault('by_raw', {})
+        results['by_raw'][raw_status] = results['by_raw'].get(raw_status, 0) + 1
+        seg = results.setdefault('seg', {
+            'ip': [], 'otp': [], 'chk': [], 'gap': [], 'loop': [],
+            'chk_cpu': [], 'bucket_cpu': [], 'otp_cpu': [], 'tail_cpu': [],
+        })
+        seg['chk_cpu'].append(event['chk_cpu'])
+        seg['bucket_cpu'].append(event['bucket_cpu'])
+        seg['otp_cpu'].append(event['otp_cpu'])
+        seg['tail_cpu'].append(event['tail_cpu'])
+        seg['gap'].append(event['gap_ms'])
+        seg['loop'].append(event['loop_ms'])
+        seg['ip'].append(event['ip_ms'])
+        seg['otp'].append(event['otp_ms'])
+        seg['chk'].append(event['chk_ms'])
+        if event['otp_metric'] == 'hit':
+            results['otp_hit'] = results.get('otp_hit', 0) + 1
+        elif event['otp_metric'] == 'fetch':
+            results['otp_fetch'] = results.get('otp_fetch', 0) + 1
+        if event['attempts'] > 1 or event['web_attempts'] > 1:
+            results['retried'] = results.get('retried', 0) + 1
+            by_retry = results.setdefault('by_retry', {})
+            reason = event['retry_reason'] or '?'
+            by_retry[reason] = by_retry.get(reason, 0) + 1
+        if event['web_method']:
+            by_method = results.setdefault('by_method', {})
+            method = event['web_method']
+            by_method[method] = by_method.get(method, 0) + 1
+        if event['web_status']:
+            by_web = results.setdefault('by_web', {})
+            web_status = event['web_status']
+            by_web[web_status] = by_web.get(web_status, 0) + 1
+            http_tag = str(event['web_http'] or '')
+            cross_key = (f"{event['gsa_status']} → {web_status}"
+                         + (f' (HTTP {http_tag})' if http_tag else ''))
+            cross = results.setdefault('cross', {})
+            cross[cross_key] = cross.get(cross_key, 0) + 1
+        if results['done'] % 10 == 0:
+            results['samples'].append(row)
+        latency_bucket = max(0, int(round(event['elapsed'])))
+        latency_hist = results['latency_hist']
+        latency_hist[latency_bucket] = latency_hist.get(latency_bucket, 0) + 1
+        results['recent'].append(row)
+
+
 def fetch_usable_ip(api, timeout=8.0, attempts=4):
     for _ in range(attempts):
         proxy = fetch_one_ip(api)
@@ -839,6 +900,9 @@ def main():
     info_cache = {}
     sink = open(args.out, 'w', encoding='utf-8')
     write_buffer = []          # 攒够再落盘，避免每条都 fsync
+    result_events = queue.SimpleQueue()  # 只在本进程内传递，不跨进程
+    result_stop = object()
+    stats_runtime = {'batches': 0, 'events': 0, 'max_batch': 0, 'cpu': 0.0}
     worker_leases = {}         # tid -> process-local in-memory device claim
     device_headers = ProcessDeviceHeaderCache()
     started = time.perf_counter()
@@ -922,6 +986,54 @@ def main():
         }
 
     SAMPLE_CAP = 4000          # 历史样本上限，超出只保留最近的一批
+
+    def result_merger():
+        """Batch process-local worker results and write JSONL outside the lock."""
+        cpu0 = time.thread_time()
+        closing = False
+        while not closing:
+            item = result_events.get()
+            if item is result_stop:
+                break
+            batch = [item]
+            # A 2ms window is short enough for live progress and long enough
+            # for a large completion wave to share one statistics lock entry.
+            deadline = time.monotonic() + 0.002
+            while len(batch) < 256:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    item = result_events.get(timeout=remaining)
+                except queue.Empty:
+                    break
+                if item is result_stop:
+                    closing = True
+                    break
+                batch.append(item)
+            with lock:
+                merge_result_events(results, batch)
+                if len(results['samples']) > SAMPLE_CAP:
+                    del results['samples'][:-SAMPLE_CAP]
+            write_buffer.extend(event['line'] for event in batch)
+            stats_runtime['batches'] += 1
+            stats_runtime['events'] += len(batch)
+            stats_runtime['max_batch'] = max(
+                stats_runtime['max_batch'], len(batch))
+            stats_runtime['cpu'] = round(time.thread_time() - cpu0, 3)
+            first_result.set()
+            if len(write_buffer) >= 200:
+                lines = write_buffer[:]
+                write_buffer.clear()
+                with sink_lock:
+                    sink.write('\n'.join(lines) + '\n')
+                    sink.flush()
+        if write_buffer:
+            with sink_lock:
+                sink.write('\n'.join(write_buffer) + '\n')
+                sink.flush()
+            write_buffer.clear()
+        stats_runtime['cpu'] = round(time.thread_time() - cpu0, 3)
 
     def live_writer():
         """每秒把当前进度写成 JSON。分位数只在 done 变化时重算。"""
@@ -1035,6 +1147,7 @@ def main():
                 'otp_hit': results.get('otp_hit', 0),
                 'writer_cpu': round(time.thread_time() - wcpu0, 2),
                 'main_cpu': round(time.thread_time() - main_cpu0, 2),
+                'stats_merge': dict(stats_runtime),
                 'otp_fetch': results.get('otp_fetch', 0),
                 'device_ready': device_registered,  # 兼容旧页面/旧汇总器
                 'device_registered': device_registered,
@@ -1752,63 +1865,24 @@ def main():
                        'web_rotation_exhausted': web_rotation_exhausted,
                        'web_ms': round(web_ms, 1)}
                 line = json.dumps(row, ensure_ascii=False)
-                batch = None
                 mark_worker_stage(tid, 'result_write')
-                with lock:
-                    results['done'] += 1
-                    results['cpu'] += thread_cpu / 1000.0
-                    results['by_status'][final_status] = results['by_status'].get(final_status, 0) + 1
-                    results.setdefault('by_raw', {})
-                    results['by_raw'][raw_status] = results['by_raw'].get(raw_status, 0) + 1
-                    seg = results.setdefault('seg', {'ip': [], 'otp': [], 'chk': [],
-                                                     'gap': [], 'loop': [],
-                                                     'chk_cpu': [], 'bucket_cpu': [],
-                                                     'otp_cpu': [], 'tail_cpu': []})
-                    seg['chk_cpu'].append(chk_cpu)
-                    seg['bucket_cpu'].append(bucket_cpu)
-                    seg['otp_cpu'].append(otp_cpu)
-                    seg['tail_cpu'].append(max(0.0, thread_cpu - chk_cpu
-                                               - bucket_cpu - otp_cpu))
-                    seg['gap'].append(gap_ms)
-                    seg['loop'].append((time.perf_counter() - t0) * 1000)
-                    seg['ip'].append(ip_ms)
-                    seg['otp'].append(otp_ms)
-                    if otp_metric == 'hit':
-                        results['otp_hit'] = results.get('otp_hit', 0) + 1
-                    elif otp_metric == 'fetch':
-                        results['otp_fetch'] = results.get('otp_fetch', 0) + 1
-                    seg['chk'].append(chk_ms)
-                    if attempts > 1 or web_attempts > 1:
-                        results['retried'] = results.get('retried', 0) + 1
-                        rk = results.setdefault('by_retry', {})
-                        rk[retry_reason or '?'] = rk.get(retry_reason or '?', 0) + 1
-                    if web_method:
-                        results.setdefault('by_method', {})
-                        results['by_method'][web_method] = results['by_method'].get(web_method, 0) + 1
-                    if web_status:
-                        results.setdefault('by_web', {})
-                        results['by_web'][web_status] = results['by_web'].get(web_status, 0) + 1
-                        http_tag = str(web.get('http') or '')
-                        key = f'{status} → {web_status}' + (f' (HTTP {http_tag})' if http_tag else '')
-                        results.setdefault('cross', {})
-                        results['cross'][key] = results['cross'].get(key, 0) + 1
-                    if results['done'] % 10 == 0:
-                        results['samples'].append(row)
-                    latency_bucket = max(0, int(round(elapsed)))
-                    latency_hist = results['latency_hist']
-                    latency_hist[latency_bucket] = latency_hist.get(latency_bucket, 0) + 1
-                    if len(results['recent']) >= 12:
-                        results['recent'].popleft()
-                    results['recent'].append(row)
-                    write_buffer.append(line)
-                    if len(write_buffer) >= 200:        # 200 条才落一次盘
-                        batch = write_buffer[:]
-                        write_buffer.clear()
-                first_result.set()
-                if batch is not None:                   # 序列化和落盘都在状态锁外
-                    with sink_lock:
-                        sink.write('\n'.join(batch) + '\n')
-                        sink.flush()
+                result_events.put({
+                    'row': row, 'line': line,
+                    'final_status': final_status, 'raw_status': raw_status,
+                    'thread_cpu': thread_cpu, 'chk_cpu': chk_cpu,
+                    'bucket_cpu': bucket_cpu, 'otp_cpu': otp_cpu,
+                    'tail_cpu': max(0.0, thread_cpu - chk_cpu
+                                    - bucket_cpu - otp_cpu),
+                    'gap_ms': gap_ms,
+                    'loop_ms': (time.perf_counter() - t0) * 1000,
+                    'ip_ms': ip_ms, 'otp_ms': otp_ms, 'chk_ms': chk_ms,
+                    'otp_metric': otp_metric, 'attempts': attempts,
+                    'web_attempts': web_attempts,
+                    'retry_reason': retry_reason,
+                    'web_method': web_method, 'web_status': web_status,
+                    'web_http': web.get('http'), 'gsa_status': status,
+                    'elapsed': elapsed,
+                })
                 served += 1
                 mine += 1
                 if not device_consumed:
@@ -1838,6 +1912,9 @@ def main():
         return 'rotate' if device_exhausted else None
 
     results['started'] = started
+    stats_thread = threading.Thread(
+        target=result_merger, name='result-merger', daemon=True)
+    stats_thread.start()
     live_thread = threading.Thread(target=live_writer, name='live', daemon=True)
     live_thread.start()
     startup_thread = threading.Thread(
@@ -1913,11 +1990,11 @@ def main():
     first_public_header.set()
     with device_pool_cv:
         device_pool_cv.notify_all()
+    result_events.put(result_stop)
+    stats_thread.join(timeout=10)
+    if stats_thread.is_alive():
+        raise RuntimeError('result merger did not finish')
     wall = time.perf_counter() - started
-    with lock:
-        if write_buffer:
-            sink.write('\n'.join(write_buffer) + '\n')
-            write_buffer.clear()
     sink.close()
     stop.set()
     live_thread.join(timeout=3)      # 必须等写线程退出，否则它会覆盖最终状态

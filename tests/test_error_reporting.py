@@ -1,4 +1,5 @@
 import json
+import collections
 import tempfile
 import threading
 import time
@@ -15,6 +16,7 @@ from simple import (ProcessDeviceHeaderCache, classify_web, classify_web_method,
                     finalize_retry_exhausted, local_exception_result,
                     local_exception_used_proxy, retry_kind,
                     retry_attempt_state, should_defer_web_retry,
+                    merge_result_events,
                     wait_for_proxy_when_tasks_remain, wait_for_ready_device,
                     web_retryable)
 
@@ -157,6 +159,48 @@ def test_web_resume_branch_does_not_repeat_gsa():
                     source.index('else:', source.index('if web_resume:'))]
     assert 'gs.check(' not in branch
     assert "context.get('gsa_result')" in branch
+
+
+def test_process_local_result_events_merge_in_one_batch():
+    results = {
+        'done': 0, 'cpu': 0.0, 'by_status': {}, 'samples': [],
+        'latency_hist': {}, 'recent': collections.deque(maxlen=12),
+    }
+    event = {
+        'row': {'email': 'fixture@example.invalid'}, 'line': '{}',
+        'final_status': 'need_2fa', 'raw_status': 'error',
+        'thread_cpu': 2.5, 'chk_cpu': 1.0, 'bucket_cpu': 0.1,
+        'otp_cpu': 0.2, 'tail_cpu': 1.2, 'gap_ms': 0.3,
+        'loop_ms': 12.0, 'ip_ms': 1.0, 'otp_ms': 2.0, 'chk_ms': 9.0,
+        'otp_metric': 'hit', 'attempts': 1, 'web_attempts': 2,
+        'retry_reason': 'web:web_timeout',
+        'web_method': 'repair_unspecified', 'web_status': 'web_timeout',
+        'web_http': 503, 'gsa_status': 'need_2fa', 'elapsed': 12.0,
+    }
+    merge_result_events(results, [dict(event) for _ in range(10)])
+    assert results['done'] == 10
+    assert results['by_status'] == {'need_2fa': 10}
+    assert results['retried'] == 10
+    assert results['by_retry'] == {'web:web_timeout': 10}
+    assert results['by_web'] == {'web_timeout': 10}
+    assert results['cross'] == {'need_2fa → web_timeout (HTTP 503)': 10}
+    assert results['otp_hit'] == 10
+    assert len(results['samples']) == 1
+    assert len(results['recent']) == 10
+
+
+def test_worker_result_path_has_no_global_statistics_lock():
+    source = (Path(__file__).resolve().parent.parent / 'simple.py').read_text(
+        encoding='utf-8')
+    start = source.index("mark_worker_stage(tid, 'result_write')")
+    end = source.index('served += 1', start)
+    worker_result_path = source[start:end]
+    assert 'result_events.put(' in worker_result_path
+    assert 'with lock:' not in worker_result_path
+    merger = source[source.index('def result_merger():'):
+                    source.index('def live_writer():')]
+    assert 'merge_result_events(results, batch)' in merger
+    assert 'while len(batch) < 256' in merger
 
 
 def test_proxy_starvation_keeps_pending_worker_alive():
@@ -530,6 +574,12 @@ class ErrorReportingTest(unittest.TestCase):
 
     def test_web_retry_resumes_without_gsa(self):
         test_web_resume_branch_does_not_repeat_gsa()
+
+    def test_result_events_merge_by_process_batch(self):
+        test_process_local_result_events_merge_in_one_batch()
+
+    def test_result_worker_avoids_global_statistics_lock(self):
+        test_worker_result_path_has_no_global_statistics_lock()
 
     def test_requests_total_timeout(self):
         test_requests_timeout_uses_independent_connect_and_read_limits()
