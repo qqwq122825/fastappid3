@@ -33,7 +33,7 @@ ACCOUNT_STATE = os.path.join(HERE, 'data', 'current-accounts.json')
 TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
-APP_VERSION = '2026.11.28.31'
+APP_VERSION = '2026.11.28.32'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -716,6 +716,8 @@ def _process_cpu_now(pid, pgid=None):
 _LIVE_CACHE = {'at': 0.0, 'data': None}
 _RESULT_PROGRESS = {}
 _RESULT_PROGRESS_LOCK = threading.Lock()
+_RESULT_RECENT_LIMIT = 500
+_OTHER_RESULT_STATUSES = frozenset(('undetermined', 'error', 'need_mac'))
 
 
 def _result_progress(path):
@@ -737,7 +739,12 @@ def _result_progress(path):
         state = _RESULT_PROGRESS.get(cache_key)
         if state is None or state['key'] != key or stat.st_size < state['offset']:
             state = {'key': key, 'offset': 0, 'done': 0, 'tail': b'',
-                     'by_status': {}, 'recent': collections.deque(maxlen=12)}
+                     'by_status': {}, 'recent': collections.deque(maxlen=12),
+                     'recent_all': collections.deque(
+                         maxlen=_RESULT_RECENT_LIMIT),
+                     'recent_by_status': {},
+                     'recent_other': collections.deque(
+                         maxlen=_RESULT_RECENT_LIMIT)}
             _RESULT_PROGRESS[cache_key] = state
         try:
             with open(path, 'rb') as handle:
@@ -764,6 +771,13 @@ def _result_progress(path):
                         by_status = state['by_status']
                         by_status[status] = by_status.get(status, 0) + 1
                         state['recent'].append(row)
+                        state['recent_all'].append(row)
+                        status_rows = state['recent_by_status'].setdefault(
+                            status, collections.deque(
+                                maxlen=_RESULT_RECENT_LIMIT))
+                        status_rows.append(row)
+                        if status in _OTHER_RESULT_STATUSES:
+                            state['recent_other'].append(row)
                 state['offset'] = handle.tell()
                 state['tail'] = data
         except OSError:
@@ -771,6 +785,37 @@ def _result_progress(path):
         return {'done': state['done'],
                 'by_status': dict(state['by_status']),
                 'recent': list(state['recent'])}
+
+
+def _indexed_result_snapshot(path, want, limit):
+    """Return an O(appended-bytes) status snapshot for one JSONL file.
+
+    ``_result_progress`` advances the cached byte offset.  This function then
+    reads only bounded deques, so refreshing a status filter costs the same for
+    a ten-thousand-row task and a multi-million-row task when no new rows were
+    appended.
+    """
+    _result_progress(path)
+    cache_key = os.path.realpath(path)
+    with _RESULT_PROGRESS_LOCK:
+        state = _RESULT_PROGRESS.get(cache_key)
+        if state is None:
+            return {'total': 0, 'rows': [], 'revision': 'missing'}
+        if want in ('', 'all'):
+            total = state['done']
+            rows = state['recent_all']
+        elif want == 'other':
+            total = sum(state['by_status'].get(status, 0)
+                        for status in _OTHER_RESULT_STATUSES)
+            rows = state['recent_other']
+        else:
+            total = state['by_status'].get(want, 0)
+            rows = state['recent_by_status'].get(want, ())
+        key = state['key']
+        revision = f'{key[1]}:{key[2]}:{state["offset"]}:{state["done"]}'
+        return {'total': int(total),
+                'rows': list(reversed(list(rows)[-limit:])),
+                'revision': revision}
 
 
 def _multiprocess_result_progress(processes, data_dir=None):
@@ -1316,11 +1361,46 @@ class Handler(BaseHTTPRequestHandler):
         else:
             # 多进程：只读本轮开始后写过的 mp-p*.jsonl
             paths = sorted(_glob.glob(os.path.join(HERE, 'data', 'mp-p*.jsonl')))
-        # Scan the complete current-run file.  The previous 4 MiB tail read
-        # made the cumulative counters disagree with filtered rows once an
-        # uncommon result (for example ``undetermined``) scrolled out of the
-        # tail.  Keep only the newest requested rows in memory while counting
-        # every matching result.
+        scoped = bool(own and os.path.exists(own)) or bool(cutoff)
+        # Status-only filters are refreshed every second by the page.  Advance
+        # each file's cached byte offset and combine bounded recent deques;
+        # never rescan millions of completed rows merely to notice an append.
+        if not query:
+            snapshots = []
+            for path in paths:
+                try:
+                    if cutoff and os.path.getmtime(path) < cutoff - 5:
+                        continue
+                except OSError:
+                    continue
+                snapshots.append(_indexed_result_snapshot(path, want, limit))
+            total = sum(snapshot['total'] for snapshot in snapshots)
+            # Each process owns a disjoint account slice.  Interleave its
+            # newest rows so an active high-numbered process cannot hide all
+            # other processes in the fixed-size browser table.
+            rows = []
+            depth = 0
+            while len(rows) < limit:
+                added = False
+                for snapshot in snapshots:
+                    if depth < len(snapshot['rows']):
+                        rows.append(snapshot['rows'][depth])
+                        added = True
+                        if len(rows) >= limit:
+                            break
+                if not added:
+                    break
+                depth += 1
+            revision = '|'.join(snapshot['revision']
+                                for snapshot in snapshots)
+            return {'total': total if scoped else 0,
+                    'rows': rows if scoped else [],
+                    'status': want, 'query': query, 'scoped': scoped,
+                    'revision': revision, 'incremental': True}
+
+        # Arbitrary substring searches remain explicit, debounced operations.
+        # They scan the current run once when the user changes the query, but
+        # are not repeated by the background refresh timer.
         out, seen, total = collections.deque(maxlen=limit), set(), 0
         if True:
             for path in paths:
@@ -1381,10 +1461,10 @@ class Handler(BaseHTTPRequestHandler):
                                     'retry_ip_ms': r.get('retry_ip_ms'),
                                     'ip_wait_none': r.get('ip_wait_none')})
         rows = list(reversed(out))          # 新的在前
-        scoped = bool(own and os.path.exists(own)) or bool(cutoff)
         return {'total': total if scoped else 0,
                 'rows': rows if scoped else [],
-                'status': want, 'query': query, 'scoped': scoped}
+                'status': want, 'query': query, 'scoped': scoped,
+                'revision': '', 'incremental': False}
 
     def _export(self, want, fmt):
         """按状态筛选导出账号。只保留 邮箱----密码 两列，不带其他信息。
@@ -2677,6 +2757,7 @@ async function tick(){
   const want = $('filter').value;
   const query = $('resultSearch').value.trim();
   if((!want || want === 'all') && !query) renderRows(); // 查询时不被实时流覆盖
+  else if(!query && want && want !== 'all') loadHistory(want, true);
   else if(!HIST) renderRows();
 
   if(d.accounts && d.accounts !== shownAccounts){
@@ -2689,6 +2770,7 @@ let LAST = null;
 let HIST = null;          // 筛选时从 /api/results 拿的历史结果
 let TICK_RUNNING = false; // 慢请求时不叠加轮询，避免页面突然卡顿
 let HIST_SEQ = 0;
+let HIST_LOADING = false;
 
 function rowHtml(r, idx){
   const st = r.status || 'unknown';
@@ -2804,17 +2886,23 @@ $('timeoutModal').addEventListener('click', e => {
   if(e.target === $('timeoutModal')) setTimeoutDetailModal(false);
 });
 
-async function loadHistory(want){
+async function loadHistory(want, quiet=false){
+  if(HIST_LOADING) return;
+  HIST_LOADING = true;
   const seq = ++HIST_SEQ;
   const query = $('resultSearch').value.trim();
-  $('tblHint').textContent = '查询中…';
+  if(!quiet) $('tblHint').textContent = '查询中…';
   try{
     const r = await (await fetch(`/api/results?status=${encodeURIComponent(want)}&limit=100&query=${encodeURIComponent(query)}`)).json();
     if(seq !== HIST_SEQ) return;
+    const changed = !HIST || HIST.revision !== r.revision ||
+      HIST.total !== r.total || HIST.query !== r.query;
     HIST = r;
     $('tblHint').textContent = `当前任务共 ${num(r.total)} 条符合条件`;
-  }catch(e){ HIST = null; $('tblHint').textContent = '查询失败'; }
-  renderRows();
+    if(changed) renderRows();
+  }catch(e){
+    if(!quiet){ HIST = null; $('tblHint').textContent = '查询失败'; renderRows(); }
+  }finally{ HIST_LOADING = false; }
 }
 
 function renderRows(){
