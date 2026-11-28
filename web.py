@@ -33,7 +33,7 @@ ACCOUNT_STATE = os.path.join(HERE, 'data', 'current-accounts.json')
 TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
-APP_VERSION = '2026.11.28.9'
+APP_VERSION = '2026.11.28.10'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -1644,11 +1644,12 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
       <div class="field">
         <label>并发</label>
         <div class="row2">
-          <div><input type="number" id="processes" value="4" min="1" max="8" placeholder="进程数">
-            <div class="hint">进程数</div></div>
-          <div><input type="number" id="threads" value="1000" min="1" max="2000" placeholder="线程/进程">
-            <div class="hint">每进程线程</div></div>
+          <div><input type="number" id="processes" value="8" min="1" max="8" placeholder="进程数">
+            <div class="hint">进程数（默认 8）</div></div>
+          <div><input type="number" id="totalConcurrency" value="800" min="1" max="16000" placeholder="总并发">
+            <div class="hint">总并发（自动平均到各进程）</div></div>
         </div>
+        <input type="hidden" id="threads" value="100">
         <div class="hint" id="rechint"></div>
       </div>
 
@@ -2076,17 +2077,23 @@ $('clearDevices').onclick = clearDevices;
 
 /* ---- 推荐提示 ---- */
 function refreshHint(){
-  const p=+$('processes').value, t=+$('threads').value, total=p*t, warn=[];
+  const p=Math.max(1, Math.min(8, Number.parseInt($('processes').value,10)||1));
+  const requested=Math.max(1, Math.min(16000,
+    Number.parseInt($('totalConcurrency').value,10)||1));
+  const t=Math.max(1, Math.ceil(requested/p));
+  const total=p*t, warn=[];
+  $('threads').value=String(t);
   if(p===1 && t>1600) warn.push('单进程超 1600 线程会放大上游长尾');
   if(total>4000) warn.push(`总线程 ${total} 可能放大代理排队`);
   if(p>1 && t>1600) warn.push('每进程超 1600 线程边际递减');
   $('rechint').textContent = warn.length ? '⚠ '+warn.join('；')
-    : `共 ${total} 线程 · 同步 HTTP · 线程模式`;
+    : `${p} 进程 × ${t} 线程 = ${total} 并发`
+      + (total!==requested ? `（输入 ${requested}，向上均分）` : '');
   $('rechint').style.color = warn.length ? 'var(--amber)' : 'var(--dim)';
   $('modeTag').textContent = p>1 ? `${p} 进程` : '单进程';
   $('rechint').style.color = warn.length ? 'var(--amber)' : 'var(--dim)';
 }
-['processes','threads'].forEach(id=>$(id).addEventListener('input', refreshHint));
+['processes','totalConcurrency'].forEach(id=>$(id).addEventListener('input', refreshHint));
 refreshHint();
 
 /* ---- 导出 ---- */
