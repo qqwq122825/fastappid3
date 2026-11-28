@@ -33,7 +33,7 @@ ACCOUNT_STATE = os.path.join(HERE, 'data', 'current-accounts.json')
 TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
-APP_VERSION = '2026.11.28.16'
+APP_VERSION = '2026.11.28.17'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -816,7 +816,7 @@ def _live_state_uncached():
 def start_job(accounts, threads, limit, processes=1, verify_web=False,
               per_ip=6, ip_ttl=50.0, timeout=20.0, anisette_workers=0,
               no_register=False, retry=2, item_timeout=None, anisette_proxy=False,
-              device_max_uses=100, anisette_timeout=20.0):
+              device_max_uses=100, anisette_timeout=20.0, otp_reuse=15):
     if is_running():
         return {'error': '已有任务在跑，先停止'}
     if STATE.get('take_pending') and STATE.get('pending_accounts'):
@@ -880,6 +880,7 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
         if verify_web:
             cmd.append('--verify-web')
         cmd += ['--per-ip', str(per_ip), '--ip-ttl', str(ip_ttl),
+                '--otp-reuse', str(max(0, min(50, int(otp_reuse or 0)))),
                 '--timeout', str(flow_timeout), '--retry', str(retry),
                 '--anisette-timeout', str(flow_timeout),
                 '--register-timeout', str(flow_timeout),
@@ -898,6 +899,7 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
                '--live', LIVE, '--limit', str(limit),
                '--out', run_out,
                '--per-ip', str(per_ip), '--ip-ttl', str(ip_ttl),
+               '--otp-reuse', str(max(0, min(50, int(otp_reuse or 0)))),
                '--timeout', str(flow_timeout), '--retry', str(retry),
                '--anisette-timeout', str(flow_timeout),
                '--register-timeout', str(flow_timeout),
@@ -1453,7 +1455,9 @@ class Handler(BaseHTTPRequestHandler):
                                    bool(payload.get('anisette_proxy')),
                                    int(payload.get('device_max_uses')
                                        if payload.get('device_max_uses') is not None else 100),
-                                   float(payload.get('timeout') or 20))
+                                   float(payload.get('timeout') or 20),
+                                   int(payload.get('otp_reuse')
+                                       if payload.get('otp_reuse') is not None else 15))
             return self._json(result)
         if self.path.startswith('/api/stop'):
             with _LOCK:
@@ -1675,7 +1679,7 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
         </div>
         <div style="margin-top:10px">
           <input type="number" id="deviceMaxUses" value="100" min="0" max="100000">
-          <div class="hint">设备使用上限（完成 100 条后自动销毁并换新；0 = 不限）</div>
+          <div class="hint">设备使用上限（完成指定条数后自动销毁并换新；0 = 不限）</div>
         </div>
       </div>
 
@@ -1986,30 +1990,61 @@ async function post(url, body){
 }
 
 const DEVICE_MAX_USES_KEY = 'gsa.device_max_uses';
-function restoreDeviceMaxUses(){
-  try{
-    const saved = localStorage.getItem(DEVICE_MAX_USES_KEY);
-    if(saved === null || !/^\d+$/.test(saved)) return;
-    $('deviceMaxUses').value = String(Math.min(100000, Number(saved)));
-  }catch(e){}
+const TASK_SETTINGS_KEY = 'gsa.task_settings.v1';
+const TASK_NUMBER_FIELDS = {
+  totalConcurrency:[1,16000], perip:[1,50], ttl:[10,600],
+  otpreuse:[0,50], retry:[0,5], timeout:[3,120], deviceMaxUses:[0,100000]
+};
+const TASK_CHECK_FIELDS = ['vweb','asproxy'];
+function clampSetting(id, raw){
+  const [low, high] = TASK_NUMBER_FIELDS[id];
+  const fallback = Number.parseInt($(id).defaultValue, 10) || low;
+  return Math.max(low, Math.min(high, Number.parseInt(raw, 10) || (low === 0 ? 0 : fallback)));
 }
-function saveDeviceMaxUses(){
-  const value = Math.max(0, Math.min(100000,
-    Number.parseInt($('deviceMaxUses').value, 10) || 0));
-  $('deviceMaxUses').value = String(value);
-  try{ localStorage.setItem(DEVICE_MAX_USES_KEY, String(value)); }catch(e){}
-  return value;
+function restoreTaskSettings(){
+  let saved = {};
+  try{
+    const raw = localStorage.getItem(TASK_SETTINGS_KEY);
+    if(raw) saved = JSON.parse(raw) || {};
+    // 兼容旧版仅保存设备使用上限的键。
+    if(saved.deviceMaxUses === undefined){
+      const legacy = localStorage.getItem(DEVICE_MAX_USES_KEY);
+      if(legacy !== null && /^\d+$/.test(legacy)) saved.deviceMaxUses = Number(legacy);
+    }
+  }catch(e){}
+  for(const id of Object.keys(TASK_NUMBER_FIELDS)){
+    if(saved[id] !== undefined) $(id).value = String(clampSetting(id, saved[id]));
+  }
+  for(const id of TASK_CHECK_FIELDS){
+    if(saved[id] !== undefined) $(id).checked = Boolean(saved[id]);
+  }
+  syncConcurrency();
+}
+function saveTaskSettings(){
+  const saved = {};
+  for(const id of Object.keys(TASK_NUMBER_FIELDS)){
+    saved[id] = clampSetting(id, $(id).value);
+    $(id).value = String(saved[id]);
+  }
+  for(const id of TASK_CHECK_FIELDS) saved[id] = $(id).checked;
+  try{
+    localStorage.setItem(TASK_SETTINGS_KEY, JSON.stringify(saved));
+    localStorage.setItem(DEVICE_MAX_USES_KEY, String(saved.deviceMaxUses));
+  }catch(e){}
+  syncConcurrency();
+  return saved;
 }
 
 async function start(){
-  const deviceMaxUses = saveDeviceMaxUses();
+  const settings = saveTaskSettings();
   const body = {threads:+$('threads').value, limit:0,
     processes:+$('processes').value, verify_web:$('vweb').checked,
     per_ip:+$('perip').value, ip_ttl:+$('ttl').value,
+    otp_reuse:+$('otpreuse').value,
     timeout:+$('timeout').value,
     retry:+$('retry').value,
     anisette_proxy:$('asproxy').checked,
-    device_max_uses:deviceMaxUses};
+    device_max_uses:settings.deviceMaxUses};
   $('start').disabled = true; $('hint').textContent='启动中…';
   $('hint').style.color = 'var(--dim)';
   const res = await post('/api/start', body);
@@ -2072,6 +2107,12 @@ function syncConcurrency(){
 }
 $('totalConcurrency').addEventListener('input', syncConcurrency);
 syncConcurrency();
+for(const id of Object.keys(TASK_NUMBER_FIELDS)){
+  $(id).addEventListener('change', saveTaskSettings);
+}
+for(const id of TASK_CHECK_FIELDS){
+  $(id).addEventListener('change', saveTaskSettings);
+}
 
 /* ---- 导出 ---- */
 function exportAs(fmt){
@@ -2342,7 +2383,7 @@ async function loadAccounts(path){
   const a = await (await fetch('/api/accounts?t='+Date.now()+q)).json();
   renderAccounts(a);
 }
-restoreDeviceMaxUses(); loadAccounts(); tick(); setInterval(tick, 1000);
+restoreTaskSettings(); loadAccounts(); tick(); setInterval(tick, 1000);
 </script></body></html>"""
 PAGE = PAGE.replace('__APP_VERSION__', APP_VERSION)
 

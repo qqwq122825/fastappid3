@@ -287,7 +287,7 @@ class ConsoleRequestTests(unittest.TestCase):
             self.assertEqual(3, state['device_registered'])
             self.assertEqual(3, state['device_ready'])
             self.assertEqual(3, state['device_total'])
-            self.assertEqual('2026.11.28.16', state['version'])
+            self.assertEqual('2026.11.28.17', state['version'])
 
     def test_linux_process_group_cpu_sums_parent_and_children(self):
         parent = '1 (parent) S 0 77 0 0 0 0 0 0 0 0 200 100 0 0 0 0 0 0 0 0\n'
@@ -456,10 +456,13 @@ new vm.Script(input.source, {filename: 'web-inline.js'}).runInContext(context);
 
     def test_page_exposes_device_usage_limit(self):
         self.assertIn('id="deviceMaxUses"', web.PAGE)
-        self.assertIn('device_max_uses:deviceMaxUses', web.PAGE)
+        self.assertIn('device_max_uses:settings.deviceMaxUses', web.PAGE)
         self.assertIn("const DEVICE_MAX_USES_KEY = 'gsa.device_max_uses'", web.PAGE)
-        self.assertIn('const deviceMaxUses = saveDeviceMaxUses();', web.PAGE)
-        self.assertIn('localStorage.getItem(DEVICE_MAX_USES_KEY)', web.PAGE)
+        self.assertIn("const TASK_SETTINGS_KEY = 'gsa.task_settings.v1'", web.PAGE)
+        self.assertIn('const settings = saveTaskSettings();', web.PAGE)
+        self.assertIn('localStorage.getItem(TASK_SETTINGS_KEY)', web.PAGE)
+        self.assertIn('TASK_CHECK_FIELDS', web.PAGE)
+        self.assertIn('restoreTaskSettings(); loadAccounts()', web.PAGE)
         self.assertIn('class="device-maintenance"', web.PAGE)
         self.assertIn('class="btn danger-outline"', web.PAGE)
         self.assertIn('class="task-actions"', web.PAGE)
