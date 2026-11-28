@@ -33,7 +33,7 @@ ACCOUNT_STATE = os.path.join(HERE, 'data', 'current-accounts.json')
 TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
-APP_VERSION = '2026.11.28.8'
+APP_VERSION = '2026.11.28.9'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -1997,14 +1997,31 @@ async function post(url, body){
   }finally{ clearTimeout(timer); }
 }
 
+const DEVICE_MAX_USES_KEY = 'gsa.device_max_uses';
+function restoreDeviceMaxUses(){
+  try{
+    const saved = localStorage.getItem(DEVICE_MAX_USES_KEY);
+    if(saved === null || !/^\d+$/.test(saved)) return;
+    $('deviceMaxUses').value = String(Math.min(100000, Number(saved)));
+  }catch(e){}
+}
+function saveDeviceMaxUses(){
+  const value = Math.max(0, Math.min(100000,
+    Number.parseInt($('deviceMaxUses').value, 10) || 0));
+  $('deviceMaxUses').value = String(value);
+  try{ localStorage.setItem(DEVICE_MAX_USES_KEY, String(value)); }catch(e){}
+  return value;
+}
+
 async function start(){
+  const deviceMaxUses = saveDeviceMaxUses();
   const body = {threads:+$('threads').value, limit:+$('limit').value,
     processes:+$('processes').value, verify_web:$('vweb').checked,
     per_ip:+$('perip').value, ip_ttl:+$('ttl').value,
     timeout:+$('timeout').value, anisette_timeout:+$('anito').value,
     retry:+$('retry').value, item_timeout:+$('itemto').value,
     anisette_proxy:$('asproxy').checked,
-    device_max_uses:+$('deviceMaxUses').value};
+    device_max_uses:deviceMaxUses};
   $('start').disabled = true; $('hint').textContent='启动中…';
   $('hint').style.color = 'var(--dim)';
   const res = await post('/api/start', body);
@@ -2341,7 +2358,7 @@ async function loadAccounts(path){
   const a = await (await fetch('/api/accounts?t='+Date.now()+q)).json();
   renderAccounts(a);
 }
-loadAccounts(); tick(); setInterval(tick, 1000);
+restoreDeviceMaxUses(); loadAccounts(); tick(); setInterval(tick, 1000);
 </script></body></html>"""
 PAGE = PAGE.replace('__APP_VERSION__', APP_VERSION)
 
