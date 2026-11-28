@@ -840,7 +840,7 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('startup.public_header_waiting', web.PAGE)
         self.assertIn('startup.threads_created', web.PAGE)
         self.assertIn('startup.business_inflight', web.PAGE)
-        self.assertIn('id="versionTag">v2026.11.28.37', web.PAGE)
+        self.assertIn('id="versionTag">v2026.11.28.38', web.PAGE)
         self.assertIn('<div class="v v-green" id="sRate">0</div>', web.PAGE)
         self.assertNotIn('<div class="v sm v-green" id="sRate">0</div>', web.PAGE)
         self.assertNotIn('程序会按需要的数量自动替换 num', web.PAGE)

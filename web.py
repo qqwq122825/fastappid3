@@ -32,9 +32,10 @@ UPLOAD_DIR = os.path.join(HERE, 'data', 'uploads')
 DEFAULT_ACCOUNTS = os.path.join(HERE, 'data', 'accounts.txt')
 ACCOUNT_STATE = os.path.join(HERE, 'data', 'current-accounts.json')
 TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
+TASK_HISTORY_DIR = os.path.join(HERE, 'data', 'task-history')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
-APP_VERSION = '2026.11.28.37'
+APP_VERSION = '2026.11.28.38'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -506,7 +507,13 @@ def read_live():
     bypassed the stale-live JSONL fallback and made the page look empty while
     the task was still producing results.
     """
-    return live_state()
+    live = live_state()
+    try:
+        _sync_task_history(live)
+    except (OSError, TypeError, ValueError):
+        # 历史索引失败不能影响实时进度；下一次轮询会再次尝试。
+        pass
+    return live
 
 
 def _path_allowed(path):
@@ -957,6 +964,211 @@ def _validated_result_paths(values):
     return out
 
 
+_TASK_ID_RE = re.compile(r'^run-(\d+)$')
+_TASK_HISTORY_LOCK = threading.Lock()
+_TASK_HISTORY_CACHE = {'task_id': '', 'signature': None, 'written_at': 0.0}
+
+
+def _task_id_from_output(path):
+    """Return the opaque run id used by the browser, never a filesystem path."""
+    name = os.path.basename(str(path or ''))
+    match = re.fullmatch(r'(run-\d+)(?:-p\d+)?\.jsonl', name)
+    return match.group(1) if match else ''
+
+
+def _task_history_path(task_id):
+    task_id = str(task_id or '')
+    if not _TASK_ID_RE.fullmatch(task_id):
+        return None
+    return os.path.join(TASK_HISTORY_DIR, task_id + '.json')
+
+
+def _task_result_sources(task_id):
+    """Resolve result files for one validated historical task id."""
+    import glob
+    task_id = str(task_id or '')
+    if not _TASK_ID_RE.fullmatch(task_id):
+        return []
+    data_dir = os.path.join(HERE, 'data')
+    exact = os.path.join(data_dir, task_id + '.jsonl')
+    values = [exact] if os.path.isfile(exact) else []
+    children = []
+    for value in glob.glob(os.path.join(data_dir, task_id + '-p*.jsonl')):
+        match = re.search(r'-p(\d+)\.jsonl$', value)
+        if match:
+            children.append((int(match.group(1)), value))
+    values.extend(value for _, value in sorted(children))
+    return _validated_result_paths(values)
+
+
+def _read_task_history_record(task_id):
+    path = _task_history_path(task_id)
+    if not path:
+        return None
+    try:
+        with open(path, encoding='utf-8') as handle:
+            record = json.load(handle)
+        return record if isinstance(record, dict) else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _write_task_history_record(record):
+    """Atomically persist one compact task summary; result rows remain JSONL."""
+    task_id = str(record.get('id') or '')
+    path = _task_history_path(task_id)
+    if not path:
+        return False
+    os.makedirs(TASK_HISTORY_DIR, exist_ok=True)
+    tmp = path + f'.tmp-{os.getpid()}-{threading.get_ident()}'
+    with open(tmp, 'w', encoding='utf-8') as handle:
+        json.dump(record, handle, ensure_ascii=False, separators=(',', ':'))
+    os.replace(tmp, path)
+    return True
+
+
+def _new_task_history_record(accounts, total, processes, threads, run_out,
+                             started_at=None):
+    task_id = _task_id_from_output(run_out)
+    account_name = re.sub(r'^\d{9,}-', '', os.path.basename(str(accounts or '')))
+    return {
+        'id': task_id, 'started_at': float(started_at or time.time()),
+        'updated_at': time.time(), 'account_name': account_name or '账号文件',
+        'accounts': _persistent_account_path(accounts) or '',
+        'total': int(total or 0), 'done': 0, 'processes': int(processes or 1),
+        'threads': int(threads or 1),
+        'total_threads': min(int(total or 0), int(processes or 1) * int(threads or 1)),
+        'status': 'running', 'elapsed': 0, 'by_status': {},
+        'version': APP_VERSION,
+    }
+
+
+def _sync_task_history(live):
+    """Persist the current task summary at most once per second and on change."""
+    live = live if isinstance(live, dict) else {}
+    task_id = _task_id_from_output(STATE.get('run_out'))
+    if not task_id:
+        return
+    existing = _read_task_history_record(task_id) or _new_task_history_record(
+        STATE.get('accounts'), STATE.get('total'), STATE.get('processes'),
+        STATE.get('threads'), STATE.get('run_out'), STATE.get('started_at'))
+    running = bool(live.get('running'))
+    finished = bool(live.get('finished'))
+    status = ('running' if running else
+              'complete' if finished and str(live.get('status') or '') == 'complete' else
+              'incomplete' if finished or int(live.get('done') or 0) else 'stopped')
+    existing.update(
+        updated_at=time.time(), total=int(live.get('total') or existing.get('total') or 0),
+        done=int(live.get('done') or 0), elapsed=round(float(live.get('elapsed') or 0), 1),
+        rate=round(float(live.get('rate') or 0), 2), status=status,
+        by_status=dict(live.get('by_status') or {}),
+        processes=int(live.get('processes') or existing.get('processes') or 1),
+        threads=int(live.get('threads') or existing.get('threads') or 1),
+        total_threads=int(live.get('total_threads') or existing.get('total_threads') or 0),
+        version=str(live.get('version') or existing.get('version') or APP_VERSION))
+    signature = json.dumps({key: existing.get(key) for key in (
+        'total', 'done', 'elapsed', 'status', 'by_status', 'processes', 'threads')},
+        sort_keys=True, ensure_ascii=False)
+    now = time.monotonic()
+    with _TASK_HISTORY_LOCK:
+        if (_TASK_HISTORY_CACHE['task_id'] == task_id and
+                _TASK_HISTORY_CACHE['signature'] == signature and
+                now - _TASK_HISTORY_CACHE['written_at'] < 5):
+            return
+        _write_task_history_record(existing)
+        _TASK_HISTORY_CACHE.update(task_id=task_id, signature=signature, written_at=now)
+
+
+def task_history(page=1, limit=20, query=''):
+    """List compact task records; legacy run files are discovered without scanning rows."""
+    import glob
+    page = max(1, int(page or 1))
+    limit = max(1, min(100, int(limit or 20)))
+    query = str(query or '').strip()[:128].casefold()
+    records = {}
+    try:
+        names = os.listdir(TASK_HISTORY_DIR)
+    except OSError:
+        names = []
+    for name in names:
+        if not name.endswith('.json'):
+            continue
+        record = _read_task_history_record(name[:-5])
+        if record and _TASK_ID_RE.fullmatch(str(record.get('id') or '')):
+            records[record['id']] = record
+    groups = {}
+    for path in glob.glob(os.path.join(HERE, 'data', 'run-*.jsonl')):
+        task_id = _task_id_from_output(path)
+        if task_id:
+            groups.setdefault(task_id, []).append(path)
+    for task_id, paths in groups.items():
+        if task_id in records:
+            continue
+        raw_stamp = int(_TASK_ID_RE.fullmatch(task_id).group(1))
+        stamp = raw_stamp / 1000 if raw_stamp > 10_000_000_000 else raw_stamp
+        records[task_id] = {
+            'id': task_id, 'started_at': stamp, 'updated_at': max(
+                (os.path.getmtime(path) for path in paths), default=stamp),
+            'account_name': '历史任务', 'total': None, 'done': None,
+            'processes': len(paths) if len(paths) > 1 else 1, 'threads': None,
+            'total_threads': None, 'status': 'archived', 'elapsed': None,
+            'by_status': {}, 'version': '',
+        }
+    current_id = _task_id_from_output(STATE.get('run_out'))
+    rows = []
+    for record in records.values():
+        paths = _task_result_sources(record.get('id'))
+        item = {key: record.get(key) for key in (
+            'id', 'started_at', 'updated_at', 'account_name', 'total', 'done',
+            'processes', 'threads', 'total_threads', 'status', 'elapsed',
+            'by_status', 'version')}
+        item['file_count'] = len(paths)
+        item['bytes'] = sum(os.path.getsize(path) for path in paths)
+        item['current'] = record.get('id') == current_id
+        if item.get('status') == 'running' and not item['current']:
+            item['status'] = 'stopped'
+        haystack = f"{item.get('id','')} {item.get('account_name','')} {item.get('status','')}".casefold()
+        if not query or query in haystack:
+            rows.append(item)
+    rows.sort(key=lambda item: float(item.get('started_at') or 0), reverse=True)
+    total = len(rows)
+    pages = max(1, (total + limit - 1) // limit)
+    page = min(page, pages)
+    start = (page - 1) * limit
+    return {'total': total, 'rows': rows[start:start + limit], 'page': page,
+            'pages': pages, 'has_prev': page > 1, 'has_next': page < pages,
+            'query': query}
+
+
+def delete_task_history(task_id):
+    """Delete one idle historical task and its result files."""
+    task_id = str(task_id or '')
+    if not _TASK_ID_RE.fullmatch(task_id):
+        return {'error': '历史任务标识无效'}
+    current = _task_id_from_output(STATE.get('run_out'))
+    if task_id == current and is_running():
+        return {'error': '当前任务正在运行，不能删除'}
+    paths = _task_result_sources(task_id)
+    meta = _task_history_path(task_id)
+    removed = 0
+    for path in paths + ([meta] if meta else []):
+        try:
+            os.remove(path)
+            removed += 1
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            return {'error': f'删除失败：{type(exc).__name__}'}
+    with _RESULT_PROGRESS_LOCK:
+        for path in paths:
+            _RESULT_PROGRESS.pop(path, None)
+    with _RESULT_QUERY_LOCK:
+        for key in list(_RESULT_QUERY_CACHE):
+            if key and key[0] in paths:
+                _RESULT_QUERY_CACHE.pop(key, None)
+    return {'ok': True, 'removed': removed, 'id': task_id}
+
+
 def _result_sources(completed_live=None):
     """Resolve only result files belonging to the current/latest task."""
     import glob
@@ -1304,6 +1516,13 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
         'processes': processes, 'started': STATE['started'],
         'started_at': STATE['started_at'], 'run_out': STATE['run_out'],
     })
+    try:
+        _write_task_history_record(_new_task_history_record(
+            accounts, total, processes, threads, run_out, STATE['started_at']))
+    except (OSError, TypeError, ValueError):
+        # 工作进程已经启动；摘要写入失败不能把成功的启动伪装成失败。
+        pass
+    _TASK_HISTORY_CACHE.update(task_id='', signature=None, written_at=0.0)
     total_threads = threads * processes
     return {'ok': True, 'pid': proc.pid, 'threads': threads, 'processes': processes,
             'limit': limit, 'total': total, 'total_threads': total_threads}
@@ -1478,6 +1697,18 @@ class Handler(BaseHTTPRequestHandler):
     def _do_get(self):
         if self.path.startswith('/api/') and not self._authorized():
             return self._json({'error': '请先输入密码', 'need_login': True})
+        if self.path.startswith('/api/task-history'):
+            from urllib.parse import urlparse, parse_qs
+            q = parse_qs(urlparse(self.path).query)
+            # 先固化最新一帧，再列出历史；只写摘要，不扫描结果正文。
+            try:
+                _sync_task_history(live_state())
+            except (OSError, TypeError, ValueError):
+                pass
+            return self._json(task_history(
+                int((q.get('page') or ['1'])[0] or 1),
+                int((q.get('limit') or ['20'])[0] or 20),
+                (q.get('query') or [''])[0]))
         if self.path.startswith('/api/results'):
             from urllib.parse import urlparse, parse_qs
             q = parse_qs(urlparse(self.path).query)
@@ -1485,13 +1716,14 @@ class Handler(BaseHTTPRequestHandler):
                 (q.get('status') or ['all'])[0],
                 int((q.get('limit') or ['60'])[0] or 60),
                 (q.get('query') or [''])[0],
-                int((q.get('page') or ['1'])[0] or 1)))
+                int((q.get('page') or ['1'])[0] or 1),
+                (q.get('task_id') or [''])[0]))
         if self.path.startswith('/api/export'):
             from urllib.parse import urlparse, parse_qs
             q = parse_qs(urlparse(self.path).query)
             want = (q.get('status') or [''])[0].strip()
             fmt = (q.get('fmt') or ['txt'])[0]
-            return self._export(want, fmt)
+            return self._export(want, fmt, (q.get('task_id') or [''])[0])
         if self.path.startswith('/api/api-config'):
             current = proxy_api()
             return self._json({'api': mask_api(current),
@@ -1527,8 +1759,8 @@ class Handler(BaseHTTPRequestHandler):
                                'log_tail': tail_log()})
         self._send(PAGE.encode('utf-8'), 'text/html; charset=utf-8')
 
-    def _results(self, want, limit=60, query='', page=1):
-        """按状态查**当前任务**的结果。
+    def _results(self, want, limit=60, query='', page=1, task_id=''):
+        """按状态分页查询当前任务或一个安全的历史任务标识。
 
         jsonl 是追加写的，历史批次都堆在同一个文件里；如果不过滤，
         页面筛出 2 万条超时、而顶部只有 3 条，因为顶部只统计当前任务。
@@ -1538,27 +1770,38 @@ class Handler(BaseHTTPRequestHandler):
         page = max(1, int(page or 1))
         want = (want or 'all').strip()
         query = str(query or '').strip()[:128].casefold()
+        task_id = str(task_id or '').strip()
+        if task_id and not _TASK_ID_RE.fullmatch(task_id):
+            return {'error': '历史任务标识无效', 'total': 0, 'rows': [],
+                    'status': want, 'query': query, 'page': 1, 'pages': 1,
+                    'has_prev': False, 'has_next': False}
         # Hydrate STATE from task-process.json after a controller restart while
         # workers are still alive.  Finished tasks no longer have that process
         # record, so fall back to live.json below.
         _active_task_record()
-        cutoff = STATE.get('started_at') or 0
-        own = STATE.get('run_out') or ''
+        cutoff = 0
+        own = ''
         completed_live = {}
-        if not cutoff and not (own and os.path.exists(own)):
-            try:
-                with open(LIVE, encoding='utf-8') as handle:
-                    value = json.load(handle)
-                if isinstance(value, dict):
-                    completed_live = value
-            except (OSError, ValueError, TypeError):
-                pass
-        paths = _result_sources(completed_live)
-        live_scoped = bool(completed_live and paths and
-                           (completed_live.get('done') is not None or
-                            completed_live.get('total') is not None))
-        scoped = (bool(own and os.path.exists(own)) or bool(cutoff) or
-                  live_scoped)
+        if task_id:
+            paths = _task_result_sources(task_id)
+            scoped = bool(paths)
+        else:
+            cutoff = STATE.get('started_at') or 0
+            own = STATE.get('run_out') or ''
+            if not cutoff and not (own and os.path.exists(own)):
+                try:
+                    with open(LIVE, encoding='utf-8') as handle:
+                        value = json.load(handle)
+                    if isinstance(value, dict):
+                        completed_live = value
+                except (OSError, ValueError, TypeError):
+                    pass
+            paths = _result_sources(completed_live)
+            live_scoped = bool(completed_live and paths and
+                               (completed_live.get('done') is not None or
+                                completed_live.get('total') is not None))
+            scoped = (bool(own and os.path.exists(own)) or bool(cutoff) or
+                      live_scoped)
         # Status-only filters are refreshed every second by the page.  Advance
         # each file's cached byte offset and combine bounded recent deques;
         # never rescan millions of completed rows merely to notice an append.
@@ -1593,6 +1836,7 @@ class Handler(BaseHTTPRequestHandler):
                     'rows': rows if scoped else [],
                     'status': want, 'query': query, 'scoped': scoped,
                     'revision': revision, 'incremental': True,
+                    'task_id': task_id,
                     'page': page, 'pages': pages,
                     'has_prev': page > 1, 'has_next': page < pages}
 
@@ -1630,17 +1874,21 @@ class Handler(BaseHTTPRequestHandler):
                 'rows': rows if scoped else [],
                 'status': want, 'query': query, 'scoped': scoped,
                 'revision': revision, 'incremental': True,
+                'task_id': task_id,
                 'page': page, 'pages': pages,
                 'has_prev': page > 1, 'has_next': page < pages}
 
-    def _export(self, want, fmt):
+    def _export(self, want, fmt, task_id=''):
         """按状态筛选导出账号。只保留 邮箱----密码 两列，不带其他信息。
 
         同样按 STATE['started'] 限定在本轮任务范围内。
         """
+        task_id = str(task_id or '').strip()
+        if task_id and not _TASK_ID_RE.fullmatch(task_id):
+            return self._json({'error': '历史任务标识无效'})
         _active_task_record()
         completed_live = {}
-        if not STATE.get('started_at'):
+        if not task_id and not STATE.get('started_at'):
             try:
                 with open(LIVE, encoding='utf-8') as handle:
                     value = json.load(handle)
@@ -1648,8 +1896,9 @@ class Handler(BaseHTTPRequestHandler):
                     completed_live = value
             except (OSError, ValueError, TypeError):
                 pass
-        paths = _result_sources(completed_live)
-        cutoff = STATE.get('started_at') or 0
+        paths = (_task_result_sources(task_id) if task_id
+                 else _result_sources(completed_live))
+        cutoff = 0 if task_id else (STATE.get('started_at') or 0)
         rows, seen = [], set()
         for path in paths:
                 try:
@@ -1707,7 +1956,8 @@ class Handler(BaseHTTPRequestHandler):
             name = f'export-details-{safe_status}-{exported_at}.csv'
         else:
             src = {}
-            acc = STATE['accounts']
+            history_record = _read_task_history_record(task_id) if task_id else None
+            acc = ((history_record or {}).get('accounts') or STATE['accounts'])
             try:
                 with open(acc, encoding='utf-8', errors='replace') as handle:
                     for line in handle:
@@ -1858,6 +2108,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith('/api/delete-account-file'):
             with _LOCK:
                 return self._json(delete_account_file(payload.get('id')))
+        if self.path.startswith('/api/delete-task-history'):
+            with _LOCK:
+                return self._json(delete_task_history(payload.get('id')))
         if self.path.startswith('/api/select-account-file'):
             return self._json(select_account_file(payload.get('id')))
         if self.path.startswith('/api/start'):
@@ -1972,7 +2225,7 @@ align-items:center;justify-content:space-between;min-width:0;gap:10px;flex-wrap:
 .field{margin-bottom:14px}
 .field>label{display:block;font-size:12px;color:var(--dim);margin-bottom:6px}
 .field>label b{color:var(--fg);font-weight:600}
-input[type=number],input[type=password],input[type=text],select{font-family:inherit;
+input[type=number],input[type=password],input[type=text],input[type=search],select{font-family:inherit;
 width:100%;border:1px solid var(--line);border-radius:8px;padding:8px 10px;
 font-size:13px;background:#fff;color:var(--fg);font-variant-numeric:tabular-nums}
 input:focus,select:focus{outline:2px solid #bfdbfe;border-color:var(--blue)}
@@ -2004,6 +2257,31 @@ white-space:nowrap}.history-item .meta{font-size:11px;color:var(--dim);margin-to
 .history-empty{padding:34px 18px;text-align:center;color:var(--dim);font-size:12px}
 .history-foot{border-top:1px solid var(--line);justify-content:flex-end}
 .history-foot .btn{padding:8px 14px}
+.task-history-dialog{width:min(820px,100%)}
+.task-history-search{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;
+width:min(420px,100%)}
+.task-history-search input{padding:7px 10px;font-size:12px}
+.task-history-list{overflow:auto;min-height:180px;max-height:520px}
+.task-history-item{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:14px;
+align-items:center;padding:13px 16px;border-bottom:1px solid #f0f2f5}
+.task-history-item:hover{background:#fafbfc}.task-history-item:last-child{border-bottom:0}
+.task-history-main{min-width:0}.task-history-title{display:flex;align-items:center;gap:8px;
+font-size:12.5px;font-weight:700;min-width:0}
+.task-history-title .file{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.task-history-meta{display:flex;gap:12px;flex-wrap:wrap;margin-top:5px;color:var(--dim);
+font-size:11px;font-variant-numeric:tabular-nums}
+.task-history-actions{display:flex;gap:7px;align-items:center}
+.task-history-actions .btn{padding:6px 10px;font-size:11.5px}
+.task-history-status{display:inline-flex;padding:2px 7px;border-radius:999px;background:#eef2ff;
+color:#4338ca;font-size:10px;white-space:nowrap}
+.task-history-status.running{background:#dbeafe;color:#1d4ed8}
+.task-history-status.complete{background:#dcfce7;color:#166534}
+.task-history-status.incomplete,.task-history-status.stopped{background:#fef3c7;color:#92400e}
+.task-history-pager{display:flex;align-items:center;gap:8px;margin-right:auto;color:var(--dim);
+font-size:11.5px}.task-history-pager .btn{padding:5px 10px;font-size:11.5px}
+.result-context{display:none;align-items:center;gap:8px;color:#4338ca;font-size:11px}
+.result-context.show{display:flex}.result-context .btn{padding:4px 9px;font-size:11px}
+@media(max-width:640px){.task-history-item{grid-template-columns:1fr}.task-history-actions{justify-content:flex-end}}
 .timeout-detail-cell{display:flex;align-items:center;gap:8px;min-width:210px}
 .timeout-detail-cell .summary{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .timeout-detail-btn{flex:none;border:1px solid #bfdbfe;background:#eff6ff;color:#1d4ed8;
@@ -2250,7 +2528,11 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
     </div>
 
     <div class="panel">
-      <div class="hd"><b>最近结果</b>
+      <div class="hd"><div><b id="resultTitle">最近结果</b>
+        <span class="result-context" id="resultContext">
+          <span id="resultContextText"></span>
+          <button class="btn ghost" id="currentResults" type="button">返回当前任务</button>
+        </span></div>
         <span class="result-tools">
           <input id="resultSearch" type="search" placeholder="搜索账号"
             autocomplete="off" style="width:180px;padding:5px 9px;font-size:12px">
@@ -2268,6 +2550,8 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
           </select>
           <button class="btn ghost" id="expTxt" style="padding:5px 12px;font-size:12px">导出账号</button>
           <button class="btn ghost" id="expCsv" style="padding:5px 12px;font-size:12px">导出明细</button>
+          <button class="btn ghost" id="taskHistory" type="button"
+            style="padding:5px 12px;font-size:12px">历史任务</button>
           <span class="hint" id="tblHint">实时刷新</span>
         </span>
       </div>
@@ -2308,6 +2592,36 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
     <div class="history-foot">
       <button class="btn ghost" id="cancelHistory" type="button">取消</button>
       <button class="btn danger" id="deleteAccountFiles" type="button" disabled>删除已选</button>
+    </div>
+  </div>
+</div>
+
+<div class="history-modal" id="taskHistoryModal" aria-hidden="true">
+  <div class="history-dialog task-history-dialog" role="dialog" aria-modal="true"
+       aria-labelledby="taskHistoryTitle">
+    <div class="history-head">
+      <div><b id="taskHistoryTitle">历史任务</b>
+        <div class="hint">任务摘要独立保存，结果按需分页读取</div></div>
+      <button class="btn ghost" id="closeTaskHistory" type="button">关闭</button>
+    </div>
+    <div class="history-toolbar">
+      <div class="task-history-search">
+        <input id="taskHistorySearch" type="search" placeholder="搜索文件名或任务编号"
+          autocomplete="off">
+        <button class="btn ghost" id="taskHistorySearchBtn" type="button">查询</button>
+      </div>
+      <span class="hint" id="taskHistoryCount">--</span>
+    </div>
+    <div class="task-history-list" id="taskHistoryList">
+      <div class="history-empty">正在读取历史任务…</div>
+    </div>
+    <div class="history-foot">
+      <div class="task-history-pager">
+        <button class="btn ghost" id="taskHistoryPrev" type="button">上一页</button>
+        <span id="taskHistoryPage">第 1 / 1 页</span>
+        <button class="btn ghost" id="taskHistoryNext" type="button">下一页</button>
+      </div>
+      <button class="btn ghost" id="dismissTaskHistory" type="button">关闭</button>
     </div>
   </div>
 </div>
@@ -2717,6 +3031,8 @@ async function start(){
 }
 function resetResultsForNewTask(total){
   HIST = null;
+  RESULT_TASK_ID = '';
+  RESULT_TASK_LABEL = '';
   RESULT_QUERY = '';
   RESULT_PAGE = 1;
   $('filter').value = 'all';
@@ -2725,6 +3041,7 @@ function resetResultsForNewTask(total){
   $('resultPageInfo').textContent = '第 1 / 1 页';
   $('resultPrev').disabled = true;
   $('resultNext').disabled = true;
+  updateResultContext();
   LAST = {running:true, finished:false, total:Number(total)||0, done:0, recent:[]};
   renderRows();
 }
@@ -2779,7 +3096,8 @@ for(const id of TASK_CHECK_FIELDS){
 /* ---- 导出 ---- */
 function exportAs(fmt){
   const st = $('filter').value;
-  const url = `/api/export?status=${encodeURIComponent(st)}&fmt=${fmt}`;
+  const task = RESULT_TASK_ID ? `&task_id=${encodeURIComponent(RESULT_TASK_ID)}` : '';
+  const url = `/api/export?status=${encodeURIComponent(st)}&fmt=${fmt}${task}`;
   const a = document.createElement('a');
   a.href = url; a.download = '';
   document.body.appendChild(a); a.click(); a.remove();
@@ -2809,6 +3127,126 @@ $('resultPrev').onclick = () => {
 $('resultNext').onclick = () => {
   if(!HIST || !HIST.has_next) return;
   RESULT_PAGE += 1; loadHistory($('filter').value || 'all');
+};
+
+/* ---- 历史任务：摘要分页，结果仍复用主表的服务端分页 ---- */
+let TASK_HISTORY_PAGE = 1;
+let TASK_HISTORY_DATA = null;
+function updateResultContext(){
+  const active = Boolean(RESULT_TASK_ID);
+  $('resultTitle').textContent = active ? '历史结果' : '最近结果';
+  if(active) $('resultContext').classList.add('show');
+  else $('resultContext').classList.remove('show');
+  $('resultContextText').textContent = active ? (RESULT_TASK_LABEL || RESULT_TASK_ID) : '';
+}
+function taskStatusLabel(status){
+  return ({running:'运行中',complete:'已完成',incomplete:'未完成',stopped:'已停止',
+           archived:'历史结果'})[status] || status || '历史结果';
+}
+function taskTime(value){
+  const stamp = Number(value||0) * 1000;
+  if(!stamp) return '--';
+  return new Date(stamp).toLocaleString('zh-CN', {hour12:false});
+}
+function taskHistoryRow(item){
+  const done = item.done == null ? '--' : num(item.done);
+  const total = item.total == null ? '--' : num(item.total);
+  const concurrency = item.threads == null ? '--' :
+    `${num(item.processes||1)} 进程 × ${num(item.threads)} 线程`;
+  const elapsed = item.elapsed == null ? '--' : `${Number(item.elapsed).toFixed(1)} 秒`;
+  const size = `${(Number(item.bytes||0)/1048576).toFixed(1)} MB`;
+  return `<div class="task-history-item" data-task-id="${esc(item.id)}">
+    <div class="task-history-main">
+      <div class="task-history-title">
+        <span class="file">${esc(item.account_name||'历史任务')}</span>
+        <span class="task-history-status ${esc(item.status||'')}">${esc(taskStatusLabel(item.status))}</span>
+        ${item.current ? '<span class="task-history-status">当前</span>' : ''}
+      </div>
+      <div class="task-history-meta">
+        <span>${esc(taskTime(item.started_at))}</span><span>${esc(item.id)}</span>
+        <span>${done} / ${total} 条</span><span>${esc(concurrency)}</span>
+        <span>${esc(elapsed)}</span><span>${esc(size)}</span>
+      </div>
+    </div>
+    <div class="task-history-actions">
+      <button class="btn ghost" type="button" data-open-task="${esc(item.id)}">查看结果</button>
+      <button class="btn danger-outline" type="button" data-delete-task="${esc(item.id)}"
+        ${item.status==='running'?'disabled':''}>删除</button>
+    </div>
+  </div>`;
+}
+function setTaskHistoryModal(open){
+  $('taskHistoryModal').classList.toggle('show', open);
+  $('taskHistoryModal').setAttribute('aria-hidden', open ? 'false' : 'true');
+}
+async function loadTaskHistory(page=TASK_HISTORY_PAGE){
+  TASK_HISTORY_PAGE = Math.max(1, Number(page)||1);
+  $('taskHistoryList').innerHTML = '<div class="history-empty">正在读取历史任务…</div>';
+  const query = $('taskHistorySearch').value.trim();
+  try{
+    const data = await (await fetch(`/api/task-history?page=${TASK_HISTORY_PAGE}&limit=20&query=${encodeURIComponent(query)}`)).json();
+    if(data.error) throw new Error(data.error);
+    TASK_HISTORY_DATA = data;
+    TASK_HISTORY_PAGE = Number(data.page||1);
+    $('taskHistoryList').innerHTML = data.rows && data.rows.length
+      ? data.rows.map(taskHistoryRow).join('')
+      : '<div class="history-empty">没有找到历史任务</div>';
+    $('taskHistoryCount').textContent = `共 ${num(data.total)} 个任务`;
+    $('taskHistoryPage').textContent = `第 ${num(data.page||1)} / ${num(data.pages||1)} 页`;
+    $('taskHistoryPrev').disabled = !data.has_prev;
+    $('taskHistoryNext').disabled = !data.has_next;
+  }catch(error){
+    $('taskHistoryList').innerHTML = `<div class="history-empty">读取失败：${esc(error.message||error)}</div>`;
+  }
+}
+function openTaskResult(item){
+  RESULT_TASK_ID = String(item.id||'');
+  RESULT_TASK_LABEL = `${item.account_name||'历史任务'} · ${taskTime(item.started_at)}`;
+  RESULT_QUERY = '';
+  RESULT_PAGE = 1;
+  HIST = null;
+  $('resultSearch').value = '';
+  $('filter').value = 'all';
+  updateResultContext();
+  setTaskHistoryModal(false);
+  loadHistory('all');
+}
+$('taskHistory').onclick = () => { setTaskHistoryModal(true); loadTaskHistory(1); };
+$('closeTaskHistory').onclick = $('dismissTaskHistory').onclick = () => setTaskHistoryModal(false);
+$('taskHistoryModal').addEventListener('click', e => {
+  if(e.target === $('taskHistoryModal')) setTaskHistoryModal(false);
+});
+$('taskHistorySearchBtn').onclick = () => loadTaskHistory(1);
+$('taskHistorySearch').onkeydown = e => {
+  if(e.key === 'Enter'){ e.preventDefault(); loadTaskHistory(1); }
+};
+$('taskHistoryPrev').onclick = () => loadTaskHistory(TASK_HISTORY_PAGE-1);
+$('taskHistoryNext').onclick = () => loadTaskHistory(TASK_HISTORY_PAGE+1);
+$('taskHistoryList').addEventListener('click', async e => {
+  const openButton = e.target.closest && e.target.closest('[data-open-task]');
+  const deleteButton = e.target.closest && e.target.closest('[data-delete-task]');
+  if(openButton){
+    const item = (TASK_HISTORY_DATA.rows||[]).find(row=>row.id===openButton.dataset.openTask);
+    if(item) openTaskResult(item);
+    return;
+  }
+  if(deleteButton){
+    const id = deleteButton.dataset.deleteTask;
+    if(!window.confirm('确定删除这个历史任务及其结果文件？此操作不能撤销。')) return;
+    deleteButton.disabled = true;
+    const result = await post('/api/delete-task-history', {id});
+    if(result.error){ window.alert(result.error); deleteButton.disabled = false; return; }
+    if(RESULT_TASK_ID === id){
+      RESULT_TASK_ID = ''; RESULT_TASK_LABEL = ''; HIST = null; RESULT_PAGE = 1;
+      updateResultContext(); loadHistory($('filter').value || 'all');
+    }
+    loadTaskHistory(TASK_HISTORY_PAGE);
+  }
+});
+$('currentResults').onclick = () => {
+  RESULT_TASK_ID = ''; RESULT_TASK_LABEL = ''; RESULT_QUERY = ''; RESULT_PAGE = 1; HIST = null;
+  $('resultSearch').value = ''; updateResultContext();
+  loadHistory($('filter').value || 'all');
 };
 
 /* ---- 主循环 ---- */
@@ -2955,7 +3393,7 @@ async function tick(){
 
   LAST = d;
   const want = $('filter').value;
-  if(!RESULT_QUERY) loadHistory(want || 'all', true);
+  if(!RESULT_TASK_ID && !RESULT_QUERY) loadHistory(want || 'all', true);
   else if(!HIST) renderRows();
 
   if(d.accounts && d.accounts !== shownAccounts){
@@ -2972,6 +3410,8 @@ let HIST_LOADING = false;
 let HIST_PENDING = null;
 let RESULT_PAGE = 1;
 let RESULT_QUERY = '';
+let RESULT_TASK_ID = '';
+let RESULT_TASK_LABEL = '';
 
 function rowHtml(r, idx){
   const st = r.status || 'unknown';
@@ -3095,10 +3535,12 @@ async function loadHistory(want, quiet=false, requestedPage=RESULT_PAGE, request
   const seq = ++HIST_SEQ;
   if(!quiet) $('tblHint').textContent = '查询中…';
   try{
-    const r = await (await fetch(`/api/results?status=${encodeURIComponent(want)}&limit=100&page=${page}&query=${encodeURIComponent(query)}`)).json();
+    const task = RESULT_TASK_ID ? `&task_id=${encodeURIComponent(RESULT_TASK_ID)}` : '';
+    const r = await (await fetch(`/api/results?status=${encodeURIComponent(want)}&limit=100&page=${page}&query=${encodeURIComponent(query)}${task}`)).json();
     if(seq !== HIST_SEQ) return;
     const stillCurrent = want === ($('filter').value || 'all') &&
-      query === RESULT_QUERY && page === RESULT_PAGE;
+      query === RESULT_QUERY && page === RESULT_PAGE &&
+      String(r.task_id||'') === RESULT_TASK_ID;
     if(!stillCurrent) return;
     const changed = !HIST || HIST.revision !== r.revision ||
       HIST.total !== r.total || HIST.query !== r.query || HIST.page !== r.page;
@@ -3106,6 +3548,7 @@ async function loadHistory(want, quiet=false, requestedPage=RESULT_PAGE, request
     RESULT_PAGE = Number(r.page || 1);
     $('tblHint').textContent = query
       ? `查询到 ${num(r.total)} 条`
+      : RESULT_TASK_ID ? `历史任务共 ${num(r.total)} 条`
       : `共 ${num(r.total)} 条·追加自动刷新`;
     $('resultPageInfo').textContent = `第 ${num(r.page || 1)} / ${num(r.pages || 1)} 页`;
     $('resultPrev').disabled = !r.has_prev;
@@ -3126,7 +3569,8 @@ function renderRows(){
   const want = $('filter').value;
   const query = RESULT_QUERY;
   const useHist = Boolean(HIST && HIST.status === (want || 'all') &&
-                          HIST.query === query && Number(HIST.page||1) === RESULT_PAGE);
+                          HIST.query === query && Number(HIST.page||1) === RESULT_PAGE &&
+                          String(HIST.task_id||'') === RESULT_TASK_ID);
   const rec = useHist ? ((HIST && HIST.rows) || [])
                       : ((LAST && LAST.recent) || []).slice().reverse();
   const base = useHist ? Math.max(0, Number(HIST.total||0) - (RESULT_PAGE-1)*100)
