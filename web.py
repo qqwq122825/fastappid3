@@ -34,7 +34,7 @@ ACCOUNT_STATE = os.path.join(HERE, 'data', 'current-accounts.json')
 TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
-APP_VERSION = '2026.11.28.34'
+APP_VERSION = '2026.11.28.35'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -3017,15 +3017,19 @@ $('timeoutModal').addEventListener('click', e => {
   if(e.target === $('timeoutModal')) setTimeoutDetailModal(false);
 });
 
-async function loadHistory(want, quiet=false){
-  if(HIST_LOADING){ HIST_PENDING = [want, quiet]; return; }
+async function loadHistory(want, quiet=false, requestedPage=RESULT_PAGE, requestedQuery=RESULT_QUERY){
+  const page = Math.max(1, Number(requestedPage)||1);
+  const query = String(requestedQuery||'');
+  if(HIST_LOADING){ HIST_PENDING = [want, quiet, page, query]; return; }
   HIST_LOADING = true;
   const seq = ++HIST_SEQ;
-  const query = RESULT_QUERY;
   if(!quiet) $('tblHint').textContent = '查询中…';
   try{
-    const r = await (await fetch(`/api/results?status=${encodeURIComponent(want)}&limit=100&page=${RESULT_PAGE}&query=${encodeURIComponent(query)}`)).json();
+    const r = await (await fetch(`/api/results?status=${encodeURIComponent(want)}&limit=100&page=${page}&query=${encodeURIComponent(query)}`)).json();
     if(seq !== HIST_SEQ) return;
+    const stillCurrent = want === ($('filter').value || 'all') &&
+      query === RESULT_QUERY && page === RESULT_PAGE;
+    if(!stillCurrent) return;
     const changed = !HIST || HIST.revision !== r.revision ||
       HIST.total !== r.total || HIST.query !== r.query || HIST.page !== r.page;
     HIST = r;
@@ -3035,7 +3039,7 @@ async function loadHistory(want, quiet=false){
       : `共 ${num(r.total)} 条·追加自动刷新`;
     $('resultPageInfo').textContent = `第 ${num(r.page || 1)} / ${num(r.pages || 1)} 页`;
     $('resultPrev').disabled = !r.has_prev;
-    $('resultNext').disabled = !r.has_next || Boolean(query);
+    $('resultNext').disabled = !r.has_next;
     if(changed) renderRows();
   }catch(e){
     if(!quiet){ HIST = null; $('tblHint').textContent = '查询失败'; renderRows(); }
@@ -3043,7 +3047,7 @@ async function loadHistory(want, quiet=false){
     HIST_LOADING = false;
     if(HIST_PENDING){
       const pending = HIST_PENDING; HIST_PENDING = null;
-      loadHistory(pending[0], pending[1]);
+      loadHistory(pending[0], pending[1], pending[2], pending[3]);
     }
   }
 }
