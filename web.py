@@ -33,7 +33,7 @@ ACCOUNT_STATE = os.path.join(HERE, 'data', 'current-accounts.json')
 TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
-APP_VERSION = '2026.11.28.7'
+APP_VERSION = '2026.11.28.8'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -1692,7 +1692,6 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
 
       <div class="field">
         <label class="chk"><input type="checkbox" id="vweb"> GSA 判 au=repair 时用 web 复核</label>
-        <label class="chk" style="margin-top:8px"><input type="checkbox" id="noreg"> 跳过设备注册检查</label>
         <label class="chk" style="margin-top:8px"><input type="checkbox" id="asproxy"> 公共头走代理 <span style="color:var(--amber);font-size:11px">（机房 IP 直连 sidestore 超时时勾）</span></label>
       </div>
 
@@ -2003,7 +2002,6 @@ async function start(){
     processes:+$('processes').value, verify_web:$('vweb').checked,
     per_ip:+$('perip').value, ip_ttl:+$('ttl').value,
     timeout:+$('timeout').value, anisette_timeout:+$('anito').value,
-    no_register:$('noreg').checked,
     retry:+$('retry').value, item_timeout:+$('itemto').value,
     anisette_proxy:$('asproxy').checked,
     device_max_uses:+$('deviceMaxUses').value};

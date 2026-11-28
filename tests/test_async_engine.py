@@ -540,8 +540,10 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('startup.public_header_waiting', web.PAGE)
         self.assertIn('startup.threads_created', web.PAGE)
         self.assertIn('startup.business_inflight', web.PAGE)
-        self.assertIn('id="versionTag">v2026.11.28.7', web.PAGE)
+        self.assertIn('id="versionTag">v2026.11.28.8', web.PAGE)
         self.assertIn('id="mStages">线程阶段 --', web.PAGE)
+        self.assertNotIn('id="noreg"', web.PAGE)
+        self.assertNotIn("no_register:$('noreg').checked", web.PAGE)
 
     def test_start_publishes_device_scan_before_worker_spawn(self):
         from pathlib import Path
