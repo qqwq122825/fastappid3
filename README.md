@@ -1,39 +1,56 @@
-# GSA 快速校验（极简模型）
+# ID 校验
 
-一线程 = 一条 SOCKS5 + 一台设备 + 一条长连接，账号按线程预切分，IP 走池。
-单条 CPU 约 6.6 ms，4 核上限约 600 条/秒。
+当前生产模型是 **Python 多进程 + 线程**：
 
-## 快速开始
+```text
+web.py  →  run_mp.py  →  simple.py  →  fastcheck/ + gsafast/ippool.py
+  UI          进程分片          线程工作器          协议/设备/IP 池
+```
+
+## 快速启动
 
 ```bash
 python3 -m venv .venv
+.venv/bin/pip install -U pip
 .venv/bin/pip install -r requirements.txt
-# 编辑 secrets.json 填入代理接口
-.venv/bin/python simple.py --accounts data/accounts.txt --threads 1000 --limit 0
+export GSA_PASSWORD='请设置强密码'
+.venv/bin/python web.py --host 0.0.0.0 --port 8600
 ```
 
-详细部署（Linux 4 核 4G）见 **DEPLOY.md**。
+打开 `http://服务器IP:8600`，在页面中保存代理接口、上传/选择账号文件后开始任务。
 
-## 三个入口
+## 主要文件
 
-| 脚本 | 用途 |
+| 路径 | 用途 |
 |---|---|
-| `simple.py` | 单进程，1 核，约 30-33 万/小时 |
-| `run_mp.py` | 多进程，按 CPU 核数吃满，约 60 万/小时 |
-| `web.py` | 图形控制台，上传账号 + 设线程 + 实时看板 |
+| `web.py` | Web 控制台、配置持久化、任务启停、状态/结果展示 |
+| `run_mp.py` | 多进程分片、状态汇总 |
+| `simple.py` | 生产线程工作器 |
+| `fastcheck/` | Apple GSA/IDMSA、SRP、TLS、设备协议 |
+| `gsafast/ippool.py` | 进程内 IP 池 |
+| `simple_async.py` | 异步实验实现，非当前 Web 生产入口 |
+| `tests/` | 安全、并发、设备、状态回归测试 |
+| `DEPLOY.md` | 环境依赖、首次部署、systemd、更新和回滚 |
 
-## 关键参数
+## 数据与密钥
 
-| 参数 | 说明 |
-|---|---|
-| `--threads` | 每进程线程数，建议 500-1000 |
-| `--per-ip` | 一条 IP 跑几条账号，默认 6 |
-| `--limit` | 跑多少条，0 = 全部 |
-| `--processes` | （run_mp）进程数 = CPU 核数 |
-| `--verify-web` | GSA 判 `au=repair` 时用 web 协议细化 |
+`data/`、`secrets.json`、`.env` 均为本地/服务器运行数据，已被 Git 忽略，不应提交。
 
-## 输出
+```text
+data/uploads/                 上传的账号文件
+data/current-accounts.json    当前选中文件
+data/devices-simple/          持久设备池
+data/live.json                实时状态
+data/mp-p*.jsonl              分进程结果
+data/web.log                  Web 日志
+secrets.json                  代理 API（页面保存）
+```
 
-- `data/live.json` — 实时状态（进度/速度/CPU/状态分布）
-- `data/simple-run.jsonl` 或 `data/mp-p*.jsonl` — 逐条结果
-- 状态口径与 `fastcheck` 原始项目一致（`result_bucket`）
+## 测试
+
+```bash
+.venv/bin/python -m unittest discover -s tests -p 'test_*.py'
+python3 -m py_compile web.py run_mp.py simple.py
+```
+
+完整部署说明见 [DEPLOY.md](DEPLOY.md)。

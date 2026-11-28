@@ -287,7 +287,7 @@ class ConsoleRequestTests(unittest.TestCase):
             self.assertEqual(3, state['device_registered'])
             self.assertEqual(3, state['device_ready'])
             self.assertEqual(3, state['device_total'])
-            self.assertEqual('2026.11.28.23', state['version'])
+            self.assertEqual('2026.11.28.24', state['version'])
 
     def test_linux_process_group_cpu_sums_parent_and_children(self):
         parent = '1 (parent) S 0 77 0 0 0 0 0 0 0 0 200 100 0 0 0 0 0 0 0 0\n'
@@ -421,6 +421,37 @@ class ConsoleRequestTests(unittest.TestCase):
                                   web.delete_account_file('fixture.txt')['error'])
             self.assertTrue(os.path.exists(default))
             self.assertTrue(os.path.exists(cached))
+
+    def test_cached_account_batch_delete_validates_all_then_deletes_selected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            uploads = os.path.join(directory, 'uploads')
+            os.makedirs(uploads)
+            first = os.path.join(uploads, '1790000000-first.txt')
+            second = os.path.join(uploads, '1790000100-second.txt')
+            keep = os.path.join(uploads, '1790000200-keep.txt')
+            for path in (first, second, keep):
+                with open(path, 'w', encoding='utf-8') as handle:
+                    handle.write('fixture@example.com----password\n')
+            state_file = os.path.join(directory, 'current-accounts.json')
+            state = dict(web.STATE)
+            state.update(accounts=first, pending_accounts=None, take_pending=False)
+            patches = (patch.object(web, 'UPLOAD_DIR', uploads),
+                       patch.object(web, 'DEFAULT_ACCOUNTS', os.path.join(directory, 'accounts.txt')),
+                       patch.object(web, 'ACCOUNT_STATE', state_file),
+                       patch.object(web, 'STATE', state),
+                       patch.object(web, 'is_running', return_value=False))
+            with patches[0], patches[1], patches[2], patches[3], patches[4]:
+                rejected = web.delete_account_files([os.path.basename(first), '../bad.txt'])
+                self.assertIn('不存在', rejected['error'])
+                self.assertTrue(os.path.exists(first))
+                result = web.delete_account_files(
+                    [os.path.basename(first), os.path.basename(second), os.path.basename(first)])
+            self.assertTrue(result['ok'])
+            self.assertEqual(2, result['deleted_count'])
+            self.assertFalse(os.path.exists(first))
+            self.assertFalse(os.path.exists(second))
+            self.assertTrue(os.path.exists(keep))
+            self.assertEqual(os.path.realpath(keep), state['accounts'])
 
     def test_idle_upload_is_cached_and_selected_immediately(self):
         with tempfile.TemporaryDirectory() as directory:

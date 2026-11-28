@@ -1,237 +1,259 @@
-# 部署到 Linux 服务器（4 核 4G）
+# ID 校验：环境与部署说明
 
-## 0. 先看懂 CPU 数字
+> 当前生产入口：`web.py`；默认部署目录：`/www/wwwroot/fast3`；当前对外端口：`8600`。
 
-`top` / 活动监视器的 `%CPU` 是**单个核的百分比**，不是整机。
+## 1. 架构
 
+```text
+浏览器
+  └─ web.py（配置/上传/任务/状态）
+       ├─ 单进程：simple.py
+       └─ 多进程：run_mp.py
+            └─ N 个 simple.py 子进程
+                 ├─ fastcheck/（GSA、IDMSA、SRP、TLS、设备）
+                 └─ gsafast/ippool.py（每进程独立 IP 池）
 ```
-%CPU 97.1%  =  0.97 个核
-4 核整机占用 = 0.97 / 4 = 24%
-```
 
-本程序自报 `CPU 1.75 核` ≈ 活动监视器的 `175%`，两者是同一个量。
-**判断机器跑满没，看 `top` 顶部 `%Cpu(s)` 那一行，不是进程列的 %CPU。**
+Web 页面只填“总线程数”，程序按 8 个进程自动拆分；例如 `800 = 8 × 100`。
 
----
+## 2. 环境要求
 
-## 1. 解压
+### 操作系统
+
+- Linux x86_64（Ubuntu 22.04/24.04、Debian 12 或同类发行版）
+- Python 3.11+，推荐 3.12/3.13
+- Git 2.x
+- 出站能访问代理供应商、Apple HTTPS 端点和 Anisette 提供端
+- 入站仅放行 Web 端口（当前 `8600/tcp`），建议限制管理 IP
+
+### 硬件建议
+
+| 规模 | CPU | 内存 | 建议总并发 |
+|---|---:|---:|---:|
+| 测试 | 2 核 | 4 GB | 100–300 |
+| 常规 | 8 核 | 8 GB | 800–1200 |
+| 高并发 | 16 核+ | 16 GB+ | 逐步压测，不要一次拉满 |
+
+SRP 加速使用 `gmpy2==2.3.2`。实际速度同时受 CPU、内存、出口 RTT、代理质量和远端限流影响。
+
+## 3. 系统依赖
+
+Ubuntu/Debian：
 
 ```bash
-tar xzf gsa-fast.tar.gz -C /opt
-cd /opt/gsa-fast
+sudo apt update
+sudo apt install -y git ca-certificates build-essential pkg-config \
+  python3 python3-venv python3-dev libgmp-dev libmpfr-dev libmpc-dev
+sudo update-ca-certificates
 ```
 
-## 2. 系统调优（**必须先做**）
+Python 包（来自 `requirements.txt`）：
+
+| 包 | 用途 |
+|---|---|
+| `requests` | 同步 HTTP 和连接池 |
+| `PySocks` | SOCKS5 代理 |
+| `gmpy2==2.3.2` | SRP 大数运算加速 |
+| `portalocker` | 设备持久化锁 |
+| `websockets` + `python-socks` | 设备注册 WebSocket 代理 |
+| `aiohttp` + `aiohttp-socks` | 异步实验模块/相关回归测试 |
+
+## 4. 首次部署
 
 ```bash
-# 文件句柄：2000 线程 + socket 需要 6000+ 个 fd，默认 1024 直接报错
-ulimit -n 200000
-cat >> /etc/security/limits.conf <<'EOF'
-* soft nofile 200000
-* hard nofile 200000
-EOF
+sudo mkdir -p /www/wwwroot
+cd /www/wwwroot
+sudo git clone https://github.com/qqwq122825/fastappid3.git fast3
+sudo chown -R "$USER":"$USER" /www/wwwroot/fast3
+cd /www/wwwroot/fast3
 
-cat >> /etc/sysctl.conf <<'EOF'
-net.core.somaxconn = 65535
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.ip_local_port_range = 1024 65535
-fs.file-max = 2097152
-EOF
-sysctl -p
-```
-
-systemd 服务还要加 `LimitNOFILE=200000`。
-
-## 3. 装依赖
-
-```bash
 python3 -m venv .venv
+.venv/bin/pip install -U pip wheel
 .venv/bin/pip install -r requirements.txt
+mkdir -p data/uploads data/devices-simple
 ```
 
-关键三个，缺一不可：
+### 依赖自检
 
-| 包 | 缺了会怎样 |
+```bash
+.venv/bin/python - <<'PY'
+import requests, socks, gmpy2, ssl
+from fastcheck.protocols.srp_auth import SRP_MATH_BACKEND
+print('requests:', requests.__version__)
+print('gmpy2:', gmpy2.version())
+print('SRP:', SRP_MATH_BACKEND)
+print('CA:', len(ssl.create_default_context().get_ca_certs()))
+PY
+```
+
+`SRP` 应显示 `gmpy2`，`CA` 不应为 0。
+
+## 5. 密钥与配置
+
+### 控制台密码
+
+```bash
+export GSA_PASSWORD='换成强密码'
+```
+
+### 代理 API
+
+推荐启动 Web 后在页面中填写并点击“保存接口”。程序把真实地址写入本机 `secrets.json`（权限 `0600`），页面只显示脱敏值。
+
+也可以用环境变量覆盖：
+
+```bash
+export GSA_PROXY_API='http://供应商/iplist?...&num={num}&...'
+```
+
+`{num}` 必须保留。不要提交 `secrets.json`、`.env` 或账号文件。
+
+## 6. 文件句柄与内核参数
+
+2000 级别并发时，文件句柄不应使用默认 1024：
+
+```bash
+ulimit -n 200000
+```
+
+持久配置（按服务器情况调整）：
+
+```bash
+sudo tee /etc/sysctl.d/99-fast3.conf >/dev/null <<'SYSCTL'
+fs.file-max = 2097152
+net.core.somaxconn = 65535
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_tw_reuse = 1
+SYSCTL
+sudo sysctl --system
+```
+
+## 7. 手动启动
+
+```bash
+cd /www/wwwroot/fast3
+export GSA_PASSWORD='换成强密码'
+nohup .venv/bin/python web.py --host 0.0.0.0 --port 8600 \
+  >> data/web.log 2>&1 &
+```
+
+检查：
+
+```bash
+pgrep -af 'web.py.*--port 8600'
+curl -fsS http://127.0.0.1:8600/ | grep -o 'v[0-9.]*' | head -1
+tail -n 100 data/web.log
+```
+
+## 8. systemd（推荐）
+
+```bash
+sudo tee /etc/fast3.env >/dev/null <<'ENV'
+GSA_PASSWORD=换成强密码
+ENV
+sudo chmod 600 /etc/fast3.env
+
+sudo tee /etc/systemd/system/fast3.service >/dev/null <<'UNIT'
+[Unit]
+Description=Fast3 ID verification console
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www
+Group=www
+WorkingDirectory=/www/wwwroot/fast3
+EnvironmentFile=/etc/fast3.env
+ExecStart=/www/wwwroot/fast3/.venv/bin/python web.py --host 0.0.0.0 --port 8600
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=200000
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now fast3
+sudo systemctl status fast3 --no-pager
+```
+
+如服务器运行用户不是 `www`，同步修改 `User`/`Group`，并确保它可读写项目和 `data/`。
+
+## 9. 防火墙
+
+```bash
+# UFW 示例：只允许管理 IP
+sudo ufw allow from <你的管理IP> to any port 8600 proto tcp
+```
+
+云服务器安全组也要做相同限制。不建议把未加 TLS 的 `8600` 对全网开放；生产建议放在 Nginx HTTPS 反向代理后面。
+
+## 10. 更新、测试和回滚
+
+### 更新
+
+```bash
+cd /www/wwwroot/fast3
+git fetch origin
+git pull --ff-only origin main
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python -m unittest discover -s tests -p 'test_*.py'
+sudo systemctl restart fast3
+```
+
+### 回滚
+
+```bash
+cd /www/wwwroot/fast3
+git log --oneline -10
+git checkout <已验证的提交>
+sudo systemctl restart fast3
+```
+
+故障处理完成后，再执行 `git switch main && git pull --ff-only` 恢复跟随主分支。
+
+## 11. 运行数据与备份
+
+更新代码不要删除：
+
+```text
+data/uploads/                 历史账号文件
+data/current-accounts.json    当前文件选择
+data/devices-simple/          持久设备池
+data/*.jsonl                  任务结果
+secrets.json                  代理 API
+```
+
+备份示例：
+
+```bash
+tar czf /root/fast3-data-$(date +%F-%H%M%S).tar.gz \
+  -C /www/wwwroot/fast3 data secrets.json
+```
+
+## 12. 故障排查
+
+```bash
+cd /www/wwwroot/fast3
+bash diag.sh 8600
+cat data/live.json | .venv/bin/python -m json.tool | head -80
+tail -f data/web.log
+```
+
+| 现象 | 检查 |
 |---|---|
-| `gmpy2==2.3.2` | SRP 退化纯 Python，单条 CPU 从 6ms 涨到 13ms |
-| `PySocks` | 代理是 SOCKS5，缺它全部报 `InvalidSchema` |
-| `requests` | 基础 |
+| `Too many open files` | `ulimit -n`、systemd `LimitNOFILE` |
+| `SRP threading` / 速度明显下降 | 确认自检输出 `SRP: gmpy2` |
+| `SOCKSHTTPSConnectionPool` | 代理 IP/端口连接失败；查看供应商成功率 |
+| `public_header:ConnectionError` | Anisette 端点或当前出口不可达 |
+| 本地快、服务器慢 | 对比 CPU、出口 RTT、代理质量、p50/p90 和错误分布 |
+| 页面旧版 | 检查 `git rev-parse --short HEAD`，重启后强制刷新 |
 
-## 4. 三项自检（必须全绿）
+## 13. 安全注意
 
-```bash
-.venv/bin/python -c "from fastcheck.protocols.srp_auth import SRP_MATH_BACKEND as b; print('SRP:', b)"
-# 必须输出 gmpy2
-
-.venv/bin/python -c "import socks; print('PySocks ok')"
-
-.venv/bin/python -c "import ssl; print('CA:', len(ssl.create_default_context().get_ca_certs()))"
-# 必须 100+；是 0 就 apt install -y ca-certificates && update-ca-certificates
-```
-
-## 5. 配代理接口
-
-编辑 `secrets.json`（**不要外传**）：
-
-```json
-{
-  "proxy_api": "http://你的供应商/iplist?custom=xxx&password=xxx&num={num}&re_type=1&lb=1&region=any"
-}
-```
-
-`{num}` 必须保留。也可用 `export GSA_PROXY_API='...'` 覆盖。
-
-## 6. 放账号
-
-```bash
-mkdir -p data
-cp /path/to/accounts.txt data/accounts.txt
-head -2 data/accounts.txt          # 必须是 账号----密码
-```
-
-## 7. 开跑（4 核 4G 推荐配置）
-
-```bash
-cd /opt/gsa-fast
-nohup .venv/bin/python run_mp.py \
-  --accounts data/accounts.txt \
-  --processes 2 --threads 1000 \
-  --limit 0 --per-ip 6 --otp-reuse 15 \
-  > data/run.log 2>&1 &
-```
-
-**实测：55-60 万/小时，CPU 1.75 核（4 核的 44%），内存 2.3 GB。**
-
-### 为什么是 2 × 1000，不是 1 × 2000
-
-| 配置 | 总线程 | 吞吐 | 内存 |
-|---|---|---|---|
-| 1 × 1000 | 1,000 | 90 条/秒 | 1.1 GB |
-| **2 × 1000** | **2,000** | **135-166 条/秒** ✅ | **2.3 GB** |
-| 1 × 2000 | 2,000 | **69 条/秒** ❌ 负优化 | 2.3 GB |
-| 2 × 2000 | 4,000 | 更慢 | 4.8 GB ❌ 超内存 |
-
-单进程超过 1200 线程会因 GIL 边际递减。要更高只能加内存。
-
-### 网页控制台（可选）
-
-```bash
-nohup .venv/bin/python web.py --port 8777 > data/web.log 2>&1 &
-# 浏览器打开 http://服务器IP:8777
-```
-
-**⚠ 安全组只放行自己的 IP**，否则任何人都能操作你的任务。
-
-页面上有：文件上传、进程数、线程数、条数、高级参数（每IP条数/IP TTL/超时/公共头并发/跳过注册）。
-改进程或线程时，下方会实时提示是否踩坑。
-
-## 8. 看进度
-
-```bash
-cat data/live.json | python3 -m json.tool | head -25
-tail -f data/run.log
-```
-
-关键字段：
-
-```json
-{
-  "done": 12000, "total": 100047,
-  "rate": 166.41,             // 条/秒
-  "per_hour": 599000,         // 条/小时
-  "proc_cpu_cores": 1.745,    // 整进程 CPU（核）
-  "cpu_cores": 1.05,          // 业务线程 CPU
-  "otp_hit": 1800, "otp_fetch": 120,   // 公共头复用命中/拉取
-  "status": "running",        // complete / incomplete / running
-  "incomplete": 0             // 非 0 = 有任务没跑完
-}
-```
-
-## 9. 实测基准（2 进程 × 1000 线程 / 20000 条）
-
-| 指标 | 数值 |
-|---|---|
-| 吞吐 | **166 条/秒 = 59.9 万/小时**（峰值），均值 55.3 万 |
-| 墙钟 | 130.1 s / 20000 条 |
-| 整进程 CPU | **1.75 核**（4 核的 44%） |
-| 单条 CPU | 6.3 ms |
-| 单条墙钟 p50 | **1,876 ms** |
-| 公共头复用率 | 90%（15 条摊一次） |
-| 状态分布 | wrong_password 87.5% / locked 6.6% / timeout 3.8% |
-
-### 单条 1.87 秒的构成
-
-```
-取 IP          0 ms    （本地队列命中）
-取公共头      40 ms    （15 条摊一次拉取）
-打 Apple   1,830 ms    ← 唯一大头，改不动
-```
-
-## 10. 常见问题
-
-| 现象 | 原因 | 处理 |
-|---|---|---|
-| `Too many open files` | `ulimit -n` 没调 | 见第 2 节 |
-| 全部 `InvalidSchema` | 缺 PySocks | `pip install PySocks` |
-| `SRP: python` | 缺 gmpy2 | `pip install gmpy2==2.3.2` |
-| 全部 `CERTIFICATE_VERIFY_FAILED` | 缺 CA | `apt install ca-certificates` |
-| 首轮速度 0 约 1-2 分钟 | 正在注册设备 | 正常，别删 `data/devices/` |
-| `status: incomplete` | 有任务没跑完 | 看 `data/*.jsonl` 缺哪些 |
-| 速度突然掉一半 | 代理质量波动 | 看 `ip_pool.blocked` 是否上升 |
-| `otp_fetch` 接近 `otp_hit` | `--otp-reuse` 设成 0 了 | 改成 15 |
-
-## 11. 参数说明
-
-| 参数 | 默认 | 说明 |
-|---|---|---|
-| `--processes` | 4 | 进程数，4 核填 2-4 |
-| `--threads` | 500 | 每进程线程数，1000 是甜点 |
-| `--per-ip` | 6 | 一条 IP 跑几条账号，越大越省配额 |
-| `--otp-reuse` | 15 | 一个公共头验几条账号（实测 15 安全，0=每条都换） |
-| `--ip-ttl` | 50 | IP 有效期，供应商给 60 秒就填 50 |
-| `--timeout` | 10 | 单条请求超时 |
-| `--verify-web` | 关 | GSA 判 `au=repair` 时用 web 协议细化 |
-| `--no-register` | 关 | 设备已注册时勾上，启动快 60 秒 |
-
-## 12. 目录说明
-
-```
-simple.py          单进程版
-run_mp.py          多进程版（推荐）
-web.py             网页控制台
-conf.json          默认配置
-secrets.json       代理凭据（勿外传）
-requirements.txt   依赖
-gsafast/           池与调度实现
-data/
-  devices/         设备身份（删了要重新注册，很慢，别删）
-  live.json        实时状态
-  *.jsonl          逐条结果
-  accounts.txt     账号文件
-```
-
----
-
-## 13. 控制台密码
-
-默认密码 **`mtx123`**，浏览器打开直接输。
-
-```bash
-# 改密码
-export GSA_PASSWORD='你的密码'
-.venv/bin/python web.py --port 8765
-
-# 或命令行指定
-.venv/bin/python web.py --port 8765 --password 你的密码
-```
-
-默认监听 `0.0.0.0`（对外），登录后拿 7 天有效的 cookie。
-密码错 3 次建议在 Nginx 层加限速（可选）。
-
-**其他限制不变：**
-
-| 项 | 限制 |
-|---|---|
-| 上传大小 | 64 MB |
-| `/api/accounts?path=` | 只能读当前任务文件或 `data/uploads/` 下的文件 |
-
+- `secrets.json`、账号文件、结果和设备数据都不得提交 Git。
+- 代理凭据如曾出现在 Git 历史中，仅从新提交删除不够，必须到供应商后台轮换密码/token。
+- 端口限制来源 IP，设置强 `GSA_PASSWORD`，并优先通过 HTTPS 反向代理对外提供。
