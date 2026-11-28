@@ -33,7 +33,7 @@ ACCOUNT_STATE = os.path.join(HERE, 'data', 'current-accounts.json')
 TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
-APP_VERSION = '2026.11.28.21'
+APP_VERSION = '2026.11.28.22'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -306,6 +306,77 @@ def _startup_accounts():
     except OSError:
         pass
     return DEFAULT_ACCOUNTS
+
+
+def _account_file_id(path):
+    """Return the opaque browser-facing identifier for a stored account file."""
+    real = _persistent_account_path(path)
+    if not real:
+        return None
+    if real == os.path.realpath(DEFAULT_ACCOUNTS):
+        return '__default__'
+    return os.path.basename(real)
+
+
+def _resolve_account_file_id(file_id):
+    """Resolve a history selection without accepting a client-supplied path."""
+    file_id = str(file_id or '')
+    if file_id == '__default__':
+        candidate = os.path.realpath(DEFAULT_ACCOUNTS)
+    elif file_id and file_id == os.path.basename(file_id):
+        candidate = os.path.realpath(os.path.join(UPLOAD_DIR, file_id))
+    else:
+        return None
+    return candidate if _persistent_account_path(candidate) and os.path.isfile(candidate) else None
+
+
+def account_file_history():
+    """List cached server uploads newest-first without exposing server paths."""
+    paths = []
+    if os.path.isfile(DEFAULT_ACCOUNTS):
+        paths.append(os.path.realpath(DEFAULT_ACCOUNTS))
+    try:
+        paths.extend(os.path.realpath(os.path.join(UPLOAD_DIR, name))
+                     for name in os.listdir(UPLOAD_DIR))
+    except OSError:
+        pass
+    selected = (STATE.get('pending_accounts') if STATE.get('take_pending')
+                else STATE.get('accounts'))
+    selected = os.path.realpath(selected) if selected else ''
+    files = []
+    for path in paths:
+        if not _persistent_account_path(path) or not os.path.isfile(path):
+            continue
+        try:
+            stat = os.stat(path)
+        except OSError:
+            continue
+        stored_name = os.path.basename(path)
+        display_name = re.sub(r'^\d{9,}-', '', stored_name) or stored_name
+        files.append({'id': _account_file_id(path), 'name': display_name,
+                      'stored_name': stored_name, 'size': stat.st_size,
+                      'uploaded_at': time.strftime('%Y-%m-%d %H:%M:%S',
+                                                   time.localtime(stat.st_mtime)),
+                      'selected': path == selected})
+    files.sort(key=lambda row: row['uploaded_at'], reverse=True)
+    return {'files': files, 'selected': _account_file_id(selected),
+            'running': is_running()}
+
+
+def select_account_file(file_id):
+    """Select one cached upload for the next run and persist that choice."""
+    if is_running():
+        return {'error': '任务运行中，请停止后再切换账号文件'}
+    path = _resolve_account_file_id(file_id)
+    if not path:
+        return {'error': '历史账号文件不存在或已被移除'}
+    STATE['accounts'] = path
+    STATE['pending_accounts'] = None
+    STATE['take_pending'] = False
+    _remember_accounts(path)
+    info = dict(analyse_accounts(path))
+    info.update(selected=True, file_id=_account_file_id(path))
+    return info
 
 
 def _cookie_token():
@@ -1145,6 +1216,8 @@ class Handler(BaseHTTPRequestHandler):
             if not _path_allowed(target):
                 return self._json({'error': '只允许读取当前任务文件或 uploads 目录下的文件'})
             return self._json(analyse_accounts(target))
+        if self.path.startswith('/api/account-files'):
+            return self._json(account_file_history())
         if self.path.startswith('/api/state'):
             return self._json({'running': is_running(),
                                'accounts': STATE['accounts'],
@@ -1442,6 +1515,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({'error': '请先输入密码', 'need_login': True})
         if self.path.startswith('/api/upload'):
             return self._json(self._upload(payload))
+        if self.path.startswith('/api/select-account-file'):
+            return self._json(select_account_file(payload.get('id')))
         if self.path.startswith('/api/start'):
             with _LOCK:
                 result = start_job(payload.get('accounts') or STATE['accounts'],
@@ -1481,9 +1556,14 @@ class Handler(BaseHTTPRequestHandler):
         path = os.path.join(UPLOAD_DIR, f'{int(time.time())}-{safe}')
         with open(path, 'w', encoding='utf-8') as handle:
             handle.write(content)
-        # 不改 STATE['accounts']：正在跑的任务还在用旧文件，页面不能把新文件显示成当前
-        STATE['pending_accounts'] = path
-        STATE['take_pending'] = True
+        # 空闲时立即选中新上传文件；运行中则只缓存为下一轮，绝不改变当前任务输入。
+        if is_running():
+            STATE['pending_accounts'] = path
+            STATE['take_pending'] = True
+        else:
+            STATE['accounts'] = path
+            STATE['pending_accounts'] = None
+            STATE['take_pending'] = False
         _remember_accounts(path)
         _ACCOUNT_CACHE.clear()
         info = analyse_accounts(path)
@@ -1512,7 +1592,7 @@ def tail_log(lines=4, window=65536):
 PAGE = r"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>GSA 校验控制台</title>
+<title>ID 校验</title>
 <style>
 :root{--bg:#f5f7fa;--card:#fff;--line:#e5e7eb;--fg:#111827;--dim:#6b7280;
 --blue:#2563eb;--green:#16a34a;--amber:#d97706;--red:#dc2626;--gray:#9ca3af}
@@ -1633,7 +1713,7 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
 </style></head><body>
 
 <div class="top">
-  <h1>GSA 校验控制台</h1>
+  <h1>ID 校验</h1>
   <span class="tag">py模型</span>
   <span class="tag" id="versionTag">v__APP_VERSION__</span>
   <div class="right">
@@ -1660,6 +1740,9 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
 
       <div class="field">
         <label>账号文件 <b id="accName">未选择</b></label>
+        <select id="accountHistory" style="margin-bottom:8px">
+          <option value="">选择服务器历史文件</option>
+        </select>
         <div class="drop" id="drop">点击或拖入 .txt（账号----密码）</div>
         <input type="file" id="file" accept=".txt,.csv" style="display:none">
         <div class="hint" id="accInfo"></div>
@@ -1959,6 +2042,7 @@ async function upload(file){
     catch(e){ throw new Error(`服务返回 HTTP ${response.status}：${text.slice(0,120)}`); }
     if(!response.ok || res.error) throw new Error(res.error || `HTTP ${response.status}`);
     renderAccounts(res);
+    await loadAccountHistory();
     status.style.color = 'var(--green)';
     $('hint').textContent = `已上传 ${res.name}：${num(res.total)} 条`;
     $('hint').style.color = 'var(--green)';
@@ -1978,6 +2062,39 @@ function renderAccounts(a){
   $('accInfo').textContent = `${num(a.total)} 条`
     + (a.format_error ? ` · 格式异常 ${a.format_error}` : '');
 }
+
+async function loadAccountHistory(){
+  try{
+    const data = await (await fetch('/api/account-files?t='+Date.now())).json();
+    const select = $('accountHistory');
+    const options = ['<option value="">选择服务器历史文件</option>'];
+    for(const file of (data.files||[])){
+      const mb = (Number(file.size||0)/1048576).toFixed(1);
+      const label = `${file.name} · ${file.uploaded_at} · ${mb} MB`;
+      options.push(`<option value="${esc(file.id)}">${esc(label)}</option>`);
+    }
+    select.innerHTML = options.join('');
+    select.value = data.selected || '';
+    select.disabled = Boolean(data.running);
+  }catch(e){}
+}
+
+$('accountHistory').addEventListener('change', async e => {
+  const id = e.target.value;
+  if(!id) return;
+  const result = await post('/api/select-account-file', {id});
+  if(result.error){
+    $('accInfo').textContent = result.error;
+    $('accInfo').style.color = 'var(--red)';
+    await loadAccountHistory();
+    return;
+  }
+  shownAccounts = result.path || shownAccounts;
+  renderAccounts(result);
+  $('accInfo').style.color = 'var(--green)';
+  $('hint').textContent = `已选择服务器文件：${result.name}`;
+  $('hint').style.color = 'var(--green)';
+});
 
 /* ---- 启停 ---- */
 async function post(url, body){
@@ -2281,6 +2398,7 @@ async function tick(){
   if(typeof d.running === 'boolean'){
     $('start').disabled = d.running;
     $('stop').disabled = !d.running;
+    $('accountHistory').disabled = d.running;
   }
   $('modeHint').textContent = startupActive
     ? (startup.message || '正在初始化')
@@ -2394,7 +2512,7 @@ async function loadAccounts(path){
   const a = await (await fetch('/api/accounts?t='+Date.now()+q)).json();
   renderAccounts(a);
 }
-restoreTaskSettings(); loadAccounts(); tick(); setInterval(tick, 1000);
+restoreTaskSettings(); loadAccounts(); loadAccountHistory(); tick(); setInterval(tick, 1000);
 </script></body></html>"""
 PAGE = PAGE.replace('__APP_VERSION__', APP_VERSION)
 

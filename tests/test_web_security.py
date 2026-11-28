@@ -287,7 +287,7 @@ class ConsoleRequestTests(unittest.TestCase):
             self.assertEqual(3, state['device_registered'])
             self.assertEqual(3, state['device_ready'])
             self.assertEqual(3, state['device_total'])
-            self.assertEqual('2026.11.28.21', state['version'])
+            self.assertEqual('2026.11.28.22', state['version'])
 
     def test_linux_process_group_cpu_sums_parent_and_children(self):
         parent = '1 (parent) S 0 77 0 0 0 0 0 0 0 0 200 100 0 0 0 0 0 0 0 0\n'
@@ -329,6 +329,65 @@ class ConsoleRequestTests(unittest.TestCase):
         response = handler._do_post()
         self.assertTrue(response.get('need_login'))
         handler._upload.assert_not_called()
+
+    def test_cached_account_history_uses_opaque_ids_and_selects_persistently(self):
+        with tempfile.TemporaryDirectory() as directory:
+            uploads = os.path.join(directory, 'uploads')
+            os.makedirs(uploads)
+            old = os.path.join(uploads, '1790000000-old.txt')
+            new = os.path.join(uploads, '1790000100-new.txt')
+            for path, account in ((old, 'old@example.com'), (new, 'new@example.com')):
+                with open(path, 'w', encoding='utf-8') as handle:
+                    handle.write(f'{account}----password\n')
+            state_file = os.path.join(directory, 'current-accounts.json')
+            state = dict(web.STATE)
+            state.update(accounts=old, pending_accounts=None, take_pending=False)
+            with patch.object(web, 'UPLOAD_DIR', uploads), \
+                 patch.object(web, 'DEFAULT_ACCOUNTS', os.path.join(directory, 'accounts.txt')), \
+                 patch.object(web, 'ACCOUNT_STATE', state_file), \
+                 patch.object(web, 'STATE', state), \
+                 patch.object(web, 'is_running', return_value=False):
+                history = web.account_file_history()
+                self.assertEqual({'1790000000-old.txt', '1790000100-new.txt'},
+                                 {row['id'] for row in history['files']})
+                self.assertTrue(all('path' not in row for row in history['files']))
+                selected = web.select_account_file('1790000100-new.txt')
+                self.assertTrue(selected['selected'])
+                self.assertEqual(os.path.realpath(new), state['accounts'])
+                with open(state_file, encoding='utf-8') as handle:
+                    self.assertEqual(os.path.realpath(new), json.load(handle)['accounts'])
+
+    def test_cached_account_selection_rejects_traversal_and_running_switch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            uploads = os.path.join(directory, 'uploads')
+            os.makedirs(uploads)
+            path = os.path.join(uploads, 'fixture.txt')
+            with open(path, 'w', encoding='utf-8') as handle:
+                handle.write('fixture@example.com----password\n')
+            with patch.object(web, 'UPLOAD_DIR', uploads), \
+                 patch.object(web, 'DEFAULT_ACCOUNTS', os.path.join(directory, 'accounts.txt')):
+                self.assertIsNone(web._resolve_account_file_id('../fixture.txt'))
+                with patch.object(web, 'is_running', return_value=True):
+                    self.assertIn('任务运行中', web.select_account_file('fixture.txt')['error'])
+
+    def test_idle_upload_is_cached_and_selected_immediately(self):
+        with tempfile.TemporaryDirectory() as directory:
+            uploads = os.path.join(directory, 'uploads')
+            state_file = os.path.join(directory, 'current-accounts.json')
+            state = dict(web.STATE)
+            state.update(accounts='', pending_accounts=None, take_pending=False)
+            handler = make_handler('/api/upload')
+            with patch.object(web, 'UPLOAD_DIR', uploads), \
+                 patch.object(web, 'DEFAULT_ACCOUNTS', os.path.join(directory, 'accounts.txt')), \
+                 patch.object(web, 'ACCOUNT_STATE', state_file), \
+                 patch.object(web, 'STATE', state), \
+                 patch.object(web, 'is_running', return_value=False), \
+                 patch.object(web.time, 'time', return_value=1790000200):
+                result = handler._upload({'name': 'batch.txt',
+                                          'content': 'fixture@example.com----password\n'})
+            self.assertTrue(result['uploaded'])
+            self.assertTrue(state['accounts'].endswith('1790000200-batch.txt'))
+            self.assertFalse(state['take_pending'])
 
     def test_export_filename_does_not_accept_header_control_characters(self):
         for status in ('all\r\nX-Fixture: marker', '\u96ea', 'x' * 500):
