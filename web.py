@@ -33,7 +33,7 @@ ACCOUNT_STATE = os.path.join(HERE, 'data', 'current-accounts.json')
 TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
-APP_VERSION = '2026.11.28.11'
+APP_VERSION = '2026.11.28.12'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -1623,7 +1623,7 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
 <div class="layout">
   <!-- 左：任务设置 -->
   <div class="panel">
-    <div class="hd"><b>任务设置</b><span class="tag" id="modeTag">单进程</span></div>
+    <div class="hd"><b>任务设置</b></div>
     <div class="bd">
       <div class="field">
         <label>代理接口 <b id="apiState">未配置</b></label>
@@ -2086,7 +2086,6 @@ function refreshHint(){
     : `${p} 进程 × ${t} 线程 = ${total} 并发`
       + (total!==requested ? `（输入 ${requested}，向上均分）` : '');
   $('rechint').style.color = warn.length ? 'var(--amber)' : 'var(--dim)';
-  $('modeTag').textContent = p>1 ? `${p} 进程` : '单进程';
   $('rechint').style.color = warn.length ? 'var(--amber)' : 'var(--dim)';
 }
 $('totalConcurrency').addEventListener('input', refreshHint);
