@@ -33,7 +33,7 @@ ACCOUNT_STATE = os.path.join(HERE, 'data', 'current-accounts.json')
 TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
-APP_VERSION = '2026.11.28.10'
+APP_VERSION = '2026.11.28.11'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -1642,13 +1642,9 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
       </div>
 
       <div class="field">
-        <label>并发</label>
-        <div class="row2">
-          <div><input type="number" id="processes" value="8" min="1" max="8" placeholder="进程数">
-            <div class="hint">进程数（默认 8）</div></div>
-          <div><input type="number" id="totalConcurrency" value="800" min="1" max="16000" placeholder="总并发">
-            <div class="hint">总并发（自动平均到各进程）</div></div>
-        </div>
+        <label>线程数（总并发）</label>
+        <input type="number" id="totalConcurrency" value="800" min="1" max="16000" placeholder="例如 800">
+        <input type="hidden" id="processes" value="8">
         <input type="hidden" id="threads" value="100">
         <div class="hint" id="rechint"></div>
       </div>
@@ -2093,7 +2089,7 @@ function refreshHint(){
   $('modeTag').textContent = p>1 ? `${p} 进程` : '单进程';
   $('rechint').style.color = warn.length ? 'var(--amber)' : 'var(--dim)';
 }
-['processes','totalConcurrency'].forEach(id=>$(id).addEventListener('input', refreshHint));
+$('totalConcurrency').addEventListener('input', refreshHint);
 refreshHint();
 
 /* ---- 导出 ---- */
