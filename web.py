@@ -34,7 +34,7 @@ ACCOUNT_STATE = os.path.join(HERE, 'data', 'current-accounts.json')
 TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
-APP_VERSION = '2026.11.28.36'
+APP_VERSION = '2026.11.28.37'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -1198,6 +1198,13 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
     total = min(limit, account_total) if limit else account_total
     os.makedirs(os.path.dirname(LIVE), exist_ok=True)
     processes = max(1, min(int(processes or 1), 8))
+    # 账号少于配置并发时，不启动空转进程，也不让代理池、设备池按
+    # 800 之类的名义并发预热。每个进程最多承载 threads 个账号；
+    # 最后一批不足时由 run_mp 再把该子进程的线程数缩到实际条数。
+    if total > 0:
+        processes = min(processes, max(1, (total + threads - 1) // threads))
+        if processes == 1:
+            threads = min(threads, total)
     _reset_run_artifacts(processes)
     run_out = os.path.join(HERE, 'data', f'run-{int(time.time())}.jsonl')
     STATE['run_out'] = run_out
@@ -1211,6 +1218,7 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
         'started': time.strftime('%H:%M:%S'), 'elapsed': 0,
         'total': total, 'done': 0, 'rate': 0, 'per_hour': 0,
         'threads': threads, 'processes': processes,
+        'total_threads': min(total, threads * processes),
         'by_status': {}, 'recent': [], 'finished': False,
         'startup': {
             'phase': 'device_scan', 'message': '已接收任务，正在读取设备池',
@@ -2849,8 +2857,12 @@ async function tick(){
   $('backend').style.color = d.backend==='gmpy2' ? 'var(--green)' : 'var(--red)';
   const threads = Number(d.threads) || Number($('threads').value) || 0;
   const processes = Number(d.processes) || Number($('processes').value) || 1;
+  const totalThreads = Number(d.total_threads) || threads * processes;
   $('mThreads').textContent = processes>1
-    ? `${threads} 线程 × ${processes} 进程` : `${threads} 线程`;
+    ? (totalThreads === threads * processes
+      ? `${threads} 线程 × ${processes} 进程`
+      : `总 ${totalThreads} 线程 · ${processes} 进程`)
+    : `${threads} 线程`;
   const procCores = d.proc_cpu_cores ?? d.cpu_cores ?? 0;
   const nowCores = d.proc_cpu_now;
   $('mCpu').textContent = nowCores == null

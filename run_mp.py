@@ -47,9 +47,15 @@ def build_jobs(args, total):
     # 预期总数会算成 200，任务永远停在 incomplete。
     available = max(0, total - args.offset)
     effective = available if not args.limit else min(args.limit, available)
-    per = (effective + args.processes - 1) // args.processes if args.processes else 0
+    requested_processes = max(1, int(args.processes or 1))
+    per_process_threads = max(1, int(args.threads or 1))
+    process_count = min(
+        requested_processes,
+        max(1, (effective + per_process_threads - 1) // per_process_threads),
+    ) if effective else 0
+    per = (effective + process_count - 1) // process_count if process_count else 0
     jobs = []
-    for index in range(args.processes):
+    for index in range(process_count):
         offset = args.offset + index * per
         left = effective - index * per
         count = min(per, left)
@@ -62,6 +68,7 @@ def build_jobs(args, total):
             'index': index,
             'offset': offset,
             'limit': count,
+            'threads': min(per_process_threads, count),
             'slot_base': args.slot_base + index * args.threads,
             'out': result_path,
             'live': os.path.join(DATA, f'live-p{index}.json'),
@@ -86,7 +93,7 @@ def spawn(args, jobs):
     for job in jobs:
         cmd = [PYTHON, WORKER,
                '--accounts', args.accounts,
-               '--threads', str(args.threads),
+               '--threads', str(job['threads']),
                '--offset', str(job['offset']),
                '--limit', str(job['limit']),
                '--slot-base', str(job['slot_base']),
@@ -297,9 +304,10 @@ def merge(jobs, started, expected_total=0, wall_started=None):
         'rate': round(done / elapsed, 2) if elapsed else 0,
         'per_hour': round(done / elapsed * 3600) if elapsed else 0,
         'eta': round((total - done) / (done / elapsed), 0) if done and elapsed else None,
-        # 页面会再显示“每进程线程 × 进程数”，这里必须保留每进程口径，
-        # 不能提前乘一次，否则 2×400 会被误显示成 800×2。
-        'threads': jobs[0].get('threads', 0) if jobs else 0,
+        # 均匀分片时继续显示“每进程线程 × 进程数”；尾批不足时页面
+        # 使用 total_threads 显示真实总线程数，避免 51×2 被误报成 102。
+        'threads': max((job.get('threads', 0) for job in jobs), default=0),
+        'total_threads': sum(job.get('threads', 0) for job in jobs),
         'backend': 'gmpy2', 'engine': 'threading',
         'cpu_seconds': round(cpu, 2),
         'cpu_cores': round(cpu / elapsed, 3) if elapsed else 0,
@@ -417,9 +425,12 @@ def main():
             'phase': 'device_scan', 'message': '正在扫描持久化设备',
             'process_ready': 0, 'process_total': len(jobs),
             'device_discovered': 0, 'device_loaded': 0,
-            'device_ready': 0, 'device_target': len(jobs) * args.threads,
+            'device_ready': 0,
+            'device_target': sum(job['threads'] for job in jobs),
             'proxy_target': 0, 'proxy_fetched': 0, 'proxy_available': 0,
-        }, total=total, threads=args.threads, processes=len(jobs),
+        }, total=total, total_threads=sum(job['threads'] for job in jobs),
+        threads=max((job['threads'] for job in jobs), default=0),
+        processes=len(jobs),
         elapsed=round(time.monotonic() - startup_started, 1))
     persisted_slots = registered_device_slots(
         args.device_root, 'https://new.ani.sidestore.io')
@@ -433,13 +444,17 @@ def main():
             'device_discovered': len(persisted_slots),
             'device_loaded': len(persisted_slots),
             'device_ready': len(persisted_slots),
-            'device_target': len(jobs) * args.threads,
+            'device_target': sum(job['threads'] for job in jobs),
             'proxy_target': 0, 'proxy_fetched': 0, 'proxy_available': 0,
-        }, total=total, threads=args.threads, processes=len(jobs),
+        }, total=total, total_threads=sum(job['threads'] for job in jobs),
+        threads=max((job['threads'] for job in jobs), default=0),
+        processes=len(jobs),
         elapsed=round(time.monotonic() - startup_started, 1))
-    need_slots = args.slot_base + len(jobs) * args.threads
-    print(f'账号总数 {total}，切成 {len(jobs)} 个进程 × {args.threads} 线程 '
-          f'= {len(jobs)*args.threads} 并发，设备池容量按需扩展（参考槽位 1-{need_slots}）')
+    total_threads = sum(job['threads'] for job in jobs)
+    need_slots = max((job['slot_base'] + job['threads'] for job in jobs),
+                     default=args.slot_base)
+    print(f'账号总数 {total}，按需启动 {len(jobs)} 个进程 / {total_threads} 个线程，'
+          f'设备池容量按需扩展（参考槽位 1-{need_slots}）')
     print(f'设备分组：磁盘已注册 {len(persisted_slots)} 台，平均加载到 {len(jobs)} 个进程；'
           '进程之间不共享设备')
     print('线程模式：优先租用本进程内使用次数最少的空闲设备；全部占用才注册新设备；任务结束即归还')
@@ -448,8 +463,6 @@ def main():
                          f'之后没有记录（共 {total} 条）')
     expected_total = sum(job['limit'] for job in jobs)
     procs = spawn(args, jobs)
-    for job in procs:
-        job['threads'] = args.threads
 
     started = time.monotonic()
     wall_started = time.time()

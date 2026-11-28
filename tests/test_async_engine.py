@@ -840,7 +840,7 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('startup.public_header_waiting', web.PAGE)
         self.assertIn('startup.threads_created', web.PAGE)
         self.assertIn('startup.business_inflight', web.PAGE)
-        self.assertIn('id="versionTag">v2026.11.28.36', web.PAGE)
+        self.assertIn('id="versionTag">v2026.11.28.37', web.PAGE)
         self.assertIn('<div class="v v-green" id="sRate">0</div>', web.PAGE)
         self.assertNotIn('<div class="v sm v-green" id="sRate">0</div>', web.PAGE)
         self.assertNotIn('程序会按需要的数量自动替换 num', web.PAGE)
@@ -902,7 +902,9 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(result['ok'])
             self.assertEqual('device_scan', first['startup']['phase'])
             self.assertEqual(1, first['startup']['device_discovered'])
-            self.assertEqual(2, first['startup']['process_total'])
+            self.assertEqual(1, first['startup']['process_total'])
+            self.assertEqual(1, first['threads'])
+            self.assertEqual(1, first['total_threads'])
             self.assertEqual(0, first['startup']['proxy_fetched'])
             popen.assert_called_once()
             command = popen.call_args.args[0]
@@ -910,6 +912,27 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
                          '--register-timeout', '--web-timeout'):
                 self.assertEqual('20.0', command[command.index(flag) + 1])
             self.assertNotIn('--item-timeout', command)
+
+    def test_small_account_batches_shrink_processes_and_child_threads(self):
+        from argparse import Namespace
+        from run_mp import build_jobs
+
+        args = Namespace(offset=0, limit=0, processes=8, result_prefix='',
+                         slot_base=0, threads=100)
+        ten = build_jobs(args, 10)
+        self.assertEqual(1, len(ten))
+        self.assertEqual([10], [job['limit'] for job in ten])
+        self.assertEqual([10], [job['threads'] for job in ten])
+
+        uneven = build_jobs(args, 101)
+        self.assertEqual(2, len(uneven))
+        self.assertEqual([51, 50], [job['limit'] for job in uneven])
+        self.assertEqual([51, 50], [job['threads'] for job in uneven])
+
+        full = build_jobs(args, 800)
+        self.assertEqual(8, len(full))
+        self.assertEqual([100] * 8, [job['limit'] for job in full])
+        self.assertEqual([100] * 8, [job['threads'] for job in full])
 
     def test_result_search_control_queries_backend(self):
         import web
