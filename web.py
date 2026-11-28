@@ -33,7 +33,7 @@ ACCOUNT_STATE = os.path.join(HERE, 'data', 'current-accounts.json')
 TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
-APP_VERSION = '2026.11.28.13'
+APP_VERSION = '2026.11.28.14'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -1659,11 +1659,6 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
       </div>
 
       <div class="field">
-        <label>条数（0 = 全部）</label>
-        <input type="number" id="limit" value="0" min="0">
-      </div>
-
-      <div class="field">
         <label>代理参数</label>
         <div class="row2" style="margin-bottom:10px">
           <div><input type="number" id="perip" value="6" min="1" max="50">
@@ -1967,8 +1962,7 @@ async function upload(file){
 function renderAccounts(a){
   if(!a || a.error){ $('accInfo').textContent = a ? a.error : ''; return; }
   $('accName').textContent = a.name || '';
-  $('accInfo').textContent =
-    `${num(a.total)} 条 · ${a.top_domains?.[0]?.[0]||'--'} · 密码=用户名 ${a.password_equals_ratio}%`
+  $('accInfo').textContent = `${num(a.total)} 条`
     + (a.format_error ? ` · 格式异常 ${a.format_error}` : '');
 }
 
@@ -2012,7 +2006,7 @@ function saveDeviceMaxUses(){
 
 async function start(){
   const deviceMaxUses = saveDeviceMaxUses();
-  const body = {threads:+$('threads').value, limit:+$('limit').value,
+  const body = {threads:+$('threads').value, limit:0,
     processes:+$('processes').value, verify_web:$('vweb').checked,
     per_ip:+$('perip').value, ip_ttl:+$('ttl').value,
     timeout:+$('timeout').value,
