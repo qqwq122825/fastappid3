@@ -103,10 +103,14 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(source.index('identity = fetch_otp()'),
                         source.index('task = retry_tasks.pop() if retry_tasks else take_task()'))
 
-    def test_web_exposes_public_header_timeout(self):
+    def test_web_exposes_one_shared_flow_timeout(self):
         import web
-        self.assertIn('id="anito" value="20"', web.PAGE)
-        self.assertIn("anisette_timeout:+$('anito').value", web.PAGE)
+        self.assertIn('id="timeout" value="20"', web.PAGE)
+        self.assertIn('统一超时/秒（注册设备、公共头、账号验证共用）', web.PAGE)
+        self.assertNotIn('id="anito"', web.PAGE)
+        self.assertNotIn('id="itemto"', web.PAGE)
+        self.assertNotIn("anisette_timeout:+$('anito').value", web.PAGE)
+        self.assertNotIn("item_timeout:+$('itemto').value", web.PAGE)
         self.assertIn('startup.public_header_retries', web.PAGE)
 
     def test_page_grid_cannot_expand_past_the_viewport(self):
@@ -228,7 +232,11 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
                  patch.object(web.subprocess, 'Popen', return_value=Mock(pid=123)) as launch:
                 result = web.start_job(str(accounts), 2, 1)
             self.assertTrue(result['ok'])
-            self.assertEqual('simple.py', Path(launch.call_args.args[0][1]).name)
+            command = launch.call_args.args[0]
+            self.assertEqual('simple.py', Path(command[1]).name)
+            for flag in ('--timeout', '--item-timeout', '--anisette-timeout',
+                         '--register-timeout', '--web-timeout'):
+                self.assertEqual('20.0', command[command.index(flag) + 1])
             self.assertTrue(launch.call_args.kwargs['start_new_session'])
             task = json.loads((root / 'data' / 'task-process.json').read_text())
             self.assertEqual(123, task['pid'])
@@ -540,7 +548,7 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('startup.public_header_waiting', web.PAGE)
         self.assertIn('startup.threads_created', web.PAGE)
         self.assertIn('startup.business_inflight', web.PAGE)
-        self.assertIn('id="versionTag">v2026.11.28.12', web.PAGE)
+        self.assertIn('id="versionTag">v2026.11.28.13', web.PAGE)
         self.assertIn('id="mStages">线程阶段 --', web.PAGE)
         self.assertNotIn('id="noreg"', web.PAGE)
         self.assertNotIn("no_register:$('noreg').checked", web.PAGE)
@@ -582,6 +590,10 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(2, first['startup']['process_total'])
             self.assertEqual(0, first['startup']['proxy_fetched'])
             popen.assert_called_once()
+            command = popen.call_args.args[0]
+            for flag in ('--timeout', '--item-timeout', '--anisette-timeout',
+                         '--register-timeout', '--web-timeout'):
+                self.assertEqual('20.0', command[command.index(flag) + 1])
 
     def test_result_search_control_queries_backend(self):
         import web

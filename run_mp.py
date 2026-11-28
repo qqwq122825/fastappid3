@@ -100,6 +100,7 @@ def spawn(args, jobs):
                '--live', job['live'],
                '--timeout', str(args.timeout),
                '--register-timeout', str(args.register_timeout),
+               '--web-timeout', str(args.web_timeout),
                '--device-max-uses', str(args.device_max_uses),
                '--api', args.api]
         if args.anisette_proxy:
@@ -360,7 +361,8 @@ def main():
     ap.add_argument('--otp-reuse', type=int, default=15, dest='otp_reuse',
                     help='一个公共头验多少条账号（0=每条都换）')
     ap.add_argument('--ip-ttl', type=float, default=50.0, dest='ip_ttl')
-    ap.add_argument('--timeout', type=float, default=10.0)
+    ap.add_argument('--timeout', type=float, default=20.0,
+                    help='统一流程超时：注册设备、公共头、账号验证和单条总预算')
     ap.add_argument('--item-timeout', type=float, default=20.0, dest='item_timeout',
                     help='单条账号墙钟总预算（含重试）')
     ap.add_argument('--retry', type=int, default=2,
@@ -370,6 +372,7 @@ def main():
     ap.add_argument('--anisette-timeout', type=float, default=20.0, dest='anisette_timeout')
     ap.add_argument('--register-timeout', type=float, default=20.0, dest='register_timeout',
                     help='设备初始化总超时，耗尽后剩余账号记为超时')
+    ap.add_argument('--web-timeout', type=float, default=20.0, dest='web_timeout')
     ap.add_argument('--device-max-uses', type=int, default=100, dest='device_max_uses',
                     help='每台设备完成账号数上限，达到后销毁并注册新设备；0=不限')
     ap.add_argument('--no-register', action='store_true', dest='no_register')
@@ -378,6 +381,12 @@ def main():
     ap.add_argument('--verify-web', action='store_true', dest='verify_web',
                     help='GSA 判 au=repair 时用 web 协议细化（透传给子进程）')
     args = ap.parse_args()
+    flow_timeout = max(1.0, float(args.timeout or 20.0))
+    args.timeout = flow_timeout
+    args.item_timeout = flow_timeout
+    args.anisette_timeout = flow_timeout
+    args.register_timeout = flow_timeout
+    args.web_timeout = flow_timeout
 
     if not args.api or '{num}' not in args.api:
         raise SystemExit('没有代理接口：设置 GSA_PROXY_API 环境变量，或写 secrets.json')

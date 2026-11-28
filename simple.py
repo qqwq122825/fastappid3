@@ -568,12 +568,13 @@ def main():
     ap.add_argument('--offset', type=int, default=0, help='从第几条账号开始（多进程切分用）')
     ap.add_argument('--slot-base', type=int, default=0, dest='slot_base',
                     help='设备槽位基址，多进程时各进程不重叠')
-    ap.add_argument('--timeout', type=float, default=25.0)
+    ap.add_argument('--timeout', type=float, default=20.0,
+                    help='统一流程超时：注册设备、公共头、账号验证和单条总预算')
     ap.add_argument('--retries', type=int, default=0,
                     help='协议内重试（同一 IP 同一公共头），一般留 0')
     ap.add_argument('--no-fix-os', action='store_true', dest='no_fix_os',
                     help='不覆盖 macOS 10.12 的设备头（默认会覆盖成 14.0，避免 -23782）')
-    ap.add_argument('--item-timeout', type=float, default=40.0, dest='item_timeout',
+    ap.add_argument('--item-timeout', type=float, default=20.0, dest='item_timeout',
                     help='单条账号的墙钟总预算（含所有重试），超了就判超时放弃')
     ap.add_argument('--retry', type=int, default=2, dest='retry',
                     help='外层重试：http=0 / 5xx / -22421 时换 IP 重来（0=不重试）')
@@ -584,7 +585,7 @@ def main():
                     help='并发请求公共头的上限，0=跟随本进程线程数（不额外限制）')
     ap.add_argument('--verify-web', action='store_true', dest='verify_web',
                     help='GSA 返回 au=repair 时，用 web 协议(idmsa)细分一次')
-    ap.add_argument('--web-timeout', type=float, default=10.0, dest='web_timeout')
+    ap.add_argument('--web-timeout', type=float, default=20.0, dest='web_timeout')
     ap.add_argument('--no-client-cache', action='store_true',
                     help='关闭 Client 复用（每条都新建，用于对照）')
     ap.add_argument('--anisette-proxy', action='store_true',
@@ -611,6 +612,12 @@ def main():
     ap.add_argument('--out', default='./data/simple-run.jsonl')
     ap.add_argument('--live', default='./data/live.json', help='实时状态文件，供页面读取')
     args = ap.parse_args()
+    flow_timeout = max(1.0, float(args.timeout or 20.0))
+    args.timeout = flow_timeout
+    args.item_timeout = flow_timeout
+    args.anisette_timeout = flow_timeout
+    args.register_timeout = flow_timeout
+    args.web_timeout = flow_timeout
     startup_started = time.monotonic()
     startup_state = {
         'phase': 'device_scan', 'message': '正在扫描持久化设备',
@@ -1219,7 +1226,7 @@ def main():
                 _b0 = time.thread_time()
                 info = _shared_device_info(
                     pool, profile, info_cache, info_gate,
-                    max(1.0, max(args.timeout, 20)), proxy=reg_proxy,
+                    args.register_timeout, proxy=reg_proxy,
                     provider_direct=reg_proxy is None)
                 _info_cpu += (time.thread_time() - _b0) * 1000
                 release_anisette_route(reg_proxy, reg_exp, True)
@@ -1246,11 +1253,11 @@ def main():
             from fastcheck.protocols.anisette_v3 import Client
             cached_client = Client(
                 'https://new.ani.sidestore.io',
-                timeout=max(args.timeout, 20),
+                timeout=args.anisette_timeout,
                 store=pool.store(slot, registered=True),
                 client_info=dict(info),
                 provider_direct=True)
-            cached_client.deadline = time.monotonic() + max(args.timeout, 20)
+            cached_client.deadline = time.monotonic() + args.anisette_timeout
         boot['client_ctor'] = (time.thread_time() - _b0) * 1000
 
         def fetch_otp():
@@ -1454,7 +1461,7 @@ def main():
                             mark_worker_stage(tid, 'retry_ip')
                             _t_ip = time.perf_counter()
                             ip_pool.release(tid, proxy, proxy_exp, healthy=False)
-                            proxy, proxy_exp = ip_pool.acquire(tid, wait=20.0)
+                            proxy, proxy_exp = ip_pool.acquire(tid, wait=args.timeout)
                             proxy_failed = False
                             retry_ip_ms.append(round((time.perf_counter() - _t_ip) * 1000, 1))
                             if proxy is None:

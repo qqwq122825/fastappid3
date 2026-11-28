@@ -33,7 +33,7 @@ ACCOUNT_STATE = os.path.join(HERE, 'data', 'current-accounts.json')
 TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
-APP_VERSION = '2026.11.28.12'
+APP_VERSION = '2026.11.28.13'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -814,8 +814,8 @@ def _live_state_uncached():
 
 # ---------------------------------------------------------------- 任务控制
 def start_job(accounts, threads, limit, processes=1, verify_web=False,
-              per_ip=6, ip_ttl=50.0, timeout=25.0, anisette_workers=0,
-              no_register=False, retry=2, item_timeout=40.0, anisette_proxy=False,
+              per_ip=6, ip_ttl=50.0, timeout=20.0, anisette_workers=0,
+              no_register=False, retry=2, item_timeout=20.0, anisette_proxy=False,
               device_max_uses=100, anisette_timeout=20.0):
     if is_running():
         return {'error': '已有任务在跑，先停止'}
@@ -825,6 +825,11 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
     if not os.path.exists(accounts):
         return {'error': f'账号文件不存在: {accounts}'}
     threads = max(1, min(int(threads or 0), MAX_THREADS))
+    # 页面只暴露一个流程超时：注册设备、公共头、账号验证和
+    # 单条总预算使用同一数值。保留旧形参仅为兼容调用方。
+    flow_timeout = max(1.0, float(timeout or 20.0))
+    item_timeout = flow_timeout
+    anisette_timeout = flow_timeout
     limit = max(0, int(limit or 0))
     account_info = analyse_accounts(accounts)
     account_total = max(0, int(account_info.get('total') or 0)
@@ -875,9 +880,11 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
         if verify_web:
             cmd.append('--verify-web')
         cmd += ['--per-ip', str(per_ip), '--ip-ttl', str(ip_ttl),
-                '--timeout', str(timeout), '--retry', str(retry),
+                '--timeout', str(flow_timeout), '--retry', str(retry),
                 '--item-timeout', str(item_timeout),
-                '--anisette-timeout', str(max(1.0, float(anisette_timeout))),
+                '--anisette-timeout', str(flow_timeout),
+                '--register-timeout', str(flow_timeout),
+                '--web-timeout', str(flow_timeout),
                 '--device-max-uses', str(max(0, int(device_max_uses or 0)))]
         # run_mp 不接受 --out，子进程文件名由它自己生成（mp-p*.jsonl）
         if anisette_workers:
@@ -892,9 +899,11 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
                '--live', LIVE, '--limit', str(limit),
                '--out', run_out,
                '--per-ip', str(per_ip), '--ip-ttl', str(ip_ttl),
-               '--timeout', str(timeout), '--retry', str(retry),
+               '--timeout', str(flow_timeout), '--retry', str(retry),
                '--item-timeout', str(item_timeout),
-               '--anisette-timeout', str(max(1.0, float(anisette_timeout))),
+               '--anisette-timeout', str(flow_timeout),
+               '--register-timeout', str(flow_timeout),
+               '--web-timeout', str(flow_timeout),
                '--device-max-uses', str(max(0, int(device_max_uses or 0)))]
         if verify_web:
             cmd.append('--verify-web')
@@ -1438,15 +1447,15 @@ class Handler(BaseHTTPRequestHandler):
                                    bool(payload.get('verify_web')),
                                    int(payload.get('per_ip') or 6),
                                    float(payload.get('ip_ttl') or 50),
-                                   float(payload.get('timeout') or 25),
+                                   float(payload.get('timeout') or 20),
                                    int(payload.get('anisette_workers') or 0),
                                    bool(payload.get('no_register')),
                                    int(payload.get('retry') if payload.get('retry') is not None else 2),
-                                   float(payload.get('item_timeout') or 40),
+                                   float(payload.get('timeout') or 20),
                                    bool(payload.get('anisette_proxy')),
                                    int(payload.get('device_max_uses')
                                        if payload.get('device_max_uses') is not None else 100),
-                                   float(payload.get('anisette_timeout') or 20))
+                                   float(payload.get('timeout') or 20))
             return self._json(result)
         if self.path.startswith('/api/stop'):
             with _LOCK:
@@ -1665,21 +1674,12 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
         <div class="row2">
           <div><input type="number" id="otpreuse" value="15" min="0" max="50">
             <div class="hint">公共头复用次数</div></div>
-          <div><input type="number" id="anito" value="20" min="3" max="60">
-            <div class="hint">公共头超时/秒（线程独立重取）</div></div>
-        </div>
-        <div class="row2" style="margin-top:10px">
-          <div><input type="number" id="timeout" value="25" min="3" max="60">
-            <div class="hint">业务请求超时/秒</div></div>
           <div><input type="number" id="retry" value="2" min="0" max="5">
             <div class="hint">重试次数</div></div>
         </div>
         <div style="margin-top:10px">
-          <div><input type="number" id="itemto" value="40" min="5" max="120" step="5">
-            <div class="hint">单条超时/秒</div></div>
-        </div>
-        <div class="hint" style="margin-top:4px">
-          单条超时 = 这条账号的总预算（含所有重试），超了直接判超时，不再磕
+          <div><input type="number" id="timeout" value="20" min="3" max="120" step="1">
+            <div class="hint">统一超时/秒（注册设备、公共头、账号验证共用）</div></div>
         </div>
         <div style="margin-top:10px">
           <input type="number" id="deviceMaxUses" value="100" min="0" max="100000">
@@ -2015,8 +2015,8 @@ async function start(){
   const body = {threads:+$('threads').value, limit:+$('limit').value,
     processes:+$('processes').value, verify_web:$('vweb').checked,
     per_ip:+$('perip').value, ip_ttl:+$('ttl').value,
-    timeout:+$('timeout').value, anisette_timeout:+$('anito').value,
-    retry:+$('retry').value, item_timeout:+$('itemto').value,
+    timeout:+$('timeout').value,
+    retry:+$('retry').value,
     anisette_proxy:$('asproxy').checked,
     device_max_uses:deviceMaxUses};
   $('start').disabled = true; $('hint').textContent='启动中…';
