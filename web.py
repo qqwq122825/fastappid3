@@ -35,7 +35,9 @@ TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 TASK_HISTORY_DIR = os.path.join(HERE, 'data', 'task-history')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
-APP_VERSION = '2026.11.29.1'
+APP_VERSION = '2026.11.29.2'
+MAX_UPLOAD_BYTES = 256 * 1024 * 1024
+MAX_UPLOAD_MB = MAX_UPLOAD_BYTES // (1024 * 1024)
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -2045,10 +2047,10 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             self.close_connection = True
             return self._json({'error': 'Content-Length 必须是非负整数'})
-        if length > 64 * 1024 * 1024:          # 上传上限 64MB
+        if length > MAX_UPLOAD_BYTES:
             # 请求体尚未读取，关闭连接以免后续请求误读残留字节。
             self.close_connection = True
-            return self._json({'error': '上传内容过大（上限 64MB）'})
+            return self._json({'error': f'上传内容过大（上限 {MAX_UPLOAD_MB}MB）'})
         # POST /api/stop has no request body.  Keep the transport body empty
         # while validating Content-Length; substituting ``{}`` before this
         # check made a valid zero-byte request look like an interrupted upload
@@ -2073,8 +2075,8 @@ class Handler(BaseHTTPRequestHandler):
                     raw = gzip.decompress(raw)
                 except (OSError, EOFError):
                     return self._json({'error': '压缩文件损坏，请重新选择文件上传'})
-                if len(raw) > 64 * 1024 * 1024:
-                    return self._json({'error': '解压后内容过大（上限 64MB）'})
+                if len(raw) > MAX_UPLOAD_BYTES:
+                    return self._json({'error': f'解压后内容过大（上限 {MAX_UPLOAD_MB}MB）'})
             try:
                 content = raw.decode('utf-8-sig')
             except UnicodeDecodeError:
@@ -2788,6 +2790,8 @@ $('saveApi').onclick = saveApiFn;
 loadApi();
 
 /* ---- 上传 ---- */
+const MAX_UPLOAD_BYTES = 256 * 1024 * 1024;
+const MAX_UPLOAD_MB = MAX_UPLOAD_BYTES / 1024 / 1024;
 const fileInput = $('file');
 $('drop').onclick = () => {
   // 先清空，否则重复选同一个文件时浏览器不会再触发 change。
@@ -2811,6 +2815,14 @@ $('drop').addEventListener('drop', e => {
 async function upload(file){
   const status = $('accInfo');
   $('accName').textContent = file.name;
+  if(file.size > MAX_UPLOAD_BYTES){
+    const msg = `文件过大（上限 ${MAX_UPLOAD_MB}MB）`;
+    status.textContent = `上传失败：${msg}`;
+    status.style.color = 'var(--red)';
+    $('hint').textContent = status.textContent;
+    $('hint').style.color = 'var(--red)';
+    return;
+  }
   status.textContent = `正在读取 ${file.name}…`;
   status.style.color = 'var(--dim)';
   try{

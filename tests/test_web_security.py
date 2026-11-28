@@ -201,11 +201,24 @@ class ConsoleRequestTests(unittest.TestCase):
                 self.assertTrue(handler.close_connection)
 
     def test_oversize_body_closes_connection_without_reading(self):
-        handler = make_handler('/api/login', {}, length=64 * 1024 * 1024 + 1)
+        handler = make_handler('/api/login', {}, length=web.MAX_UPLOAD_BYTES + 1)
         handler.rfile = Mock()
-        self.assertIn('error', handler._do_post())
+        response = handler._do_post()
+        self.assertIn('256MB', response['error'])
         handler.rfile.read.assert_not_called()
         self.assertTrue(handler.close_connection)
+
+    def test_gzip_upload_rejects_decompressed_oversize(self):
+        class OversizeBytes:
+            def __len__(self):
+                return web.MAX_UPLOAD_BYTES + 1
+
+        handler = make_handler('/api/upload?name=batch.txt', cookie=self.cookie(), raw=b'gzip')
+        handler.headers.replace_header('Content-Type', 'application/octet-stream')
+        handler.headers['Content-Encoding'] = 'gzip'
+        with patch.object(web.gzip, 'decompress', return_value=OversizeBytes()):
+            response = handler._do_post()
+        self.assertIn('256MB', response['error'])
 
     def test_empty_stop_request_is_still_valid(self):
         handler = make_handler('/api/stop', cookie=self.cookie(), raw=b'')
@@ -287,7 +300,7 @@ class ConsoleRequestTests(unittest.TestCase):
             self.assertEqual(3, state['device_registered'])
             self.assertEqual(3, state['device_ready'])
             self.assertEqual(3, state['device_total'])
-            self.assertEqual('2026.11.29.1', state['version'])
+            self.assertEqual('2026.11.29.2', state['version'])
 
     def test_linux_process_group_cpu_sums_parent_and_children(self):
         parent = '1 (parent) S 0 77 0 0 0 0 0 0 0 0 200 100 0 0 0 0 0 0 0 0\n'
