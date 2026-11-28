@@ -33,7 +33,7 @@ ACCOUNT_STATE = os.path.join(HERE, 'data', 'current-accounts.json')
 TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
-APP_VERSION = '2026.11.28.14'
+APP_VERSION = '2026.11.28.15'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -1619,7 +1619,7 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
 
 <div class="top">
   <h1>GSA 校验控制台</h1>
-  <span class="tag">极简模型</span>
+  <span class="tag">py模型</span>
   <span class="tag" id="versionTag">v__APP_VERSION__</span>
   <div class="right">
     <span id="stateTag"><span class="dot" style="background:#9ca3af"></span>未开始</span>
