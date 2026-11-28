@@ -33,7 +33,7 @@ ACCOUNT_STATE = os.path.join(HERE, 'data', 'current-accounts.json')
 TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
-APP_VERSION = '2026.11.28.18'
+APP_VERSION = '2026.11.28.19'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -1717,7 +1717,7 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
           <div class="stat"><div class="k">总数</div><div class="v" id="sTotal">0</div></div>
           <div class="stat"><div class="k">完成</div><div class="v v-blue" id="sDone">0</div></div>
           <div class="stat"><div class="k">剩余</div><div class="v" id="sLeft">0</div></div>
-          <div class="stat"><div class="k">当前速度</div><div class="v sm v-green" id="sRate">0</div></div>
+          <div class="stat"><div class="k">当前速度</div><div class="v v-green" id="sRate">0</div></div>
           <div class="stat"><div class="k">密码正确</div><div class="v v-green" id="sValid">0</div></div>
           <div class="stat"><div class="k">密码错误</div><div class="v v-red" id="sWrong">0</div></div>
           <div class="stat"><div class="k">锁定</div><div class="v v-amber" id="sLock">0</div></div>
