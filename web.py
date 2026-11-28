@@ -35,7 +35,7 @@ TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 TASK_HISTORY_DIR = os.path.join(HERE, 'data', 'task-history')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
-APP_VERSION = '2026.11.28.38'
+APP_VERSION = '2026.11.28.39'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -1169,6 +1169,26 @@ def delete_task_history(task_id):
     return {'ok': True, 'removed': removed, 'id': task_id}
 
 
+def delete_task_histories(task_ids):
+    """Delete a validated batch of idle historical tasks."""
+    if not isinstance(task_ids, list):
+        return {'error': '请选择要删除的历史任务'}
+    task_ids = list(dict.fromkeys(str(item or '') for item in task_ids))
+    if not task_ids:
+        return {'error': '请选择要删除的历史任务'}
+    if len(task_ids) > 200:
+        return {'error': '单次最多删除 200 个历史任务'}
+    deleted, removed, errors = [], 0, []
+    for task_id in task_ids:
+        result = delete_task_history(task_id)
+        if result.get('ok'):
+            deleted.append(task_id)
+            removed += int(result.get('removed') or 0)
+        else:
+            errors.append({'id': task_id, 'error': result.get('error') or '删除失败'})
+    return {'ok': not errors, 'deleted': deleted, 'removed': removed, 'errors': errors}
+
+
 def _result_sources(completed_live=None):
     """Resolve only result files belonging to the current/latest task."""
     import glob
@@ -2110,6 +2130,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(delete_account_file(payload.get('id')))
         if self.path.startswith('/api/delete-task-history'):
             with _LOCK:
+                if isinstance(payload.get('ids'), list):
+                    return self._json(delete_task_histories(payload.get('ids')))
                 return self._json(delete_task_history(payload.get('id')))
         if self.path.startswith('/api/select-account-file'):
             return self._json(select_account_file(payload.get('id')))
@@ -2261,8 +2283,11 @@ white-space:nowrap}.history-item .meta{font-size:11px;color:var(--dim);margin-to
 .task-history-search{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;
 width:min(420px,100%)}
 .task-history-search input{padding:7px 10px;font-size:12px}
+.task-history-selectbar{padding:8px 16px;border-bottom:1px solid var(--line);background:#fff;
+display:flex;align-items:center;gap:12px}.task-history-selectbar label{display:flex;align-items:center;
+gap:7px;font-size:12px;font-weight:600}.task-history-selectbar .hint{margin-right:auto}
 .task-history-list{overflow:auto;min-height:180px;max-height:520px}
-.task-history-item{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:14px;
+.task-history-item{display:grid;grid-template-columns:20px minmax(0,1fr) auto;gap:12px;
 align-items:center;padding:13px 16px;border-bottom:1px solid #f0f2f5}
 .task-history-item:hover{background:#fafbfc}.task-history-item:last-child{border-bottom:0}
 .task-history-main{min-width:0}.task-history-title{display:flex;align-items:center;gap:8px;
@@ -2281,7 +2306,8 @@ color:#4338ca;font-size:10px;white-space:nowrap}
 font-size:11.5px}.task-history-pager .btn{padding:5px 10px;font-size:11.5px}
 .result-context{display:none;align-items:center;gap:8px;color:#4338ca;font-size:11px}
 .result-context.show{display:flex}.result-context .btn{padding:4px 9px;font-size:11px}
-@media(max-width:640px){.task-history-item{grid-template-columns:1fr}.task-history-actions{justify-content:flex-end}}
+@media(max-width:640px){.task-history-item{grid-template-columns:20px minmax(0,1fr)}
+.task-history-actions{grid-column:2;justify-content:flex-end}.task-history-selectbar{flex-wrap:wrap}}
 .timeout-detail-cell{display:flex;align-items:center;gap:8px;min-width:210px}
 .timeout-detail-cell .summary{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .timeout-detail-btn{flex:none;border:1px solid #bfdbfe;background:#eff6ff;color:#1d4ed8;
@@ -2611,6 +2637,11 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
         <button class="btn ghost" id="taskHistorySearchBtn" type="button">查询</button>
       </div>
       <span class="hint" id="taskHistoryCount">--</span>
+    </div>
+    <div class="task-history-selectbar">
+      <label><input type="checkbox" id="selectAllTaskHistory"> 全选本页</label>
+      <span class="hint" id="taskHistorySelection">0 个已选</span>
+      <button class="btn danger" id="deleteSelectedTasks" type="button" disabled>删除已选</button>
     </div>
     <div class="task-history-list" id="taskHistoryList">
       <div class="history-empty">正在读取历史任务…</div>
@@ -3132,6 +3163,7 @@ $('resultNext').onclick = () => {
 /* ---- 历史任务：摘要分页，结果仍复用主表的服务端分页 ---- */
 let TASK_HISTORY_PAGE = 1;
 let TASK_HISTORY_DATA = null;
+const TASK_HISTORY_SELECTED = new Set();
 function updateResultContext(){
   const active = Boolean(RESULT_TASK_ID);
   $('resultTitle').textContent = active ? '历史结果' : '最近结果';
@@ -3156,6 +3188,9 @@ function taskHistoryRow(item){
   const elapsed = item.elapsed == null ? '--' : `${Number(item.elapsed).toFixed(1)} 秒`;
   const size = `${(Number(item.bytes||0)/1048576).toFixed(1)} MB`;
   return `<div class="task-history-item" data-task-id="${esc(item.id)}">
+    <input type="checkbox" data-select-task="${esc(item.id)}"
+      ${TASK_HISTORY_SELECTED.has(String(item.id))?'checked':''}
+      ${item.status==='running'?'disabled title="运行中的任务不能删除"':''}>
     <div class="task-history-main">
       <div class="task-history-title">
         <span class="file">${esc(item.account_name||'历史任务')}</span>
@@ -3174,6 +3209,17 @@ function taskHistoryRow(item){
         ${item.status==='running'?'disabled':''}>删除</button>
     </div>
   </div>`;
+}
+function updateTaskHistorySelection(){
+  const rows = (TASK_HISTORY_DATA && TASK_HISTORY_DATA.rows) || [];
+  const selectable = rows.filter(item => item.status !== 'running');
+  const selectedOnPage = selectable.filter(item => TASK_HISTORY_SELECTED.has(String(item.id))).length;
+  const selectAll = $('selectAllTaskHistory');
+  selectAll.disabled = selectable.length === 0;
+  selectAll.checked = selectable.length > 0 && selectedOnPage === selectable.length;
+  selectAll.indeterminate = selectedOnPage > 0 && selectedOnPage < selectable.length;
+  $('taskHistorySelection').textContent = `${num(TASK_HISTORY_SELECTED.size)} 个已选`;
+  $('deleteSelectedTasks').disabled = TASK_HISTORY_SELECTED.size === 0;
 }
 function setTaskHistoryModal(open){
   $('taskHistoryModal').classList.toggle('show', open);
@@ -3195,6 +3241,7 @@ async function loadTaskHistory(page=TASK_HISTORY_PAGE){
     $('taskHistoryPage').textContent = `第 ${num(data.page||1)} / ${num(data.pages||1)} 页`;
     $('taskHistoryPrev').disabled = !data.has_prev;
     $('taskHistoryNext').disabled = !data.has_next;
+    updateTaskHistorySelection();
   }catch(error){
     $('taskHistoryList').innerHTML = `<div class="history-empty">读取失败：${esc(error.message||error)}</div>`;
   }
@@ -3211,7 +3258,12 @@ function openTaskResult(item){
   setTaskHistoryModal(false);
   loadHistory('all');
 }
-$('taskHistory').onclick = () => { setTaskHistoryModal(true); loadTaskHistory(1); };
+$('taskHistory').onclick = () => {
+  TASK_HISTORY_SELECTED.clear();
+  updateTaskHistorySelection();
+  setTaskHistoryModal(true);
+  loadTaskHistory(1);
+};
 $('closeTaskHistory').onclick = $('dismissTaskHistory').onclick = () => setTaskHistoryModal(false);
 $('taskHistoryModal').addEventListener('click', e => {
   if(e.target === $('taskHistoryModal')) setTaskHistoryModal(false);
@@ -3222,6 +3274,40 @@ $('taskHistorySearch').onkeydown = e => {
 };
 $('taskHistoryPrev').onclick = () => loadTaskHistory(TASK_HISTORY_PAGE-1);
 $('taskHistoryNext').onclick = () => loadTaskHistory(TASK_HISTORY_PAGE+1);
+$('selectAllTaskHistory').onchange = e => {
+  for(const item of (TASK_HISTORY_DATA && TASK_HISTORY_DATA.rows) || []){
+    if(item.status === 'running') continue;
+    if(e.target.checked) TASK_HISTORY_SELECTED.add(String(item.id));
+    else TASK_HISTORY_SELECTED.delete(String(item.id));
+  }
+  for(const box of document.querySelectorAll('[data-select-task]')){
+    if(!box.disabled) box.checked = e.target.checked;
+  }
+  updateTaskHistorySelection();
+};
+$('deleteSelectedTasks').onclick = async () => {
+  const ids = Array.from(TASK_HISTORY_SELECTED);
+  if(!ids.length) return;
+  if(!window.confirm(`确定删除选中的 ${ids.length} 个历史任务及其结果文件？此操作不能撤销。`)) return;
+  $('deleteSelectedTasks').disabled = true;
+  const result = await post('/api/delete-task-history', {ids});
+  for(const id of result.deleted || []) TASK_HISTORY_SELECTED.delete(String(id));
+  if(ids.includes(RESULT_TASK_ID) && (result.deleted || []).includes(RESULT_TASK_ID)){
+    RESULT_TASK_ID = ''; RESULT_TASK_LABEL = ''; HIST = null; RESULT_PAGE = 1;
+    updateResultContext(); loadHistory($('filter').value || 'all');
+  }
+  if(result.errors && result.errors.length){
+    window.alert(result.errors.map(item => `${item.id}：${item.error}`).join('\n'));
+  }
+  await loadTaskHistory(TASK_HISTORY_PAGE);
+};
+$('taskHistoryList').addEventListener('change', e => {
+  const box = e.target.closest && e.target.closest('[data-select-task]');
+  if(!box) return;
+  if(box.checked) TASK_HISTORY_SELECTED.add(String(box.dataset.selectTask));
+  else TASK_HISTORY_SELECTED.delete(String(box.dataset.selectTask));
+  updateTaskHistorySelection();
+});
 $('taskHistoryList').addEventListener('click', async e => {
   const openButton = e.target.closest && e.target.closest('[data-open-task]');
   const deleteButton = e.target.closest && e.target.closest('[data-delete-task]');
@@ -3236,6 +3322,7 @@ $('taskHistoryList').addEventListener('click', async e => {
     deleteButton.disabled = true;
     const result = await post('/api/delete-task-history', {id});
     if(result.error){ window.alert(result.error); deleteButton.disabled = false; return; }
+    TASK_HISTORY_SELECTED.delete(String(id));
     if(RESULT_TASK_ID === id){
       RESULT_TASK_ID = ''; RESULT_TASK_LABEL = ''; HIST = null; RESULT_PAGE = 1;
       updateResultContext(); loadHistory($('filter').value || 'all');

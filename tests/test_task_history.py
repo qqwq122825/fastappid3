@@ -93,11 +93,33 @@ class TaskHistoryTests(unittest.TestCase):
         self.assertTrue(os.path.exists(other_path))
         self.assertFalse(os.path.exists(web._task_history_path(selected)))
 
+    def test_bulk_delete_removes_selected_tasks_and_preserves_other(self):
+        selected = ['run-1795840030', 'run-1795840031']
+        other = 'run-1795840032'
+        selected_paths = [self.write_rows(task_id, count=1) for task_id in selected]
+        other_path = self.write_rows(other, count=1)
+        for task_id in selected + [other]:
+            web._write_task_history_record({'id': task_id, 'started_at': 1})
+        with mock.patch.object(web, 'is_running', return_value=False):
+            result = web.delete_task_histories(selected)
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['deleted'], selected)
+        self.assertTrue(all(not os.path.exists(path) for path in selected_paths))
+        self.assertTrue(os.path.exists(other_path))
+
+    def test_bulk_delete_rejects_empty_or_oversized_selection(self):
+        self.assertIn('error', web.delete_task_histories([]))
+        oversized = [f'run-{1795841000 + index}' for index in range(201)]
+        self.assertIn('error', web.delete_task_histories(oversized))
+
     def test_page_contains_history_controls(self):
         self.assertIn('id="taskHistoryModal"', web.PAGE)
         self.assertIn('id="taskHistory"', web.PAGE)
         self.assertIn('id="currentResults"', web.PAGE)
         self.assertIn('task_id=', web.PAGE)
+        self.assertIn('id="selectAllTaskHistory"', web.PAGE)
+        self.assertIn('id="deleteSelectedTasks"', web.PAGE)
+        self.assertIn('data-select-task=', web.PAGE)
 
 
 if __name__ == '__main__':
