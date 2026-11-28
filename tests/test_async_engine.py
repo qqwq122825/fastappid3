@@ -401,7 +401,7 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
             self.assertLessEqual(len(cached['recent']), web._RESULT_RECENT_LIMIT)
             self.assertEqual(web._RESULT_RECENT_LIMIT, len(cached['recent_all']))
 
-    def test_multiprocess_filtered_rows_are_interleaved(self):
+    def test_multiprocess_filtered_rows_are_server_paginated(self):
         from pathlib import Path
         from unittest.mock import patch
         import web
@@ -423,9 +423,38 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
                 result = object.__new__(web.Handler)._results('timeout', 4)
             self.assertEqual(6, result['total'])
             self.assertEqual([
-                'p0-2@example.invalid', 'p1-2@example.invalid',
-                'p0-1@example.invalid', 'p1-1@example.invalid',
+                'p0-2@example.invalid', 'p0-1@example.invalid',
+                'p0-0@example.invalid', 'p1-2@example.invalid',
             ], [row['email'] for row in result['rows']])
+
+    def test_result_pages_use_compact_offsets_and_refresh_after_append(self):
+        from pathlib import Path
+        from unittest.mock import patch
+        import web
+        with tempfile.TemporaryDirectory() as directory:
+            result_file = Path(directory) / 'run.jsonl'
+            result_file.write_text(''.join(json.dumps({
+                'email': f'user{index}@example.invalid', 'status': 'timeout'}) + '\n'
+                for index in range(250)), encoding='utf-8')
+            state = dict(web.STATE, run_out=str(result_file), started_at=1)
+            with patch.object(web, 'STATE', state):
+                web._RESULT_PROGRESS.clear()
+                page2 = object.__new__(web.Handler)._results(
+                    'timeout', 100, page=2)
+                with result_file.open('a', encoding='utf-8') as handle:
+                    handle.write(json.dumps({
+                        'email': 'appended@example.invalid',
+                        'status': 'timeout'}) + '\n')
+                page1 = object.__new__(web.Handler)._results(
+                    'timeout', 100, page=1)
+                cached = web._RESULT_PROGRESS[str(result_file.resolve())]
+            self.assertEqual(3, page2['pages'])
+            self.assertTrue(page2['has_prev'])
+            self.assertTrue(page2['has_next'])
+            self.assertEqual('user149@example.invalid', page2['rows'][0]['email'])
+            self.assertEqual(251, page1['total'])
+            self.assertEqual('appended@example.invalid', page1['rows'][0]['email'])
+            self.assertEqual(251, len(cached['offsets']))
 
     def test_finished_multiprocess_filter_survives_web_restart(self):
         from pathlib import Path
@@ -457,6 +486,38 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(result['scoped'])
             self.assertEqual(2, result['total'])
             self.assertEqual({'p0@example.invalid', 'p1@example.invalid'},
+                             {row['email'] for row in result['rows']})
+
+    def test_finished_multiprocess_uses_published_unique_result_paths(self):
+        from pathlib import Path
+        from unittest.mock import patch
+        import web
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = root / 'data'
+            data.mkdir()
+            first = data / 'run-123-p0.jsonl'
+            second = data / 'run-123-p1.jsonl'
+            first.write_text(json.dumps({
+                'email': 'first@example.invalid', 'status': 'timeout'}) + '\n',
+                encoding='utf-8')
+            second.write_text(json.dumps({
+                'email': 'second@example.invalid', 'status': 'locked'}) + '\n',
+                encoding='utf-8')
+            live_file = data / 'live.json'
+            live_file.write_text(json.dumps({
+                'done': 2, 'total': 2, 'processes': 2, 'finished': True,
+                'result_paths': [str(first), str(second)]}), encoding='utf-8')
+            state = dict(web.STATE, run_out='', started_at=0, processes=1)
+            with patch.object(web, 'HERE', str(root)), \
+                 patch.object(web, 'LIVE', str(live_file)), \
+                 patch.object(web, 'STATE', state), \
+                 patch.object(web, '_active_task_record', return_value=None):
+                web._RESULT_PROGRESS.clear()
+                result = object.__new__(web.Handler)._results('all', 100)
+            self.assertTrue(result['scoped'])
+            self.assertEqual(2, result['total'])
+            self.assertEqual({'first@example.invalid', 'second@example.invalid'},
                              {row['email'] for row in result['rows']})
 
     def test_finished_single_process_filter_uses_latest_run_after_restart(self):
@@ -750,7 +811,7 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('startup.public_header_waiting', web.PAGE)
         self.assertIn('startup.threads_created', web.PAGE)
         self.assertIn('startup.business_inflight', web.PAGE)
-        self.assertIn('id="versionTag">v2026.11.28.33', web.PAGE)
+        self.assertIn('id="versionTag">v2026.11.28.34', web.PAGE)
         self.assertIn('<div class="v v-green" id="sRate">0</div>', web.PAGE)
         self.assertNotIn('<div class="v sm v-green" id="sRate">0</div>', web.PAGE)
         self.assertNotIn('程序会按需要的数量自动替换 num', web.PAGE)
@@ -824,11 +885,15 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
     def test_result_search_control_queries_backend(self):
         import web
         self.assertIn('id="resultSearch"', web.PAGE)
+        self.assertIn('id="resultSearchBtn"', web.PAGE)
         self.assertIn('placeholder="搜索账号"', web.PAGE)
         self.assertIn('&query=${encodeURIComponent(query)}', web.PAGE)
-        self.assertIn('loadHistory(want, true)', web.PAGE)
-        self.assertIn('if(HIST_LOADING) return', web.PAGE)
+        self.assertIn('submitResultSearch', web.PAGE)
+        self.assertIn('loadHistory(want || \'all\', true)', web.PAGE)
+        self.assertIn('if(HIST_LOADING){ HIST_PENDING', web.PAGE)
         self.assertIn('HIST.revision !== r.revision', web.PAGE)
+        self.assertIn('id="resultPrev"', web.PAGE)
+        self.assertIn('id="resultNext"', web.PAGE)
 
     def test_web_fills_old_multiprocess_ip_pool_from_child_live_files(self):
         from pathlib import Path

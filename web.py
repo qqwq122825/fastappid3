@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import array
 import collections
 import gzip
 import hashlib
@@ -33,7 +34,7 @@ ACCOUNT_STATE = os.path.join(HERE, 'data', 'current-accounts.json')
 TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
-APP_VERSION = '2026.11.28.33'
+APP_VERSION = '2026.11.28.34'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -740,6 +741,8 @@ def _result_progress(path):
         if state is None or state['key'] != key or stat.st_size < state['offset']:
             state = {'key': key, 'offset': 0, 'done': 0, 'tail': b'',
                      'by_status': {}, 'recent': collections.deque(maxlen=12),
+                     'offsets': array.array('Q'), 'offsets_by_status': {},
+                     'offsets_other': array.array('Q'),
                      'recent_all': collections.deque(
                          maxlen=_RESULT_RECENT_LIMIT),
                      'recent_by_status': {},
@@ -750,6 +753,7 @@ def _result_progress(path):
             with open(path, 'rb') as handle:
                 handle.seek(state['offset'])
                 data = state['tail']
+                cursor = state['offset'] - len(state['tail'])
                 while True:
                     chunk = handle.read(1024 * 1024)
                     if not chunk:
@@ -758,6 +762,8 @@ def _result_progress(path):
                     lines = data.split(b'\n')
                     data = lines.pop()
                     for raw in lines:
+                        row_offset = cursor
+                        cursor += len(raw) + 1
                         if not raw.strip():
                             continue
                         try:
@@ -768,6 +774,10 @@ def _result_progress(path):
                             continue
                         state['done'] += 1
                         status = str(row.get('status') or 'unknown')
+                        state['offsets'].append(row_offset)
+                        status_offsets = state['offsets_by_status'].setdefault(
+                            status, array.array('Q'))
+                        status_offsets.append(row_offset)
                         by_status = state['by_status']
                         by_status[status] = by_status.get(status, 0) + 1
                         state['recent'].append(row)
@@ -778,6 +788,7 @@ def _result_progress(path):
                         status_rows.append(row)
                         if status in _OTHER_RESULT_STATUSES:
                             state['recent_other'].append(row)
+                            state['offsets_other'].append(row_offset)
                 state['offset'] = handle.tell()
                 state['tail'] = data
         except OSError:
@@ -787,7 +798,7 @@ def _result_progress(path):
                 'recent': list(state['recent'])}
 
 
-def _indexed_result_snapshot(path, want, limit):
+def _indexed_result_snapshot(path, want, limit, skip=0):
     """Return an O(appended-bytes) status snapshot for one JSONL file.
 
     ``_result_progress`` advances the cached byte offset.  This function then
@@ -804,18 +815,92 @@ def _indexed_result_snapshot(path, want, limit):
         if want in ('', 'all'):
             total = state['done']
             rows = state['recent_all']
+            offsets = state['offsets']
         elif want == 'other':
             total = sum(state['by_status'].get(status, 0)
                         for status in _OTHER_RESULT_STATUSES)
             rows = state['recent_other']
+            offsets = state['offsets_other']
         else:
             total = state['by_status'].get(want, 0)
             rows = state['recent_by_status'].get(want, ())
+            offsets = state['offsets_by_status'].get(want, ())
         key = state['key']
         revision = f'{key[1]}:{key[2]}:{state["offset"]}:{state["done"]}'
-        return {'total': int(total),
-                'rows': list(reversed(list(rows)[-limit:])),
-                'revision': revision}
+        if skip or limit > _RESULT_RECENT_LIMIT:
+            end = max(0, len(offsets) - max(0, int(skip)))
+            begin = max(0, end - max(0, int(limit)))
+            selected = list(reversed(offsets[begin:end]))
+        elif limit:
+            selected = None
+            cached_rows = list(reversed(list(rows)[-limit:]))
+        else:
+            selected, cached_rows = [], []
+    if selected is not None:
+        cached_rows = []
+        try:
+            with open(path, 'rb') as handle:
+                for position in selected:
+                    handle.seek(position)
+                    raw = handle.readline()
+                    try:
+                        row = json.loads(raw.decode('utf-8', 'replace'))
+                    except (ValueError, TypeError):
+                        continue
+                    if isinstance(row, dict):
+                        cached_rows.append(row)
+        except OSError:
+            cached_rows = []
+    return {'total': int(total), 'rows': cached_rows, 'revision': revision}
+
+
+def _validated_result_paths(values):
+    """Return existing JSONL files below data/, preserving input order."""
+    data_root = os.path.realpath(os.path.join(HERE, 'data'))
+    out = []
+    for value in values or ():
+        path = os.path.realpath(str(value or ''))
+        if (not path.endswith('.jsonl') or
+                not path.startswith(data_root + os.sep) or
+                not os.path.isfile(path) or path in out):
+            continue
+        out.append(path)
+    return out
+
+
+def _result_sources(completed_live=None):
+    """Resolve only result files belonging to the current/latest task."""
+    import glob
+    completed_live = completed_live if isinstance(completed_live, dict) else {}
+    own = str(STATE.get('run_out') or '')
+    if own and os.path.isfile(own):
+        # STATE.run_out is created by this controller and is already trusted.
+        # Keeping this direct also makes isolated result-index tests possible.
+        return [os.path.realpath(own)]
+    processes = int(completed_live.get('processes') or
+                    STATE.get('processes') or 1)
+    if own:
+        stem = own[:-6] if own.endswith('.jsonl') else own
+        current = _validated_result_paths(sorted(glob.glob(stem + '-p*.jsonl')))
+        if current:
+            return current
+    published = _validated_result_paths(completed_live.get('result_paths') or ())
+    if published:
+        return published
+    if processes > 1 or own:
+        legacy = _validated_result_paths(sorted(glob.glob(
+            os.path.join(HERE, 'data', 'mp-p*.jsonl'))))
+        if legacy:
+            return legacy
+    # Compatibility for finished snapshots created before result_paths was
+    # published.  Never use this fallback while a new task is running.
+    if not STATE.get('started_at') and completed_live:
+        exact = [path for path in glob.glob(
+            os.path.join(HERE, 'data', 'run-*.jsonl'))
+            if re.fullmatch(r'run-\d+\.jsonl', os.path.basename(path))]
+        if exact:
+            return _validated_result_paths([max(exact, key=os.path.getmtime)])
+    return []
 
 
 def _multiprocess_result_progress(processes, data_dir=None):
@@ -1058,7 +1143,7 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
         # 多进程分配账号与设备槽位；每个子进程内使用简单线程。
         cmd = [PYTHON, os.path.join(HERE, 'run_mp.py'),
                '--accounts', accounts, '--processes', str(processes),
-               '--threads', str(threads)]
+               '--threads', str(threads), '--result-prefix', run_out[:-6]]
         cmd += ['--limit', str(limit)]
         api = proxy_api()
         if not api:
@@ -1300,7 +1385,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(self._results(
                 (q.get('status') or ['all'])[0],
                 int((q.get('limit') or ['60'])[0] or 60),
-                (q.get('query') or [''])[0]))
+                (q.get('query') or [''])[0],
+                int((q.get('page') or ['1'])[0] or 1)))
         if self.path.startswith('/api/export'):
             from urllib.parse import urlparse, parse_qs
             q = parse_qs(urlparse(self.path).query)
@@ -1342,15 +1428,15 @@ class Handler(BaseHTTPRequestHandler):
                                'log_tail': tail_log()})
         self._send(PAGE.encode('utf-8'), 'text/html; charset=utf-8')
 
-    def _results(self, want, limit=60, query=''):
+    def _results(self, want, limit=60, query='', page=1):
         """按状态查**当前任务**的结果。
 
         jsonl 是追加写的，历史批次都堆在同一个文件里；如果不过滤，
         页面筛出 2 万条超时、而顶部只有 3 条，因为顶部只统计当前任务。
         这里用 STATE['started'] 做下界：只保留本轮开始后写入的行。
         """
-        import glob as _glob
         limit = max(1, min(500, int(limit)))
+        page = max(1, int(page or 1))
         want = (want or 'all').strip()
         query = str(query or '').strip()[:128].casefold()
         # Hydrate STATE from task-process.json after a controller restart while
@@ -1368,25 +1454,7 @@ class Handler(BaseHTTPRequestHandler):
                     completed_live = value
             except (OSError, ValueError, TypeError):
                 pass
-        if own and os.path.exists(own):
-            # 单进程：本轮就是一个文件，直接读全量
-            paths = [own]
-        else:
-            processes = int(completed_live.get('processes') or
-                            STATE.get('processes') or 1)
-            if not cutoff and completed_live and processes <= 1:
-                # A completed single-process task writes a unique run-*.jsonl.
-                # After a web restart STATE.run_out is gone, so use the newest
-                # persisted run file that corresponds to the displayed live
-                # summary rather than silently returning an empty filter.
-                candidates = _glob.glob(os.path.join(HERE, 'data', 'run-*.jsonl'))
-                paths = ([max(candidates, key=os.path.getmtime)]
-                         if candidates else [])
-            else:
-                # run_mp removes mp-p*.jsonl before each task, therefore the
-                # remaining files are exactly the current/latest task.
-                paths = sorted(_glob.glob(
-                    os.path.join(HERE, 'data', 'mp-p*.jsonl')))
+        paths = _result_sources(completed_live)
         live_scoped = bool(completed_live and paths and
                            (completed_live.get('done') is not None or
                             completed_live.get('total') is not None))
@@ -1403,30 +1471,31 @@ class Handler(BaseHTTPRequestHandler):
                         continue
                 except OSError:
                     continue
-                snapshots.append(_indexed_result_snapshot(path, want, limit))
-            total = sum(snapshot['total'] for snapshot in snapshots)
-            # Each process owns a disjoint account slice.  Interleave its
-            # newest rows so an active high-numbered process cannot hide all
-            # other processes in the fixed-size browser table.
+                snapshots.append((path, _indexed_result_snapshot(path, want, 0)))
+            total = sum(snapshot['total'] for _, snapshot in snapshots)
+            pages = max(1, (total + limit - 1) // limit)
+            page = min(page, pages)
+            skip = (page - 1) * limit
             rows = []
-            depth = 0
-            while len(rows) < limit:
-                added = False
-                for snapshot in snapshots:
-                    if depth < len(snapshot['rows']):
-                        rows.append(snapshot['rows'][depth])
-                        added = True
-                        if len(rows) >= limit:
-                            break
-                if not added:
+            for path, snapshot in snapshots:
+                if skip >= snapshot['total']:
+                    skip -= snapshot['total']
+                    continue
+                take = min(limit - len(rows), snapshot['total'] - skip)
+                if take > 0:
+                    rows.extend(_indexed_result_snapshot(
+                        path, want, take, skip=skip)['rows'])
+                skip = 0
+                if len(rows) >= limit:
                     break
-                depth += 1
             revision = '|'.join(snapshot['revision']
-                                for snapshot in snapshots)
+                                for _, snapshot in snapshots)
             return {'total': total if scoped else 0,
                     'rows': rows if scoped else [],
                     'status': want, 'query': query, 'scoped': scoped,
-                    'revision': revision, 'incremental': True}
+                    'revision': revision, 'incremental': True,
+                    'page': page, 'pages': pages,
+                    'has_prev': page > 1, 'has_next': page < pages}
 
         # Arbitrary substring searches remain explicit, debounced operations.
         # They scan the current run once when the user changes the query, but
@@ -1494,20 +1563,29 @@ class Handler(BaseHTTPRequestHandler):
         return {'total': total if scoped else 0,
                 'rows': rows if scoped else [],
                 'status': want, 'query': query, 'scoped': scoped,
-                'revision': '', 'incremental': False}
+                'revision': '', 'incremental': False,
+                'page': 1, 'pages': max(1, (total + limit - 1) // limit),
+                'has_prev': False, 'has_next': total > limit}
 
     def _export(self, want, fmt):
         """按状态筛选导出账号。只保留 邮箱----密码 两列，不带其他信息。
 
         同样按 STATE['started'] 限定在本轮任务范围内。
         """
-        import glob as _glob
-        patterns = [os.path.join(HERE, 'data', 'simple-run.jsonl'),
-                    os.path.join(HERE, 'data', 'mp-p*.jsonl')]
-        cutoff = STATE.get('started') or 0
+        _active_task_record()
+        completed_live = {}
+        if not STATE.get('started_at'):
+            try:
+                with open(LIVE, encoding='utf-8') as handle:
+                    value = json.load(handle)
+                if isinstance(value, dict):
+                    completed_live = value
+            except (OSError, ValueError, TypeError):
+                pass
+        paths = _result_sources(completed_live)
+        cutoff = STATE.get('started_at') or 0
         rows, seen = [], set()
-        for pat in patterns:
-            for path in sorted(_glob.glob(pat)):
+        for path in paths:
                 try:
                     if cutoff and os.path.getmtime(path) < cutoff - 5:
                         continue
@@ -1950,6 +2028,10 @@ font-feature-settings:"tnum" 1,"lnum" 1}
 .b-gray{background:#f3f4f6;color:#4b5563}
 .b-blue{background:#dbeafe;color:#1e40af}
 .scroll{max-height:520px;max-width:100%;overflow:auto}
+.result-tools{display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
+.result-pager{display:flex;justify-content:flex-end;align-items:center;gap:8px;
+padding:10px 14px;border-top:1px solid var(--line);font-size:12px;color:var(--dim)}
+.result-pager .btn{padding:5px 11px;font-size:12px}
 .mono,.stat .v,.tbl td,.tbl th{font-family:inherit;
 font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1,"lnum" 1}
 #gate{position:fixed;inset:0;background:rgba(17,24,39,.55);z-index:99;display:none;
@@ -2103,9 +2185,11 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
 
     <div class="panel">
       <div class="hd"><b>最近结果</b>
-        <span style="display:flex;gap:8px;align-items:center">
+        <span class="result-tools">
           <input id="resultSearch" type="search" placeholder="搜索账号"
             autocomplete="off" style="width:180px;padding:5px 9px;font-size:12px">
+          <button class="btn ghost" id="resultSearchBtn" type="button"
+            style="padding:5px 12px;font-size:12px">查询</button>
           <select id="filter" style="width:auto;padding:5px 9px;font-size:12px">
             <option value="all">全部结果</option>
             <option value="valid">密码正确</option>
@@ -2134,6 +2218,11 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
           <tbody id="rows"><tr><td colspan="13" style="text-align:center;color:#9ca3af;padding:24px">
             还没有结果</td></tr></tbody>
         </table>
+      </div>
+      <div class="result-pager">
+        <button class="btn ghost" id="resultPrev" type="button" disabled>上一页</button>
+        <span id="resultPageInfo">第 1 / 1 页</span>
+        <button class="btn ghost" id="resultNext" type="button" disabled>下一页</button>
       </div>
     </div>
   </div>
@@ -2562,9 +2651,14 @@ async function start(){
 }
 function resetResultsForNewTask(total){
   HIST = null;
+  RESULT_QUERY = '';
+  RESULT_PAGE = 1;
   $('filter').value = 'all';
   $('resultSearch').value = '';
   $('tblHint').textContent = '实时刷新';
+  $('resultPageInfo').textContent = '第 1 / 1 页';
+  $('resultPrev').disabled = true;
+  $('resultNext').disabled = true;
   LAST = {running:true, finished:false, total:Number(total)||0, done:0, recent:[]};
   renderRows();
 }
@@ -2630,19 +2724,25 @@ $('expTxt').onclick = () => exportAs('txt');
 $('expCsv').onclick = () => exportAs('csv');
 $('filter').onchange = () => {
   const want = $('filter').value;
-  const query = $('resultSearch').value.trim();
-  if((want && want !== 'all') || query){ loadHistory(want); }
-  else { HIST = null; $('tblHint').textContent = '实时刷新'; renderRows(); }
+  RESULT_PAGE = 1;
+  loadHistory(want || 'all');
 };
-let SEARCH_TIMER = null;
-$('resultSearch').oninput = () => {
-  clearTimeout(SEARCH_TIMER);
-  SEARCH_TIMER = setTimeout(() => {
-    const want = $('filter').value;
-    const query = $('resultSearch').value.trim();
-    if(query || (want && want !== 'all')) loadHistory(want);
-    else { HIST = null; $('tblHint').textContent = '实时刷新'; renderRows(); }
-  }, 250);
+function submitResultSearch(){
+  RESULT_QUERY = $('resultSearch').value.trim();
+  RESULT_PAGE = 1;
+  loadHistory($('filter').value || 'all');
+}
+$('resultSearchBtn').onclick = submitResultSearch;
+$('resultSearch').onkeydown = e => {
+  if(e.key === 'Enter'){ e.preventDefault(); submitResultSearch(); }
+};
+$('resultPrev').onclick = () => {
+  if(RESULT_PAGE <= 1) return;
+  RESULT_PAGE -= 1; loadHistory($('filter').value || 'all');
+};
+$('resultNext').onclick = () => {
+  if(!HIST || !HIST.has_next) return;
+  RESULT_PAGE += 1; loadHistory($('filter').value || 'all');
 };
 
 /* ---- 主循环 ---- */
@@ -2785,9 +2885,7 @@ async function tick(){
 
   LAST = d;
   const want = $('filter').value;
-  const query = $('resultSearch').value.trim();
-  if((!want || want === 'all') && !query) renderRows(); // 查询时不被实时流覆盖
-  else if(!query && want && want !== 'all') loadHistory(want, true);
+  if(!RESULT_QUERY) loadHistory(want || 'all', true);
   else if(!HIST) renderRows();
 
   if(d.accounts && d.accounts !== shownAccounts){
@@ -2801,6 +2899,9 @@ let HIST = null;          // 筛选时从 /api/results 拿的历史结果
 let TICK_RUNNING = false; // 慢请求时不叠加轮询，避免页面突然卡顿
 let HIST_SEQ = 0;
 let HIST_LOADING = false;
+let HIST_PENDING = null;
+let RESULT_PAGE = 1;
+let RESULT_QUERY = '';
 
 function rowHtml(r, idx){
   const st = r.status || 'unknown';
@@ -2917,66 +3018,48 @@ $('timeoutModal').addEventListener('click', e => {
 });
 
 async function loadHistory(want, quiet=false){
-  if(HIST_LOADING) return;
+  if(HIST_LOADING){ HIST_PENDING = [want, quiet]; return; }
   HIST_LOADING = true;
   const seq = ++HIST_SEQ;
-  const query = $('resultSearch').value.trim();
+  const query = RESULT_QUERY;
   if(!quiet) $('tblHint').textContent = '查询中…';
   try{
-    const r = await (await fetch(`/api/results?status=${encodeURIComponent(want)}&limit=100&query=${encodeURIComponent(query)}`)).json();
+    const r = await (await fetch(`/api/results?status=${encodeURIComponent(want)}&limit=100&page=${RESULT_PAGE}&query=${encodeURIComponent(query)}`)).json();
     if(seq !== HIST_SEQ) return;
     const changed = !HIST || HIST.revision !== r.revision ||
-      HIST.total !== r.total || HIST.query !== r.query;
+      HIST.total !== r.total || HIST.query !== r.query || HIST.page !== r.page;
     HIST = r;
-    $('tblHint').textContent = `当前任务共 ${num(r.total)} 条符合条件`;
+    RESULT_PAGE = Number(r.page || 1);
+    $('tblHint').textContent = query
+      ? `查询到 ${num(r.total)} 条`
+      : `共 ${num(r.total)} 条·追加自动刷新`;
+    $('resultPageInfo').textContent = `第 ${num(r.page || 1)} / ${num(r.pages || 1)} 页`;
+    $('resultPrev').disabled = !r.has_prev;
+    $('resultNext').disabled = !r.has_next || Boolean(query);
     if(changed) renderRows();
   }catch(e){
     if(!quiet){ HIST = null; $('tblHint').textContent = '查询失败'; renderRows(); }
-  }finally{ HIST_LOADING = false; }
+  }finally{
+    HIST_LOADING = false;
+    if(HIST_PENDING){
+      const pending = HIST_PENDING; HIST_PENDING = null;
+      loadHistory(pending[0], pending[1]);
+    }
+  }
 }
 
 function renderRows(){
   const want = $('filter').value;
-  const query = $('resultSearch').value.trim();
-  const useHist = Boolean(query || (want && want !== 'all'));
+  const query = RESULT_QUERY;
+  const useHist = Boolean(HIST && HIST.status === (want || 'all') &&
+                          HIST.query === query && Number(HIST.page||1) === RESULT_PAGE);
   const rec = useHist ? ((HIST && HIST.rows) || [])
                       : ((LAST && LAST.recent) || []).slice().reverse();
-  const base = useHist ? (HIST ? HIST.rows.length : 0)
+  const base = useHist ? Math.max(0, Number(HIST.total||0) - (RESULT_PAGE-1)*100)
                        : ((LAST && LAST.done) || 0);
   $('rows').innerHTML = rec.length ? rec.map((r,i)=>rowHtml(r, base - i)).join('')
     : `<tr><td colspan="13" style="text-align:center;color:#9ca3af;padding:24px">
         ${useHist ? '这个分类下还没有记录' : '还没有结果'}</td></tr>`;
-}
-
-function renderRowsOld(){
-  const d = LAST;
-  if(!d){ return; }
-  const want = $('filter').value;
-  let rec = (d.recent||[]).slice().reverse();
-  if(want === 'other') rec = rec.filter(r =>
-    ['undetermined','error','need_mac'].includes(r.status||''));
-  else if(want && want !== 'all') rec = rec.filter(r => (r.status||'') === want);
-  $('rows').innerHTML = rec.length ? rec.map((r,i)=>{
-    const st = r.status || 'unknown';
-    const att = (r.attempts && r.attempts > 1)
-      ? ` <span class="badge b-blue" style="font-size:10px">×${esc(r.attempts)}</span>` : '';
-    const seconds = r.ms == null ? '--' : (Number(r.ms) / 1000).toFixed(2);
-    return `<tr>
-      <td class="mono">${esc(d.done-rec.length+i+1)}</td>
-      <td>${esc(String(r.email||'').slice(0,32)||'--')}</td>
-      <td><span class="badge ${cls(st)}">${esc(statusLabel(st))}</span>${att}</td>
-      <td class="mono">${seconds}</td>
-      <td class="mono">${esc(r.thread_cpu_ms ?? '--')}</td>
-      <td class="mono">${esc(r.slot ?? '--')}</td>
-      <td class="mono">${esc(r.http ?? '--')}</td>
-      <td class="mono">${esc(r.ec ?? '--')}</td>
-      <td style="font-size:11px">${webReviewHtml(r)}</td>
-      <td style="color:#6b7280;font-size:11.5px;max-width:340px;overflow:hidden;
-          text-overflow:ellipsis" title="${esc(r.detail||'')}">
-        ${esc(String(r.detail||'--').slice(0,64))}</td>
-    </tr>`;
-  }).join('') : `<tr><td colspan="10" style="text-align:center;color:#9ca3af;padding:24px">
-    ${want === 'all' ? '还没有结果' : '这个分类下没有结果'}</td></tr>`;
 }
 
 async function loadAccounts(path){

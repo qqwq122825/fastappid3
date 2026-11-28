@@ -55,12 +55,15 @@ def build_jobs(args, total):
         count = min(per, left)
         if count <= 0:
             break
+        result_prefix = str(getattr(args, 'result_prefix', '') or '').strip()
+        result_path = (f'{result_prefix}-p{index}.jsonl' if result_prefix else
+                       os.path.join(DATA, f'mp-p{index}.jsonl'))
         jobs.append({
             'index': index,
             'offset': offset,
             'limit': count,
             'slot_base': args.slot_base + index * args.threads,
-            'out': os.path.join(DATA, f'mp-p{index}.jsonl'),
+            'out': result_path,
             'live': os.path.join(DATA, f'live-p{index}.json'),
         })
     return jobs
@@ -345,6 +348,7 @@ def merge(jobs, started, expected_total=0, wall_started=None):
             'current_oldest_ms': worker_stage_oldest,
         },
         'recent': recent[-12:],
+        'result_paths': [job['out'] for job in jobs if job.get('out')],
         'accounts': os.path.join(DATA, 'accounts-placeholder'),
         'finished': finished and finished_flag,
         'processes': len(jobs),
@@ -360,6 +364,8 @@ def main():
     ap.add_argument('--threads', type=int, default=500, help='每进程并发线程数')
     ap.add_argument('--limit', type=int, default=0, help='总条数，0=全部')
     ap.add_argument('--offset', type=int, default=0)
+    ap.add_argument('--result-prefix', default='', dest='result_prefix',
+                    help='Per-process JSONL prefix for this task')
     ap.add_argument('--slot-base', type=int, default=0, dest='slot_base')
     ap.add_argument('--device-root', default='./data/devices-simple', dest='device_root')
     ap.add_argument('--per-ip', type=int, default=1, dest='per_ip',
