@@ -13,11 +13,13 @@ import gzip
 import hashlib
 import json
 import os
+import platform
 import re
 import shlex
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -31,10 +33,114 @@ ACCOUNT_STATE = os.path.join(HERE, 'data', 'current-accounts.json')
 TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
-APP_VERSION = '2026.11.28.6'
+APP_VERSION = '2026.11.28.7'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
+
+
+def _read_text(path):
+    try:
+        with open(path, encoding='utf-8') as handle:
+            return handle.read().strip()
+    except OSError:
+        return ''
+
+
+def runtime_environment():
+    """Return stable interpreter/CPU facts needed for local/remote A/B tests."""
+    affinity = None
+    try:
+        affinity = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        pass
+    cpu_model = ''
+    cpuinfo = _read_text('/proc/cpuinfo')
+    if cpuinfo:
+        match = re.search(r'(?im)^(?:model name|hardware)\s*:\s*(.+)$', cpuinfo)
+        if match:
+            cpu_model = match.group(1).strip()
+    cpu_max = _read_text('/sys/fs/cgroup/cpu.max')
+    quota_cores = None
+    if cpu_max:
+        quota, _, period = cpu_max.partition(' ')
+        try:
+            if quota != 'max':
+                quota_cores = round(int(quota) / int(period), 3)
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+    try:
+        import gmpy2
+        gmp_version = gmpy2.version()
+    except (ImportError, AttributeError):
+        gmp_version = None
+    try:
+        from fastcheck.protocols.srp_auth import SRP_MATH_BACKEND
+    except ImportError:
+        SRP_MATH_BACKEND = None
+    return {
+        'python': platform.python_version(),
+        'implementation': platform.python_implementation(),
+        'machine': platform.machine(),
+        'platform': platform.platform(),
+        'cpu_model': cpu_model or platform.processor(),
+        'logical_cpus': os.cpu_count(),
+        'affinity_cpus': affinity,
+        'cgroup_cpu_max': cpu_max or None,
+        'quota_cores': quota_cores,
+        'gmpy2': gmp_version,
+        'srp_backend': SRP_MATH_BACKEND,
+        'gil_enabled': (sys._is_gil_enabled()
+                        if hasattr(sys, '_is_gil_enabled') else None),
+    }
+
+
+def runtime_benchmark(thread_count=1000, lock_loops=100, srp_loops=100):
+    """Synthetic CPU/lock benchmark; it never reads accounts or uses network."""
+    thread_count = max(1, min(int(thread_count), 1000))
+    lock_loops = max(1, min(int(lock_loops), 1000))
+
+    def lock_trial(factory):
+        mutex = factory()
+        gate = threading.Event()
+        counter = [0]
+
+        def worker():
+            gate.wait()
+            for _ in range(lock_loops):
+                with mutex:
+                    counter[0] += 1
+
+        cohort = [threading.Thread(target=worker, daemon=True)
+                  for _ in range(thread_count)]
+        for thread in cohort:
+            thread.start()
+        started = time.perf_counter()
+        gate.set()
+        for thread in cohort:
+            thread.join()
+        elapsed = max(time.perf_counter() - started, 1e-9)
+        return {'operations': counter[0], 'seconds': round(elapsed, 6),
+                'operations_per_second': round(counter[0] / elapsed)}
+
+    from fastcheck.protocols.srp_auth import (GrandSlamSRPClient, N, g, i2b,
+                                               mod_pow)
+    server_public = i2b(mod_pow(g, 123456789, N))
+    srp_started = time.perf_counter()
+    srp_loops = max(1, min(int(srp_loops), 500))
+    for index in range(srp_loops):
+        client = GrandSlamSRPClient(f'benchmark-{index}@example.invalid',
+                                   'benchmark-password')
+        client.process_challenge(b'\x01' * 16, server_public, 1000, 's2k')
+    srp_elapsed = max(time.perf_counter() - srp_started, 1e-9)
+    return {
+        'threading_lock': lock_trial(threading.Lock),
+        'semaphore_1': lock_trial(lambda: threading.Semaphore(1)),
+        'srp': {'operations': srp_loops, 'seconds': round(srp_elapsed, 6),
+                'operations_per_second': round(srp_loops / srp_elapsed, 2),
+                'milliseconds_per_operation': round(srp_elapsed * 1000 /
+                                                    srp_loops, 3)},
+    }
 
 
 def normalize_api(url):
@@ -1014,6 +1120,16 @@ class Handler(BaseHTTPRequestHandler):
                                'configured': bool(current)})
         if self.path.startswith('/api/live'):
             return self._json(read_live())
+        if self.path.startswith('/api/diagnostics'):
+            from urllib.parse import urlparse, parse_qs
+            query = parse_qs(urlparse(self.path).query)
+            result = {'runtime': runtime_environment(), 'running': is_running()}
+            if (query.get('benchmark') or ['0'])[0] in ('1', 'true', 'yes'):
+                if result['running']:
+                    result['benchmark_error'] = '任务运行中，不执行 CPU 基准以免干扰'
+                else:
+                    result['benchmark'] = runtime_benchmark()
+            return self._json(result)
         if self.path.startswith('/api/accounts'):
             from urllib.parse import urlparse, parse_qs
             query = parse_qs(urlparse(self.path).query)

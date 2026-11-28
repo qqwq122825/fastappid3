@@ -82,6 +82,32 @@ class ConsoleRequestTests(unittest.TestCase):
         save.assert_called_once_with('https://fixture.invalid/?num={num}')
         self.assertTrue(response['ok'])
 
+    def test_diagnostics_reports_runtime_and_opt_in_benchmark(self):
+        handler = make_handler('/api/diagnostics?benchmark=1', cookie=self.cookie())
+        fixture = {'threading_lock': {'operations_per_second': 123}}
+        with patch.object(web, 'is_running', return_value=False), \
+             patch.object(web, 'runtime_benchmark', return_value=fixture) as bench:
+            response = handler._do_get()
+        bench.assert_called_once_with()
+        self.assertEqual(fixture, response['benchmark'])
+        self.assertIn('python', response['runtime'])
+        self.assertIn('srp_backend', response['runtime'])
+
+    def test_diagnostics_does_not_benchmark_during_a_task(self):
+        handler = make_handler('/api/diagnostics?benchmark=1', cookie=self.cookie())
+        with patch.object(web, 'is_running', return_value=True), \
+             patch.object(web, 'runtime_benchmark') as bench:
+            response = handler._do_get()
+        bench.assert_not_called()
+        self.assertIn('任务运行中', response['benchmark_error'])
+
+    def test_runtime_benchmark_has_lock_and_srp_measurements(self):
+        result = web.runtime_benchmark(thread_count=2, lock_loops=2, srp_loops=1)
+        self.assertEqual(4, result['threading_lock']['operations'])
+        self.assertEqual(4, result['semaphore_1']['operations'])
+        self.assertEqual(1, result['srp']['operations'])
+        self.assertGreater(result['srp']['milliseconds_per_operation'], 0)
+
     def test_supplier_error_is_rejected_before_configuration_save(self):
         handler = make_handler('/api/set-api', {'api': 'https://fixture.invalid/?num=1'},
                                cookie=self.cookie())
@@ -261,7 +287,7 @@ class ConsoleRequestTests(unittest.TestCase):
             self.assertEqual(3, state['device_registered'])
             self.assertEqual(3, state['device_ready'])
             self.assertEqual(3, state['device_total'])
-            self.assertEqual('2026.11.28.6', state['version'])
+            self.assertEqual('2026.11.28.7', state['version'])
 
     def test_linux_process_group_cpu_sums_parent_and_children(self):
         parent = '1 (parent) S 0 77 0 0 0 0 0 0 0 0 200 100 0 0 0 0 0 0 0 0\n'
