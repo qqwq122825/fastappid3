@@ -427,6 +427,71 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
                 'p0-1@example.invalid', 'p1-1@example.invalid',
             ], [row['email'] for row in result['rows']])
 
+    def test_finished_multiprocess_filter_survives_web_restart(self):
+        from pathlib import Path
+        from unittest.mock import patch
+        import web
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = root / 'data'
+            data.mkdir()
+            live_file = data / 'live.json'
+            live_file.write_text(json.dumps({
+                'done': 3, 'total': 3, 'processes': 2,
+                'finished': True, 'by_status': {'timeout': 2}}),
+                encoding='utf-8')
+            (data / 'mp-p0.jsonl').write_text(json.dumps({
+                'email': 'p0@example.invalid', 'status': 'timeout'}) + '\n',
+                encoding='utf-8')
+            (data / 'mp-p1.jsonl').write_text(''.join((
+                json.dumps({'email': 'p1@example.invalid', 'status': 'timeout'}) + '\n',
+                json.dumps({'email': 'ok@example.invalid', 'status': 'locked'}) + '\n')),
+                encoding='utf-8')
+            state = dict(web.STATE, run_out='', started_at=0, processes=1)
+            with patch.object(web, 'HERE', str(root)), \
+                 patch.object(web, 'LIVE', str(live_file)), \
+                 patch.object(web, 'STATE', state), \
+                 patch.object(web, '_active_task_record', return_value=None):
+                web._RESULT_PROGRESS.clear()
+                result = object.__new__(web.Handler)._results('timeout', 100)
+            self.assertTrue(result['scoped'])
+            self.assertEqual(2, result['total'])
+            self.assertEqual({'p0@example.invalid', 'p1@example.invalid'},
+                             {row['email'] for row in result['rows']})
+
+    def test_finished_single_process_filter_uses_latest_run_after_restart(self):
+        from pathlib import Path
+        from unittest.mock import patch
+        import web
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = root / 'data'
+            data.mkdir()
+            live_file = data / 'live.json'
+            live_file.write_text(json.dumps({
+                'done': 1, 'total': 1, 'processes': 1, 'finished': True}),
+                encoding='utf-8')
+            old = data / 'run-1.jsonl'
+            old.write_text(json.dumps({
+                'email': 'old@example.invalid', 'status': 'timeout'}) + '\n',
+                encoding='utf-8')
+            current = data / 'run-2.jsonl'
+            current.write_text(json.dumps({
+                'email': 'current@example.invalid', 'status': 'timeout'}) + '\n',
+                encoding='utf-8')
+            os.utime(old, (1, 1))
+            os.utime(current, (2, 2))
+            state = dict(web.STATE, run_out='', started_at=0, processes=1)
+            with patch.object(web, 'HERE', str(root)), \
+                 patch.object(web, 'LIVE', str(live_file)), \
+                 patch.object(web, 'STATE', state), \
+                 patch.object(web, '_active_task_record', return_value=None):
+                web._RESULT_PROGRESS.clear()
+                result = object.__new__(web.Handler)._results('timeout', 100)
+            self.assertTrue(result['scoped'])
+            self.assertEqual(1, result['total'])
+            self.assertEqual('current@example.invalid', result['rows'][0]['email'])
+
     def test_need_mac_is_grouped_into_other_results(self):
         from pathlib import Path
         from unittest.mock import patch
@@ -685,7 +750,7 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('startup.public_header_waiting', web.PAGE)
         self.assertIn('startup.threads_created', web.PAGE)
         self.assertIn('startup.business_inflight', web.PAGE)
-        self.assertIn('id="versionTag">v2026.11.28.32', web.PAGE)
+        self.assertIn('id="versionTag">v2026.11.28.33', web.PAGE)
         self.assertIn('<div class="v v-green" id="sRate">0</div>', web.PAGE)
         self.assertNotIn('<div class="v sm v-green" id="sRate">0</div>', web.PAGE)
         self.assertNotIn('程序会按需要的数量自动替换 num', web.PAGE)

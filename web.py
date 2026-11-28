@@ -33,7 +33,7 @@ ACCOUNT_STATE = os.path.join(HERE, 'data', 'current-accounts.json')
 TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
-APP_VERSION = '2026.11.28.32'
+APP_VERSION = '2026.11.28.33'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -1353,15 +1353,45 @@ class Handler(BaseHTTPRequestHandler):
         limit = max(1, min(500, int(limit)))
         want = (want or 'all').strip()
         query = str(query or '').strip()[:128].casefold()
+        # Hydrate STATE from task-process.json after a controller restart while
+        # workers are still alive.  Finished tasks no longer have that process
+        # record, so fall back to live.json below.
+        _active_task_record()
         cutoff = STATE.get('started_at') or 0
         own = STATE.get('run_out') or ''
+        completed_live = {}
+        if not cutoff and not (own and os.path.exists(own)):
+            try:
+                with open(LIVE, encoding='utf-8') as handle:
+                    value = json.load(handle)
+                if isinstance(value, dict):
+                    completed_live = value
+            except (OSError, ValueError, TypeError):
+                pass
         if own and os.path.exists(own):
             # 单进程：本轮就是一个文件，直接读全量
             paths = [own]
         else:
-            # 多进程：只读本轮开始后写过的 mp-p*.jsonl
-            paths = sorted(_glob.glob(os.path.join(HERE, 'data', 'mp-p*.jsonl')))
-        scoped = bool(own and os.path.exists(own)) or bool(cutoff)
+            processes = int(completed_live.get('processes') or
+                            STATE.get('processes') or 1)
+            if not cutoff and completed_live and processes <= 1:
+                # A completed single-process task writes a unique run-*.jsonl.
+                # After a web restart STATE.run_out is gone, so use the newest
+                # persisted run file that corresponds to the displayed live
+                # summary rather than silently returning an empty filter.
+                candidates = _glob.glob(os.path.join(HERE, 'data', 'run-*.jsonl'))
+                paths = ([max(candidates, key=os.path.getmtime)]
+                         if candidates else [])
+            else:
+                # run_mp removes mp-p*.jsonl before each task, therefore the
+                # remaining files are exactly the current/latest task.
+                paths = sorted(_glob.glob(
+                    os.path.join(HERE, 'data', 'mp-p*.jsonl')))
+        live_scoped = bool(completed_live and paths and
+                           (completed_live.get('done') is not None or
+                            completed_live.get('total') is not None))
+        scoped = (bool(own and os.path.exists(own)) or bool(cutoff) or
+                  live_scoped)
         # Status-only filters are refreshed every second by the page.  Advance
         # each file's cached byte offset and combine bounded recent deques;
         # never rescan millions of completed rows merely to notice an append.
