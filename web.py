@@ -34,7 +34,7 @@ ACCOUNT_STATE = os.path.join(HERE, 'data', 'current-accounts.json')
 TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
-APP_VERSION = '2026.11.28.35'
+APP_VERSION = '2026.11.28.36'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -719,6 +719,9 @@ _RESULT_PROGRESS = {}
 _RESULT_PROGRESS_LOCK = threading.Lock()
 _RESULT_RECENT_LIMIT = 500
 _OTHER_RESULT_STATUSES = frozenset(('undetermined', 'error', 'need_mac'))
+_RESULT_QUERY_CACHE = collections.OrderedDict()
+_RESULT_QUERY_LOCK = threading.Lock()
+_RESULT_QUERY_CACHE_LIMIT = 4
 
 
 def _result_progress(path):
@@ -852,6 +855,92 @@ def _indexed_result_snapshot(path, want, limit, skip=0):
         except OSError:
             cached_rows = []
     return {'total': int(total), 'rows': cached_rows, 'revision': revision}
+
+
+def _query_result_snapshot(path, want, query, limit, skip=0):
+    """Index one explicit account query and return a bounded result page.
+
+    Account searches are user-triggered rather than polled.  The first search
+    scans the file once and stores only matching 64-bit byte offsets.  Page
+    switches then seek at most ``limit`` rows, while a later repeat scans only
+    offsets appended since the previous search.  The small LRU prevents broad
+    searches across million-row files from growing memory without bound.
+    """
+    _result_progress(path)
+    cache_path = os.path.realpath(path)
+    with _RESULT_PROGRESS_LOCK:
+        progress = _RESULT_PROGRESS.get(cache_path)
+        if progress is None:
+            return {'total': 0, 'rows': [], 'revision': 'missing'}
+        generation = progress['key']
+        indexed_total = len(progress['offsets'])
+        revision = (f'{generation[1]}:{generation[2]}:'
+                    f'{progress["offset"]}:{progress["done"]}')
+
+    cache_key = (cache_path, str(want or 'all'), str(query or '').casefold())
+    with _RESULT_QUERY_LOCK:
+        cached = _RESULT_QUERY_CACHE.pop(cache_key, None)
+        if (cached is None or cached['generation'] != generation or
+                cached['indexed'] > indexed_total):
+            cached = {'generation': generation, 'indexed': 0,
+                      'offsets': array.array('Q')}
+
+        start = cached['indexed']
+        if start < indexed_total:
+            with _RESULT_PROGRESS_LOCK:
+                progress = _RESULT_PROGRESS.get(cache_path)
+                positions = (array.array('Q', progress['offsets'][start:indexed_total])
+                             if progress is not None else array.array('Q'))
+            try:
+                with open(path, 'rb') as handle:
+                    for position in positions:
+                        handle.seek(position)
+                        raw = handle.readline()
+                        try:
+                            row = json.loads(raw.decode('utf-8', 'replace'))
+                        except (ValueError, TypeError):
+                            continue
+                        if not isinstance(row, dict):
+                            continue
+                        status = str(row.get('status') or '')
+                        email = str(row.get('email') or '')
+                        if cache_key[2] not in email.casefold():
+                            continue
+                        if want == 'other':
+                            if status not in _OTHER_RESULT_STATUSES:
+                                continue
+                        elif want not in ('', 'all') and status != want:
+                            continue
+                        cached['offsets'].append(position)
+            except OSError:
+                pass
+            cached['indexed'] = indexed_total
+
+        _RESULT_QUERY_CACHE[cache_key] = cached
+        _RESULT_QUERY_CACHE.move_to_end(cache_key)
+        while len(_RESULT_QUERY_CACHE) > _RESULT_QUERY_CACHE_LIMIT:
+            _RESULT_QUERY_CACHE.popitem(last=False)
+        total = len(cached['offsets'])
+        end = max(0, total - max(0, int(skip)))
+        begin = max(0, end - max(0, int(limit)))
+        selected = list(reversed(cached['offsets'][begin:end]))
+
+    rows = []
+    try:
+        with open(path, 'rb') as handle:
+            for position in selected:
+                handle.seek(position)
+                raw = handle.readline()
+                try:
+                    row = json.loads(raw.decode('utf-8', 'replace'))
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(row, dict):
+                    rows.append(row)
+    except OSError:
+        rows = []
+    return {'total': total, 'rows': rows,
+            'revision': f'{revision}:q{cached["indexed"]}:{total}'}
 
 
 def _validated_result_paths(values):
@@ -1237,6 +1326,8 @@ def _reset_run_artifacts(processes):
     _LIVE_CACHE.update(at=0.0, data=None)
     with _RESULT_PROGRESS_LOCK:
         _RESULT_PROGRESS.clear()
+    with _RESULT_QUERY_LOCK:
+        _RESULT_QUERY_CACHE.clear()
 
 
 def clear_devices():
@@ -1497,75 +1588,42 @@ class Handler(BaseHTTPRequestHandler):
                     'page': page, 'pages': pages,
                     'has_prev': page > 1, 'has_next': page < pages}
 
-        # Arbitrary substring searches remain explicit, debounced operations.
-        # They scan the current run once when the user changes the query, but
-        # are not repeated by the background refresh timer.
-        out, seen, total = collections.deque(maxlen=limit), set(), 0
-        if True:
-            for path in paths:
-                try:
-                    if cutoff and os.path.getmtime(path) < cutoff - 5:
-                        continue
-                except OSError:
+        # Arbitrary account searches are explicit operations.  Their matching
+        # offsets are cached, so page changes never rescan a multi-million-row
+        # file and the browser still receives only one bounded page.
+        snapshots = []
+        for path in paths:
+            try:
+                if cutoff and os.path.getmtime(path) < cutoff - 5:
                     continue
-                try:
-                    handle = open(path, encoding='utf-8', errors='replace')
-                except OSError:
-                    continue
-                with handle:
-                    for line in handle:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            r = json.loads(line)
-                        except ValueError:
-                            continue
-                        st = str(r.get('status') or '')
-                        email = str(r.get('email') or '')
-                        if query and query not in email.casefold():
-                            continue
-                        if want == 'other':
-                            if st not in ('undetermined', 'error', 'need_mac'):
-                                continue
-                        elif want not in ('', 'all') and st != want:
-                            continue
-                        key = (email, st)
-                        if key in seen:
-                            continue
-                        seen.add(key)
-                        total += 1
-                        out.append({'email': email, 'status': st,
-                                    'attempts': r.get('attempts'),
-                                    'http': r.get('http'), 'ec': r.get('ec'),
-                                    'ms': r.get('ms'), 'slot': r.get('slot'),
-                                    'device_id': r.get('device_id'),
-                                    'device_uses': r.get('device_uses'),
-                                    'device_limit': r.get('device_limit'),
-                                    'cpu': r.get('thread_cpu_ms'),
-                                    'detail': r.get('detail'),
-                                    'web_status': r.get('web_status'),
-                                    'web_ec': r.get('web_ec'),
-                                    'web_detail': r.get('web_detail'),
-                                    'web_method': r.get('web_method'),
-                                    'web_auth_type': r.get('web_auth_type'),
-                                    'web_attempts': r.get('web_attempts'),
-                                    'web_proxy_rotations': r.get('web_proxy_rotations'),
-                                    'web_rotation_exhausted': r.get('web_rotation_exhausted'),
-                                    'web_ms': r.get('web_ms'),
-                                    'retry_reason': r.get('retry_reason'),
-                                    'proxy_changed': r.get('proxy_changed'),
-                                    'proxy_change_count': r.get('proxy_change_count'),
-                                    'proxy_entries': r.get('proxy_entries'),
-                                    'retry_ip_ms': r.get('retry_ip_ms'),
-                                    'ip_wait_none': r.get('ip_wait_none')})
-        rows = list(reversed(out))          # 新的在前
+            except OSError:
+                continue
+            snapshots.append((path, _query_result_snapshot(
+                path, want, query, 0)))
+        total = sum(snapshot['total'] for _, snapshot in snapshots)
+        pages = max(1, (total + limit - 1) // limit)
+        page = min(page, pages)
+        skip = (page - 1) * limit
+        rows = []
+        for path, snapshot in snapshots:
+            if skip >= snapshot['total']:
+                skip -= snapshot['total']
+                continue
+            take = min(limit - len(rows), snapshot['total'] - skip)
+            if take > 0:
+                rows.extend(_query_result_snapshot(
+                    path, want, query, take, skip=skip)['rows'])
+            skip = 0
+            if len(rows) >= limit:
+                break
+        revision = '|'.join(snapshot['revision']
+                            for _, snapshot in snapshots)
         return {'total': total if scoped else 0,
                 'rows': rows if scoped else [],
                 'status': want, 'query': query, 'scoped': scoped,
-                'revision': '', 'incremental': False,
-                'page': 1, 'pages': max(1, (total + limit - 1) // limit),
-                'has_prev': False, 'has_next': total > limit}
+                'revision': revision, 'incremental': True,
+                'page': page, 'pages': pages,
+                'has_prev': page > 1, 'has_next': page < pages}
 
     def _export(self, want, fmt):
         """按状态筛选导出账号。只保留 邮箱----密码 两列，不带其他信息。

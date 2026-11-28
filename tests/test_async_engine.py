@@ -637,6 +637,35 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual('Needle.User@example.com', result['rows'][0]['email'])
             self.assertEqual('needle.user', result['query'])
 
+    def test_result_search_pages_reuse_compact_match_offsets(self):
+        from pathlib import Path
+        from unittest.mock import patch
+        import web
+        with tempfile.TemporaryDirectory() as directory:
+            result_file = Path(directory) / 'run.jsonl'
+            result_file.write_text(''.join(json.dumps({
+                'email': f'needle{index}@example.invalid',
+                'status': 'timeout'}) + '\n' for index in range(250)),
+                encoding='utf-8')
+            state = dict(web.STATE, run_out=str(result_file), started_at=1)
+            with patch.object(web, 'STATE', state):
+                web._RESULT_PROGRESS.clear()
+                web._RESULT_QUERY_CACHE.clear()
+                page2 = object.__new__(web.Handler)._results(
+                    'timeout', 100, 'needle', page=2)
+                cached = next(iter(web._RESULT_QUERY_CACHE.values()))
+                page1 = object.__new__(web.Handler)._results(
+                    'timeout', 100, 'needle', page=1)
+            self.assertEqual(250, page2['total'])
+            self.assertEqual(3, page2['pages'])
+            self.assertTrue(page2['has_prev'])
+            self.assertTrue(page2['has_next'])
+            self.assertEqual('needle149@example.invalid',
+                             page2['rows'][0]['email'])
+            self.assertEqual('needle249@example.invalid',
+                             page1['rows'][0]['email'])
+            self.assertEqual(250, len(cached['offsets']))
+
     def test_stale_live_state_uses_incremental_result_progress(self):
         from pathlib import Path
         from unittest.mock import patch
@@ -811,7 +840,7 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('startup.public_header_waiting', web.PAGE)
         self.assertIn('startup.threads_created', web.PAGE)
         self.assertIn('startup.business_inflight', web.PAGE)
-        self.assertIn('id="versionTag">v2026.11.28.35', web.PAGE)
+        self.assertIn('id="versionTag">v2026.11.28.36', web.PAGE)
         self.assertIn('<div class="v v-green" id="sRate">0</div>', web.PAGE)
         self.assertNotIn('<div class="v sm v-green" id="sRate">0</div>', web.PAGE)
         self.assertNotIn('程序会按需要的数量自动替换 num', web.PAGE)
