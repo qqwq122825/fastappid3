@@ -33,7 +33,7 @@ ACCOUNT_STATE = os.path.join(HERE, 'data', 'current-accounts.json')
 TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
-APP_VERSION = '2026.11.28.15'
+APP_VERSION = '2026.11.28.16'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -815,7 +815,7 @@ def _live_state_uncached():
 # ---------------------------------------------------------------- 任务控制
 def start_job(accounts, threads, limit, processes=1, verify_web=False,
               per_ip=6, ip_ttl=50.0, timeout=20.0, anisette_workers=0,
-              no_register=False, retry=2, item_timeout=20.0, anisette_proxy=False,
+              no_register=False, retry=2, item_timeout=None, anisette_proxy=False,
               device_max_uses=100, anisette_timeout=20.0):
     if is_running():
         return {'error': '已有任务在跑，先停止'}
@@ -825,10 +825,10 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
     if not os.path.exists(accounts):
         return {'error': f'账号文件不存在: {accounts}'}
     threads = max(1, min(int(threads or 0), MAX_THREADS))
-    # 页面只暴露一个流程超时：注册设备、公共头、账号验证和
-    # 单条总预算使用同一数值。保留旧形参仅为兼容调用方。
+    # 页面只暴露一个流程超时：注册设备、公共头、每次账号验证和
+    # Web 复核分别使用同一数值；不再叠加“整条账号总预算”。
+    # item_timeout 仅保留为旧调用方兼容形参，不再传给工作进程。
     flow_timeout = max(1.0, float(timeout or 20.0))
-    item_timeout = flow_timeout
     anisette_timeout = flow_timeout
     limit = max(0, int(limit or 0))
     account_info = analyse_accounts(accounts)
@@ -881,7 +881,6 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
             cmd.append('--verify-web')
         cmd += ['--per-ip', str(per_ip), '--ip-ttl', str(ip_ttl),
                 '--timeout', str(flow_timeout), '--retry', str(retry),
-                '--item-timeout', str(item_timeout),
                 '--anisette-timeout', str(flow_timeout),
                 '--register-timeout', str(flow_timeout),
                 '--web-timeout', str(flow_timeout),
@@ -900,7 +899,6 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
                '--out', run_out,
                '--per-ip', str(per_ip), '--ip-ttl', str(ip_ttl),
                '--timeout', str(flow_timeout), '--retry', str(retry),
-               '--item-timeout', str(item_timeout),
                '--anisette-timeout', str(flow_timeout),
                '--register-timeout', str(flow_timeout),
                '--web-timeout', str(flow_timeout),
@@ -1655,7 +1653,6 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
         <input type="number" id="totalConcurrency" value="800" min="1" max="16000" placeholder="例如 800">
         <input type="hidden" id="processes" value="8">
         <input type="hidden" id="threads" value="100">
-        <div class="hint" id="rechint"></div>
       </div>
 
       <div class="field">
@@ -1674,7 +1671,7 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
         </div>
         <div style="margin-top:10px">
           <div><input type="number" id="timeout" value="20" min="3" max="120" step="1">
-            <div class="hint">统一超时/秒（注册设备、公共头、账号验证共用）</div></div>
+            <div class="hint">统一超时/秒（各流程分别计时）</div></div>
         </div>
         <div style="margin-top:10px">
           <input type="number" id="deviceMaxUses" value="100" min="0" max="100000">
@@ -2065,25 +2062,16 @@ $('stop').onclick = stop;
 $('refresh').onclick = () => { shownAccounts=null; tick(); };
 $('clearDevices').onclick = clearDevices;
 
-/* ---- 推荐提示 ---- */
-function refreshHint(){
+/* ---- 总并发按固定 8 进程均分 ---- */
+function syncConcurrency(){
   const p=Math.max(1, Math.min(8, Number.parseInt($('processes').value,10)||1));
   const requested=Math.max(1, Math.min(16000,
     Number.parseInt($('totalConcurrency').value,10)||1));
   const t=Math.max(1, Math.ceil(requested/p));
-  const total=p*t, warn=[];
   $('threads').value=String(t);
-  if(p===1 && t>1600) warn.push('单进程超 1600 线程会放大上游长尾');
-  if(total>4000) warn.push(`总线程 ${total} 可能放大代理排队`);
-  if(p>1 && t>1600) warn.push('每进程超 1600 线程边际递减');
-  $('rechint').textContent = warn.length ? '⚠ '+warn.join('；')
-    : `${p} 进程 × ${t} 线程 = ${total} 并发`
-      + (total!==requested ? `（输入 ${requested}，向上均分）` : '');
-  $('rechint').style.color = warn.length ? 'var(--amber)' : 'var(--dim)';
-  $('rechint').style.color = warn.length ? 'var(--amber)' : 'var(--dim)';
 }
-$('totalConcurrency').addEventListener('input', refreshHint);
-refreshHint();
+$('totalConcurrency').addEventListener('input', syncConcurrency);
+syncConcurrency();
 
 /* ---- 导出 ---- */
 function exportAs(fmt){

@@ -569,13 +569,13 @@ def main():
     ap.add_argument('--slot-base', type=int, default=0, dest='slot_base',
                     help='设备槽位基址，多进程时各进程不重叠')
     ap.add_argument('--timeout', type=float, default=20.0,
-                    help='统一流程超时：注册设备、公共头、账号验证和单条总预算')
+                    help='统一流程超时：注册设备、公共头、每次账号验证和 Web 复核各自独立')
     ap.add_argument('--retries', type=int, default=0,
                     help='协议内重试（同一 IP 同一公共头），一般留 0')
     ap.add_argument('--no-fix-os', action='store_true', dest='no_fix_os',
                     help='不覆盖 macOS 10.12 的设备头（默认会覆盖成 14.0，避免 -23782）')
-    ap.add_argument('--item-timeout', type=float, default=20.0, dest='item_timeout',
-                    help='单条账号的墙钟总预算（含所有重试），超了就判超时放弃')
+    ap.add_argument('--item-timeout', type=float, default=None, dest='item_timeout',
+                    help=argparse.SUPPRESS)  # 旧命令兼容；不再限制整条账号总耗时
     ap.add_argument('--retry', type=int, default=2, dest='retry',
                     help='外层重试：http=0 / 5xx / -22421 时换 IP 重来（0=不重试）')
     ap.add_argument('--no-register', action='store_true')
@@ -614,7 +614,6 @@ def main():
     args = ap.parse_args()
     flow_timeout = max(1.0, float(args.timeout or 20.0))
     args.timeout = flow_timeout
-    args.item_timeout = flow_timeout
     args.anisette_timeout = flow_timeout
     args.register_timeout = flow_timeout
     args.web_timeout = flow_timeout
@@ -763,15 +762,12 @@ def main():
             return task_queue.popleft() if task_queue else None
     lock = _new_state_lock()
     sink_lock = threading.Lock()       # 结果落盘不占用状态锁
-    budget_lock = threading.Lock()     # 预算日志有独立的 I/O 锁
     info_gate = threading.Lock()       # 全进程只获取一次 anisette 客户端信息
     info_cache = {}
     sink = open(args.out, 'w', encoding='utf-8')
     write_buffer = []          # 攒够再落盘，避免每条都 fsync
     worker_leases = {}         # tid -> process-local in-memory device claim
     device_headers = ProcessDeviceHeaderCache()
-    # 预算耗尽专用日志：每条 budget_hit 一行，含 OTP/每跳耗时拆解，方便单独分析
-    budget_sink = open(os.path.splitext(args.out)[0] + '-budget.jsonl', 'w', encoding='utf-8')
     started = time.perf_counter()
     wall_started = time.time()
     proc_cpu_start = time.process_time()
@@ -960,7 +956,6 @@ def main():
                 'ip_pool': pool_snapshot,
                 'startup': startup_snapshot,
                 'retried': results.get('retried', 0),
-                'budget_hit': results.get('budget_hit', 0),
                 'by_retry': results.get('by_retry') or {},
                 'otp_hit': results.get('otp_hit', 0),
                 'writer_cpu': round(time.thread_time() - wcpu0, 2),
@@ -1408,33 +1403,17 @@ def main():
                 cpu0 = time.thread_time()
                 attempts = 0
                 retry_reason = ''
-                budget_hit = False
                 attempt_ms = []                 # 每次 gs.check 的实际墙钟耗时
-                budget_left_ms = None            # 预算耗尽时还剩多少（负数=超出）
                 retry_ip_ms = []                 # 重试换 IP 时 ip_pool.acquire 的等待耗时
                 ip_wait_none = False             # 重试里是否因为「等不到 IP」而中断
-                budget = max(1.0, float(args.item_timeout))
                 gsa_started = False
                 try:
                     # ---- 外层重试：只有链路/环境问题才换环境重来 ----
                     attempts = 0
                     t_chk = time.perf_counter()
                     c0_chk = time.thread_time()
-                    # 预算从 OTP 之后开始算：慢的 anisette 不该吃掉 GSA 重试预算。
-                    # 之前 deadline = t0 + budget 把 fetch_otp 耗时也算进 20s，
-                    # 导致 OTP 一慢就「attempts=1 + 单条预算用尽」。
-                    deadline = time.perf_counter() + budget
-                    budget_hit = False
                     while True:
                         attempts += 1
-                        remain = deadline - time.perf_counter()
-                        if remain < 1.0:
-                            # 预算耗尽：不再发请求，直接判超时
-                            result = {'status': 'timeout', 'kind': 'budget',
-                                      'detail': f'单条预算 {budget:.0f}s 用尽', 'http': 0}
-                            budget_hit = True
-                            retry_reason = 'budget'
-                            break
                         # gs.check 内部有 init + complete 两跳，每跳读超时 per_hop，
                         # 与 gsa-console 使用相同阈值：每个 GSA 请求独立获得
                         # connect/read 时间，不再把账号总预算切碎到剩余重试和两跳。
@@ -1482,8 +1461,6 @@ def main():
                         served = max(0, served - 1)   # 重试不占 per_ip 配额
                     chk_ms = (time.perf_counter() - t_chk) * 1000
                     chk_cpu = (time.thread_time() - c0_chk) * 1000
-                    if budget_hit:
-                        budget_left_ms = round((deadline - time.perf_counter()) * 1000, 1)
                 except Exception as exc:                            # noqa: BLE001
                     otp_ms = chk_ms = 0.0
                     otp_cpu = chk_cpu = 0.0
@@ -1628,8 +1605,7 @@ def main():
                        'http': result.get('http'), 'ms': round(elapsed, 1),
                        'thread_cpu_ms': round(thread_cpu, 2),
                        'attempts': attempts, 'retry_reason': retry_reason,
-                       'budget_hit': budget_hit,
-                       'attempt_ms': attempt_ms, 'budget_left_ms': budget_left_ms,
+                       'attempt_ms': attempt_ms,
                        'retry_ip_ms': retry_ip_ms, 'ip_wait_none': ip_wait_none,
                        'ip_ms': round(ip_ms, 1), 'otp_ms': round(otp_ms, 1),
                        'chk_ms': round(chk_ms, 1), 'gap_ms': round(gap_ms, 2),
@@ -1641,22 +1617,6 @@ def main():
                        'web_rotation_exhausted': web_rotation_exhausted,
                        'web_ms': round(web_ms, 1)}
                 line = json.dumps(row, ensure_ascii=False)
-                budget_line = None
-                if budget_hit:
-                    budget_line = json.dumps({
-                        'at': time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime()),
-                        'tid': tid, 'slot': slot, 'email': email,
-                        'proxy': row['proxy'],
-                        'budget_ms': round(budget * 1000, 1),
-                        'otp_ms': round(otp_ms, 1), 'chk_ms': round(chk_ms, 1),
-                        'ip_ms': round(ip_ms, 1), 'gap_ms': round(gap_ms, 2),
-                        'attempts': attempts, 'attempt_ms': attempt_ms,
-                        'budget_left_ms': budget_left_ms,
-                        'retry_reason': retry_reason,
-                        'retry_ip_ms': retry_ip_ms,
-                        'ip_wait_ms': round(sum(retry_ip_ms), 1),
-                        'ip_wait_none': ip_wait_none,
-                    }, ensure_ascii=False) + '\n'
                 batch = None
                 mark_worker_stage(tid, 'result_write')
                 with lock:
@@ -1683,8 +1643,6 @@ def main():
                     elif otp_metric == 'fetch':
                         results['otp_fetch'] = results.get('otp_fetch', 0) + 1
                     seg['chk'].append(chk_ms)
-                    if budget_hit:
-                        results['budget_hit'] = results.get('budget_hit', 0) + 1
                     if attempts > 1:
                         results['retried'] = results.get('retried', 0) + 1
                         rk = results.setdefault('by_retry', {})
@@ -1712,10 +1670,6 @@ def main():
                         batch = write_buffer[:]
                         write_buffer.clear()
                 first_result.set()
-                if budget_line is not None:
-                    with budget_lock:
-                        budget_sink.write(budget_line)
-                        budget_sink.flush()
                 if batch is not None:                   # 序列化和落盘都在状态锁外
                     with sink_lock:
                         sink.write('\n'.join(batch) + '\n')
@@ -1838,10 +1792,6 @@ def main():
             sink.write('\n'.join(write_buffer) + '\n')
             write_buffer.clear()
     sink.close()
-    try:
-        budget_sink.close()
-    except OSError:
-        pass
     stop.set()
     live_thread.join(timeout=3)      # 必须等写线程退出，否则它会覆盖最终状态
     startup_thread.join(timeout=3)
@@ -1932,8 +1882,6 @@ def main():
     if hit or fetch:
         print(f'公共头: 复用命中 {hit} 条 · 真实拉取 {fetch} 次 · '
               f'复用率 {hit/(hit+fetch)*100:.1f}%')
-    if results.get('budget_hit'):
-        print(f'预算耗尽: {results["budget_hit"]} 条（超过 {args.item_timeout:.0f}s 直接判超时）')
     if results.get('retried'):
         print(f'重试: {results["retried"]} 条触发 · 原因分布 {results.get("by_retry")}')
     if ip_pool is not None:

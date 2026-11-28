@@ -94,7 +94,6 @@ def spawn(args, jobs):
                '--per-ip', str(args.per_ip),
                '--otp-reuse', str(args.otp_reuse),
                '--retry', str(args.retry),
-               '--item-timeout', str(args.item_timeout),
                '--ip-ttl', str(args.ip_ttl),
                '--out', job['out'],
                '--live', job['live'],
@@ -362,9 +361,9 @@ def main():
                     help='一个公共头验多少条账号（0=每条都换）')
     ap.add_argument('--ip-ttl', type=float, default=50.0, dest='ip_ttl')
     ap.add_argument('--timeout', type=float, default=20.0,
-                    help='统一流程超时：注册设备、公共头、账号验证和单条总预算')
-    ap.add_argument('--item-timeout', type=float, default=20.0, dest='item_timeout',
-                    help='单条账号墙钟总预算（含重试）')
+                    help='统一流程超时：注册设备、公共头、每次账号验证和 Web 复核各自独立')
+    ap.add_argument('--item-timeout', type=float, default=None, dest='item_timeout',
+                    help=argparse.SUPPRESS)  # 旧命令兼容；不再传给工作进程
     ap.add_argument('--retry', type=int, default=2,
                     help='外层重试：http=0 / 5xx / -22421 时换环境重来')
     ap.add_argument('--anisette-proxy', action='store_true', dest='anisette_proxy',
@@ -383,7 +382,6 @@ def main():
     args = ap.parse_args()
     flow_timeout = max(1.0, float(args.timeout or 20.0))
     args.timeout = flow_timeout
-    args.item_timeout = flow_timeout
     args.anisette_timeout = flow_timeout
     args.register_timeout = flow_timeout
     args.web_timeout = flow_timeout
