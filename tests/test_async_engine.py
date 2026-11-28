@@ -12,7 +12,8 @@ from fastcheck.status import result_bucket
 from gsafast.ippool import IpPool
 from simple_async import _attempt_slice
 from simple import (anisette_concurrency_limit, startup_worker_batches,
-                    _new_state_lock, _proxy_host, _shared_device_info)
+                    _new_state_lock, _proxy_host, _shared_device_info,
+                    finalize_retry_exhausted, retry_kind)
 
 
 class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
@@ -552,7 +553,7 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('startup.public_header_waiting', web.PAGE)
         self.assertIn('startup.threads_created', web.PAGE)
         self.assertIn('startup.business_inflight', web.PAGE)
-        self.assertIn('id="versionTag">v2026.11.28.24', web.PAGE)
+        self.assertIn('id="versionTag">v2026.11.28.25', web.PAGE)
         self.assertIn('<div class="v v-green" id="sRate">0</div>', web.PAGE)
         self.assertNotIn('<div class="v sm v-green" id="sRate">0</div>', web.PAGE)
         self.assertNotIn('程序会按需要的数量自动替换 num', web.PAGE)
@@ -651,6 +652,15 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         row = gsa_async._result(
             'error', 'init timeout', time.time(), kind='network', http=0)
         self.assertEqual(0, row['http'])
+        self.assertEqual('timeout', result_bucket(row))
+
+    def test_http_503_is_retried_and_remains_timeout_when_exhausted(self):
+        row = {'status': 'error', 'kind': 'server', 'http': 503,
+               'detail': 'HTTP 503; Content-Type=text/html'}
+        bucket = result_bucket(row)
+        self.assertEqual('timeout', bucket)
+        self.assertEqual(('5xx', 'http=503'), retry_kind(row, bucket))
+        finalize_retry_exhausted(row)
         self.assertEqual('timeout', result_bucket(row))
 
     def test_retry_attempts_share_item_budget_evenly(self):

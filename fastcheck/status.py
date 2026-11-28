@@ -70,10 +70,16 @@ def result_bucket(result):
     # 请求没有拿到任何 HTTP 响应时，协议层统一记录 http=0。它不是业务
     # 返回，也不应该落入“其他未验证”；按用户可理解的口径归为超时。
     try:
-        explicit_http_zero = 'http' in result and result.get('http') is not None and int(result['http']) == 0
+        explicit_http = (int(result['http']) if 'http' in result
+                         and result.get('http') is not None else None)
     except (TypeError, ValueError):
-        explicit_http_zero = False
-    if explicit_http_zero:
+        explicit_http = None
+    if explicit_http == 0:
+        return 'timeout'
+    # HTTP 503 is a transient Apple/service-chain failure.  It already enters
+    # the retry + proxy-rotation path; keep the exhausted result in the same
+    # user-facing "timeout" bucket instead of leaking it into "other".
+    if explicit_http == 503:
         return 'timeout'
     # 账号业务分类以 Apple 返回的英文原因为准，不用可复用于多种
     # 原因的 ec 错误码猜测账号状态。-22421 仅是设备环境异常的重试信号。
