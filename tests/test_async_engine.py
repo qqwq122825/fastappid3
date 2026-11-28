@@ -792,9 +792,9 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('`P${p.process} `', web.PAGE)
         self.assertIn('· 合计 ', web.PAGE)
         self.assertIn("'补货中'", web.PAGE)
-        self.assertEqual(2, web.PAGE.count(
+        self.assertEqual(1, web.PAGE.count(
             "const seconds = r.ms == null ? '--' : (Number(r.ms) / 1000).toFixed(2);"))
-        self.assertEqual(2, web.PAGE.count('${seconds}</td>'))
+        self.assertEqual(1, web.PAGE.count('${seconds}</td>'))
 
     def test_startup_progress_is_visible_before_first_result(self):
         import web

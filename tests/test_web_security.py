@@ -558,8 +558,6 @@ const context = vm.createContext({
 new vm.Script(input.source, {filename: 'web-inline.js'}).runInContext(context);
 (async () => {
   const row = vm.runInContext('rowHtml(fixtureRow, fixtureText)', context);
-  vm.runInContext("LAST = {done: 1, recent: [fixtureRow]}; $('filter').value = 'all'; renderRowsOld();", context);
-  const legacy = element('rows').innerHTML;
   context.fetch = async () => ({json: async () => ({error: input.fixture})});
   await vm.runInContext('TICK_RUNNING = false; tick()', context);
   const error = element('stateTag').innerHTML;
@@ -573,7 +571,7 @@ new vm.Script(input.source, {filename: 'web-inline.js'}).runInContext(context);
   const nonTimeout = vm.runInContext("timeoutDetailText({status:'locked'},false)", context);
   const timeoutPayload = vm.runInContext('timeoutDetailPayload(fixtureRow)', context);
   const timeoutRow = vm.runInContext("rowHtml({email:'wait@example.invalid',status:'timeout',http:503,attempts:5,retry_reason:'http=503',proxy_entries:['gate:1000','gate:1001'],proxy_changed:true,proxy_change_count:1,retry_ip_ms:[12.4],detail:'fixture'},1)", context);
-  console.log(JSON.stringify({row, legacy, error, reset, timeoutChanged, timeoutSame,
+  console.log(JSON.stringify({row, error, reset, timeoutChanged, timeoutSame,
     nonTimeout, timeoutPayload, timeoutRow}));
 })().catch(error => { console.error(error); process.exitCode = 1; });
 '''
@@ -585,19 +583,19 @@ new vm.Script(input.source, {filename: 'web-inline.js'}).runInContext(context);
         cls.rendered = json.loads(result.stdout)
 
     def test_result_text_is_not_interpreted_as_markup(self):
-        for name in ('row', 'legacy'):
+        for name in ('row',):
             with self.subTest(renderer=name):
                 parsed = ParsedHTML(self.rendered[name])
                 self.assertNotIn('b', parsed.tags)
                 self.assertIn(self.fixture, ''.join(parsed.text))
 
     def test_detail_tooltip_preserves_literal_text(self):
-        for name in ('row', 'legacy'):
+        for name in ('row',):
             with self.subTest(renderer=name):
                 self.assertEqual([self.fixture], ParsedHTML(self.rendered[name]).titles)
 
     def test_duration_keeps_seconds_format(self):
-        for name in ('row', 'legacy'):
+        for name in ('row',):
             with self.subTest(renderer=name):
                 self.assertIn('1.25', ParsedHTML(self.rendered[name]).text)
 
