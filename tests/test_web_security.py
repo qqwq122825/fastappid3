@@ -287,7 +287,7 @@ class ConsoleRequestTests(unittest.TestCase):
             self.assertEqual(3, state['device_registered'])
             self.assertEqual(3, state['device_ready'])
             self.assertEqual(3, state['device_total'])
-            self.assertEqual('2026.11.28.28', state['version'])
+            self.assertEqual('2026.11.28.29', state['version'])
 
     def test_linux_process_group_cpu_sums_parent_and_children(self):
         parent = '1 (parent) S 0 77 0 0 0 0 0 0 0 0 200 100 0 0 0 0 0 0 0 0\n'
@@ -571,7 +571,10 @@ new vm.Script(input.source, {filename: 'web-inline.js'}).runInContext(context);
   const timeoutChanged = vm.runInContext("timeoutDetailText({status:'timeout',attempts:3,proxy_entries:['gate:1000','gate:1001'],proxy_changed:true,proxy_change_count:1,retry_ip_ms:[12.4]},false)", context);
   const timeoutSame = vm.runInContext("timeoutDetailText({status:'timeout',attempts:2,proxy_entries:['gate:1000','gate:1000'],proxy_changed:false,proxy_change_count:0,retry_ip_ms:[8]},false)", context);
   const nonTimeout = vm.runInContext("timeoutDetailText({status:'locked'},false)", context);
-  console.log(JSON.stringify({row, legacy, error, reset, timeoutChanged, timeoutSame, nonTimeout}));
+  const timeoutPayload = vm.runInContext('timeoutDetailPayload(fixtureRow)', context);
+  const timeoutRow = vm.runInContext("rowHtml({email:'wait@example.invalid',status:'timeout',http:503,attempts:5,retry_reason:'http=503',proxy_entries:['gate:1000','gate:1001'],proxy_changed:true,proxy_change_count:1,retry_ip_ms:[12.4],detail:'fixture'},1)", context);
+  console.log(JSON.stringify({row, legacy, error, reset, timeoutChanged, timeoutSame,
+    nonTimeout, timeoutPayload, timeoutRow}));
 })().catch(error => { console.error(error); process.exitCode = 1; });
 '''
         source = web.PAGE.split('<script>', 1)[1].split('</script>', 1)[0]
@@ -605,6 +608,15 @@ new vm.Script(input.source, {filename: 'web-inline.js'}).runInContext(context);
         self.assertIn('重试 2 次', self.rendered['timeoutChanged'])
         self.assertIn('入口未变', self.rendered['timeoutSame'])
         self.assertEqual('', self.rendered['nonTimeout'])
+
+    def test_timeout_detail_button_exposes_modal_payload(self):
+        parsed = ParsedHTML(self.rendered['timeoutRow'])
+        self.assertIn('button', parsed.tags)
+        self.assertIn('详情', parsed.text)
+        self.assertIn('id="timeoutModal"', web.PAGE)
+        self.assertIn('id="timeoutRoute"', web.PAGE)
+        self.assertIn('openTimeoutDetail(JSON.parse', web.PAGE)
+        self.assertEqual(self.fixture, self.rendered['timeoutPayload']['email'])
 
     def test_error_text_is_not_interpreted_as_markup(self):
         parsed = ParsedHTML(self.rendered['error'])

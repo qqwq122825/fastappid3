@@ -33,7 +33,7 @@ ACCOUNT_STATE = os.path.join(HERE, 'data', 'current-accounts.json')
 TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
-APP_VERSION = '2026.11.28.28'
+APP_VERSION = '2026.11.28.29'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -1750,6 +1750,25 @@ white-space:nowrap}.history-item .meta{font-size:11px;color:var(--dim);margin-to
 .history-empty{padding:34px 18px;text-align:center;color:var(--dim);font-size:12px}
 .history-foot{border-top:1px solid var(--line);justify-content:flex-end}
 .history-foot .btn{padding:8px 14px}
+.timeout-detail-cell{display:flex;align-items:center;gap:8px;min-width:210px}
+.timeout-detail-cell .summary{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.timeout-detail-btn{flex:none;border:1px solid #bfdbfe;background:#eff6ff;color:#1d4ed8;
+border-radius:6px;padding:4px 9px;font-family:inherit;font-size:11px;font-weight:600;cursor:pointer}
+.timeout-detail-btn:hover{background:#dbeafe;border-color:#93c5fd}
+.timeout-dialog{width:min(760px,100%)}
+.timeout-body{padding:16px;overflow:auto;display:grid;gap:14px}
+.timeout-account{font-size:13px;font-weight:700;overflow-wrap:anywhere}
+.timeout-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+.timeout-stat{border:1px solid var(--line);border-radius:8px;padding:10px;background:#fafbfc}
+.timeout-stat .k{font-size:10.5px;color:var(--dim);margin-bottom:4px}
+.timeout-stat .v{font-size:12px;font-weight:600;overflow-wrap:anywhere}
+.timeout-route-title{font-size:12px;font-weight:700;margin-bottom:7px}
+.timeout-route{margin:0;padding:0;list-style:none;display:grid;gap:7px}
+.timeout-route li{display:grid;grid-template-columns:24px minmax(0,1fr);gap:8px;align-items:start;
+font-size:11.5px;padding:8px 10px;border-radius:7px;background:#f8fafc;border:1px solid #eef2f7}
+.timeout-route .step{width:22px;height:22px;border-radius:50%;display:grid;place-items:center;
+background:#dbeafe;color:#1d4ed8;font-size:10px;font-weight:700}
+@media(max-width:640px){.timeout-grid{grid-template-columns:1fr}}
 .drop{border:1.5px dashed var(--line);border-radius:8px;padding:16px;text-align:center;
 color:var(--dim);font-size:12px;cursor:pointer;transition:.15s}
 .drop:hover,.drop.on{border-color:var(--blue);background:#f8fbff;color:var(--blue)}
@@ -2024,6 +2043,34 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
     <div class="history-foot">
       <button class="btn ghost" id="cancelHistory" type="button">取消</button>
       <button class="btn danger" id="deleteAccountFiles" type="button" disabled>删除已选</button>
+    </div>
+  </div>
+</div>
+
+<div class="history-modal" id="timeoutModal" aria-hidden="true">
+  <div class="history-dialog timeout-dialog" role="dialog" aria-modal="true"
+       aria-labelledby="timeoutTitle">
+    <div class="history-head">
+      <div><b id="timeoutTitle">超时重试详情</b><div class="hint">只展示该账号实际记录的重试与代理入口</div></div>
+      <button class="btn ghost" id="closeTimeoutDetail" type="button">关闭</button>
+    </div>
+    <div class="timeout-body">
+      <div class="timeout-account" id="timeoutAccount">--</div>
+      <div class="timeout-grid">
+        <div class="timeout-stat"><div class="k">结果</div><div class="v" id="timeoutResult">--</div></div>
+        <div class="timeout-stat"><div class="k">重试原因</div><div class="v" id="timeoutReason">--</div></div>
+        <div class="timeout-stat"><div class="k">入口变化</div><div class="v" id="timeoutChange">--</div></div>
+        <div class="timeout-stat"><div class="k">重试次数</div><div class="v" id="timeoutAttempts">--</div></div>
+        <div class="timeout-stat"><div class="k">取入口耗时</div><div class="v" id="timeoutWaits">--</div></div>
+        <div class="timeout-stat"><div class="k">最终原因</div><div class="v" id="timeoutMessage">--</div></div>
+      </div>
+      <div>
+        <div class="timeout-route-title">代理入口链</div>
+        <ol class="timeout-route" id="timeoutRoute"></ol>
+      </div>
+    </div>
+    <div class="history-foot">
+      <button class="btn ghost" id="dismissTimeoutDetail" type="button">关闭</button>
     </div>
   </div>
 </div>
@@ -2669,11 +2716,27 @@ function rowHtml(r, idx){
     <td style="color:#6b7280;font-size:11.5px;max-width:340px;overflow:hidden;
         text-overflow:ellipsis" title="${esc(r.detail||'')}">
       ${esc(String(r.detail||'--').slice(0,64))}</td>
-    <td style="color:#6b7280;font-size:11.5px;max-width:260px;overflow:hidden;
-        text-overflow:ellipsis"${st === 'timeout'
-          ? ` title="${esc(timeoutDetailText(r, true))}"` : ''}>
-      ${esc(timeoutDetailText(r, false))}</td>
+    <td style="color:#6b7280;font-size:11.5px;max-width:300px;overflow:hidden"
+        ${st === 'timeout' ? ` title="${esc(timeoutDetailText(r, true))}"` : ''}>
+      ${st === 'timeout' ? `<div class="timeout-detail-cell">
+        <span class="summary">${esc(timeoutDetailText(r, false))}</span>
+        <button type="button" class="timeout-detail-btn"
+          data-timeout-detail="${esc(encodeURIComponent(JSON.stringify(timeoutDetailPayload(r))))}">详情</button>
+      </div>` : ''}</td>
   </tr>`;
+}
+
+function timeoutDetailPayload(r){
+  return {
+    email:String(r.email||''), status:String(r.status||''),
+    http:r.http ?? null, attempts:Number(r.attempts||1),
+    retry_reason:String(r.retry_reason||''), detail:String(r.detail||''),
+    proxy_changed:Boolean(r.proxy_changed),
+    proxy_change_count:Number(r.proxy_change_count||0),
+    proxy_entries:Array.isArray(r.proxy_entries) ? r.proxy_entries.map(String).filter(Boolean) : [],
+    retry_ip_ms:Array.isArray(r.retry_ip_ms) ? r.retry_ip_ms.map(v=>Number(v)||0) : [],
+    ip_wait_none:Boolean(r.ip_wait_none)
+  };
 }
 
 function timeoutDetailText(r, full){
@@ -2699,6 +2762,47 @@ function timeoutDetailText(r, full){
   if(full && entries.length) parts.push(`入口 ${entries.join(' → ')}`);
   return parts.join(' · ');
 }
+
+function setTimeoutDetailModal(open){
+  $('timeoutModal').classList.toggle('show', open);
+  $('timeoutModal').setAttribute('aria-hidden', open ? 'false' : 'true');
+}
+
+function openTimeoutDetail(r){
+  const entries = Array.isArray(r.proxy_entries) ? r.proxy_entries : [];
+  const waits = Array.isArray(r.retry_ip_ms) ? r.retry_ip_ms : [];
+  const retries = Math.max(0, Number(r.attempts||1)-1);
+  $('timeoutAccount').textContent = r.email || '--';
+  $('timeoutResult').textContent = `HTTP ${r.http ?? '--'} · ${r.status || 'timeout'}`;
+  $('timeoutReason').textContent = r.retry_reason || '--';
+  $('timeoutChange').textContent = r.proxy_change_count > 0 || r.proxy_changed
+    ? `已换入口 ${r.proxy_change_count || 1} 次`
+    : entries.length > 1 ? `已重取 ${entries.length-1} 次，入口未变`
+    : r.ip_wait_none ? '未取到新入口' : '未触发换入口';
+  $('timeoutAttempts').textContent = `${retries} 次（共 ${r.attempts || 1} 次请求）`;
+  $('timeoutWaits').textContent = waits.length
+    ? waits.map(v=>Math.round(Number(v)||0)+'ms').join(' / ') : '--';
+  $('timeoutMessage').textContent = r.detail || '--';
+  $('timeoutRoute').innerHTML = entries.length
+    ? entries.map((entry,index)=>`<li><span class="step">${index+1}</span><span>${esc(entry)}</span></li>`).join('')
+    : '<li><span class="step">–</span><span>没有记录到代理入口</span></li>';
+  setTimeoutDetailModal(true);
+}
+
+$('rows').addEventListener('click', e => {
+  const button = e.target.closest && e.target.closest('.timeout-detail-btn');
+  if(!button) return;
+  try{
+    openTimeoutDetail(JSON.parse(decodeURIComponent(button.dataset.timeoutDetail||'')));
+  }catch(error){
+    openTimeoutDetail({status:'timeout', detail:'详情数据解析失败'});
+  }
+});
+$('closeTimeoutDetail').addEventListener('click', () => setTimeoutDetailModal(false));
+$('dismissTimeoutDetail').addEventListener('click', () => setTimeoutDetailModal(false));
+$('timeoutModal').addEventListener('click', e => {
+  if(e.target === $('timeoutModal')) setTimeoutDetailModal(false);
+});
 
 async function loadHistory(want){
   const seq = ++HIST_SEQ;
