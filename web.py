@@ -33,7 +33,7 @@ ACCOUNT_STATE = os.path.join(HERE, 'data', 'current-accounts.json')
 TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
-APP_VERSION = '2026.11.28.20'
+APP_VERSION = '2026.11.28.21'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -1277,6 +1277,12 @@ class Handler(BaseHTTPRequestHandler):
                             continue
                         seen.add(email)
                         rows.append(r)
+        # 导出文件名同时保留内容类型、结果分类和北京时间，便于多次导出后追溯。
+        # 文件名保持 ASCII，筛选参数中的控制字符不得进入响应头。
+        from datetime import datetime, timedelta, timezone
+        safe_status = re.sub(r'[^a-zA-Z0-9_-]', '_', want or 'all')[:80]
+        exported_at = datetime.now(timezone(timedelta(hours=8))).strftime(
+            '%Y%m%d-%H%M%S')
         if fmt == 'csv':
             import csv as _csv, io as _io
             buf = _io.StringIO()
@@ -1287,7 +1293,8 @@ class Handler(BaseHTTPRequestHandler):
             for r in rows:
                 w.writerow([r.get(k, '') for k in fields])
             out = buf.getvalue()
-            ctype, name = 'text/csv; charset=utf-8', 'export.csv'
+            ctype = 'text/csv; charset=utf-8'
+            name = f'export-details-{safe_status}-{exported_at}.csv'
         else:
             src = {}
             acc = STATE['accounts']
@@ -1308,9 +1315,8 @@ class Handler(BaseHTTPRequestHandler):
                 elif em:
                     body.append(em)      # 原始文件里没有这行时只导 email
             out = '\n'.join(body) + ('\n' if body else '')
-            # 文件名保持 ASCII，筛选参数中的控制字符不得进入响应头。
-            safe_status = re.sub(r'[^a-zA-Z0-9_-]', '_', want or 'all')[:80]
-            ctype, name = 'text/plain; charset=utf-8', f'export-{safe_status}.txt'
+            ctype = 'text/plain; charset=utf-8'
+            name = f'export-accounts-{safe_status}-{exported_at}.txt'
         data = out.encode('utf-8')
         self.send_response(200)
         self.send_header('Content-Type', ctype)

@@ -287,7 +287,7 @@ class ConsoleRequestTests(unittest.TestCase):
             self.assertEqual(3, state['device_registered'])
             self.assertEqual(3, state['device_ready'])
             self.assertEqual(3, state['device_total'])
-            self.assertEqual('2026.11.28.20', state['version'])
+            self.assertEqual('2026.11.28.21', state['version'])
 
     def test_linux_process_group_cpu_sums_parent_and_children(self):
         parent = '1 (parent) S 0 77 0 0 0 0 0 0 0 0 200 100 0 0 0 0 0 0 0 0\n'
@@ -344,6 +344,22 @@ class ConsoleRequestTests(unittest.TestCase):
                 self.assertNotIn('\n', values[0])
                 self.assertTrue(values[0].isascii())
                 self.assertLess(len(values[0]), 150)
+
+    def test_export_filename_contains_type_status_and_beijing_timestamp(self):
+        cases = (
+            ('txt', r'attachment; filename="export-accounts-timeout-\d{8}-\d{6}\.txt"'),
+            ('csv', r'attachment; filename="export-details-timeout-\d{8}-\d{6}\.csv"'),
+        )
+        for fmt, expected in cases:
+            with self.subTest(fmt=fmt):
+                handler = make_handler('/api/export')
+                with patch('glob.glob', return_value=[]), \
+                     patch('builtins.open', side_effect=FileNotFoundError):
+                    handler._export('timeout', fmt)
+                values = [call.args[1] for call in handler.send_header.call_args_list
+                          if call.args[0] == 'Content-Disposition']
+                self.assertEqual(1, len(values))
+                self.assertRegex(values[0], expected)
 
     def test_rejected_body_response_advertises_connection_close(self):
         handler = make_handler('/api/login')
