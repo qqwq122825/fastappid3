@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import argparse
+import collections
+import heapq
 import json
 import os
 import queue
@@ -30,6 +32,56 @@ import urllib.request
 
 
 SHUFFLE_SEED = 20261125
+DELAYED_RETRY_SECONDS = 3.0
+
+
+class DelayedRetryQueue:
+    """Thread-safe normal queue plus a monotonic delayed-retry heap."""
+
+    def __init__(self, rows, clock=time.monotonic):
+        self._normal = collections.deque(rows)
+        self._delayed = []
+        self._sequence = 0
+        self._clock = clock
+        self._lock = threading.Lock()
+
+    def pending(self):
+        with self._lock:
+            return len(self._normal) + len(self._delayed)
+
+    def delayed_count(self):
+        with self._lock:
+            return len(self._delayed)
+
+    def ready_wait(self):
+        """Return 0 for ready work, seconds until retry, or None if empty."""
+        with self._lock:
+            if self._delayed and self._delayed[0][0] <= self._clock():
+                return 0.0
+            if self._normal:
+                return 0.0
+            if self._delayed:
+                return max(0.0, self._delayed[0][0] - self._clock())
+            return None
+
+    def take(self):
+        with self._lock:
+            now = self._clock()
+            if self._delayed and self._delayed[0][0] <= now:
+                _, _, task, context = heapq.heappop(self._delayed)
+                return task, context, True
+            if self._normal:
+                return self._normal.popleft(), None, False
+            return None, None, False
+
+    def defer(self, task, context, delay=DELAYED_RETRY_SECONDS):
+        with self._lock:
+            self._sequence += 1
+            heapq.heappush(
+                self._delayed,
+                (self._clock() + max(0.0, float(delay)), self._sequence,
+                 task, context))
+            return len(self._delayed)
 
 
 def ensure_open_file_limit(threads, resource_module=None):
@@ -754,21 +806,17 @@ def main():
 
     # 设备与公共头准备好之前不分配账号。共享队列仅在真正准备发业务
     # 请求时弹出一条，因此注册等待/失败不会污染任何账号结果。
-    import collections
-    task_queue = collections.deque(rows)
-    task_queue_lock = threading.Lock()
+    task_queue = DelayedRetryQueue(rows)
     active_workers = min(max(0, len(rows)), max(1, args.threads))
     missing_devices = max(0, active_workers - loaded_devices)
     print(f'账号进入共享待领队列 {len(rows)} 条；启动 {active_workers} 个工作线程；'
           f'缺设备线程自行注册 {0 if args.no_register else missing_devices} 台')
 
     def pending_task_count():
-        with task_queue_lock:
-            return len(task_queue)
+        return task_queue.pending()
 
     def take_task():
-        with task_queue_lock:
-            return task_queue.popleft() if task_queue else None
+        return task_queue.take()
     lock = _new_state_lock()
     sink_lock = threading.Lock()       # 结果落盘不占用状态锁
     info_gate = threading.Lock()       # 全进程只获取一次 anisette 客户端信息
@@ -965,6 +1013,8 @@ def main():
                 'ip_pool': pool_snapshot,
                 'startup': startup_snapshot,
                 'retried': results.get('retried', 0),
+                'retry_waiting': task_queue.delayed_count(),
+                'retry_delay_seconds': DELAYED_RETRY_SECONDS,
                 'by_retry': results.get('by_retry') or {},
                 'otp_hit': results.get('otp_hit', 0),
                 'writer_cpu': round(time.thread_time() - wcpu0, 2),
@@ -1327,10 +1377,6 @@ def main():
             return raw
 
         # ---- 3) 循环验证：每 per_ip 条换 IP，每 otp_reuse 条换公共头 ----
-        local_retries = {}
-        local_proxy_entries = {}
-        local_retry_ip_ms = {}
-        retry_tasks = []
         with lock:
             bag = results.setdefault('boot_segments', {})
             for k, v in boot.items():
@@ -1339,18 +1385,29 @@ def main():
         mine = 0
         device_exhausted = False
         while not stop.is_set():
+            ready_wait = task_queue.ready_wait()
+            if ready_wait is None:
+                break
+            if ready_wait > 0:
+                mark_worker_stage(tid, 'retry_backoff')
+                stop.wait(min(0.5, ready_wait))
+                continue
             # 池模式每轮重新领一条；非池模式保留线程启动时取得的固定代理。
             proxy_exp = 0.0
             t_ip = time.perf_counter()
             if ip_pool is not None:
                 mark_worker_stage(tid, 'proxy_acquire')
                 proxy, proxy_exp = ip_pool.acquire(tid, wait=60.0)
+            elif proxy is None:
+                mark_worker_stage(tid, 'proxy_acquire')
+                proxy = (fetch_one_ip(args.api) if args.no_precheck
+                         else fetch_usable_ip(args.api, args.precheck_timeout))
             ip_ms = (time.perf_counter() - t_ip) * 1000
             if proxy is None:
                 with lock:
                     results['ip_fail'] += 1
                 # 代理池短暂断货不能消费账号；保留共享队列等待补池。
-                pending = len(retry_tasks) + pending_task_count()
+                pending = pending_task_count()
                 if not wait_for_proxy_when_tasks_remain(pending, stop.is_set()):
                     break
                 stop.wait(0.5 + random.uniform(0.0, 0.5))
@@ -1361,8 +1418,10 @@ def main():
             while served < args.per_ip and not stop.is_set():
                 t_loop = time.perf_counter()
                 gap_ms = (t_loop - t_prev_end) * 1000   # 轮与轮之间的空档
-                pending = len(retry_tasks) + pending_task_count()
-                if not wait_for_proxy_when_tasks_remain(pending, stop.is_set()):
+                ready_wait = task_queue.ready_wait()
+                if ready_wait is None:
+                    break
+                if ready_wait > 0:
                     break
                 t_otp = time.perf_counter()
                 c0_otp = time.thread_time()
@@ -1398,8 +1457,7 @@ def main():
                 otp_ms = (time.perf_counter() - t_otp) * 1000
                 otp_cpu = (time.thread_time() - c0_otp) * 1000
                 mark_worker_stage(tid, 'account_queue')
-                was_retry = bool(retry_tasks)
-                task = retry_tasks.pop() if retry_tasks else take_task()
+                task, retry_context, was_retry = take_task()
                 if task is None:
                     break
                 if not was_retry:
@@ -1408,132 +1466,96 @@ def main():
                     with startup_runtime_lock:
                         startup_runtime['accounts_claimed'] += 1
                 email, password = task
-                task_key = (email, password)
-                local_retry_count = local_retries.get(task_key, 0)
-                proxy_entries = local_proxy_entries.pop(task_key, [])
-                if not proxy_entries:
-                    entry = _proxy_host(proxy)
-                    if entry:
-                        proxy_entries.append(entry)
-                prior_retry_ip_ms = local_retry_ip_ms.pop(task_key, [])
-                t0 = time.perf_counter()
+                context = retry_context or {}
+                proxy_entries = list(context.get('proxy_entries') or [])
+                entry = _proxy_host(proxy)
+                if entry and (was_retry or not proxy_entries):
+                    proxy_entries.append(entry)
+                retry_ip_ms = list(context.get('retry_ip_ms') or [])
+                if was_retry:
+                    retry_ip_ms.append(round(ip_ms, 1))
+                t0 = float(context.get('started_at') or time.perf_counter())
                 cpu0 = time.thread_time()
-                attempts = 0
-                retry_reason = ''
-                attempt_ms = []                 # 每次 gs.check 的实际墙钟耗时
-                retry_ip_ms = prior_retry_ip_ms  # 重试换 IP 时 ip_pool.acquire 的等待耗时
+                previous_cpu_ms = float(context.get('thread_cpu_ms') or 0.0)
+                attempts = int(context.get('attempts') or 0) + 1
+                retry_reason = str(context.get('retry_reason') or '')
+                attempt_ms = list(context.get('attempt_ms') or [])
                 ip_wait_none = False             # 重试里是否因为「等不到 IP」而中断
                 gsa_started = False
+                deferred_retry = False
                 try:
-                    # ---- 外层重试：只有链路/环境问题才换环境重来 ----
-                    attempts = 0
                     t_chk = time.perf_counter()
                     c0_chk = time.thread_time()
-                    while True:
-                        attempts += 1
-                        # gs.check 内部有 init + complete 两跳，每跳读超时 per_hop，
-                        # 与 gsa-console 使用相同阈值：每个 GSA 请求独立获得
-                        # connect/read 时间，不再把账号总预算切碎到剩余重试和两跳。
-                        per_hop = max(1.0, float(args.timeout))
-                        _a0 = time.perf_counter()
-                        gsa_started = True
-                        mark_worker_stage(tid, 'apple_check')
-                        result = gs.check(email, password, proxy,
-                                          timeout=per_hop,
-                                          retries=0, identity=identity)
-                        attempt_ms.append(round((time.perf_counter() - _a0) * 1000, 1))
-                        probe_status = refine_status(result, result_bucket(result))
-                        kind, why = retry_kind(result, probe_status)
-                        if kind is not None:
-                            proxy_failed = True
-                        if kind is None or attempts > args.retry or stop.is_set():
-                            if attempts > args.retry:
-                                finalize_retry_exhausted(result)
-                            retry_reason = why if attempts > 1 else ''
-                            break
-                        retry_reason = why
-                        # 换 IP：归还当前这条（标记为坏），取新的
-                        if ip_pool is not None:
-                            mark_worker_stage(tid, 'retry_ip')
-                            _t_ip = time.perf_counter()
-                            ip_pool.release(tid, proxy, proxy_exp, healthy=False)
-                            proxy, proxy_exp = ip_pool.acquire(tid, wait=args.timeout)
-                            proxy_failed = False
-                            retry_ip_ms.append(round((time.perf_counter() - _t_ip) * 1000, 1))
-                            if proxy is None:
-                                ip_wait_none = True
-                                break
-                            proxy_entries.append(_proxy_host(proxy))
-                        # 环境异常（-22421）还要顺带换一个公共头
-                        if kind == RETRY_ENV:
-                            device_headers.invalidate(slot)
-                            try:
-                                identity = fetch_otp()
-                                device_headers.bind_used(
-                                    slot, identity,
-                                    max(10.0, min(60.0, float(args.ip_ttl))),
-                                    args.otp_reuse)
-                                otp_metric = 'fetch'
-                            except Exception:
-                                pass
-                        served = max(0, served - 1)   # 重试不占 per_ip 配额
+                    # 每次领取只发一次校验。链路/环境异常进入共享延迟
+                    # 队列，不再让当前 OS 线程原地睡眠或连续重试。
+                    per_hop = max(1.0, float(args.timeout))
+                    _a0 = time.perf_counter()
+                    gsa_started = True
+                    mark_worker_stage(tid, 'apple_check')
+                    result = gs.check(email, password, proxy,
+                                      timeout=per_hop,
+                                      retries=0, identity=identity)
+                    attempt_ms.append(round((time.perf_counter() - _a0) * 1000, 1))
+                    probe_status = refine_status(result, result_bucket(result))
+                    kind, why = retry_kind(result, probe_status)
+                    if kind is not None:
+                        proxy_failed = True
                     chk_ms = (time.perf_counter() - t_chk) * 1000
                     chk_cpu = (time.thread_time() - c0_chk) * 1000
+                    if kind is not None and attempts <= args.retry and not stop.is_set():
+                        retry_reason = why
+                        if kind == RETRY_ENV:
+                            device_headers.invalidate(slot)
+                        proxy_failed = True
+                        context = {
+                            'attempts': attempts,
+                            'retry_reason': retry_reason,
+                            'attempt_ms': attempt_ms,
+                            'retry_ip_ms': retry_ip_ms,
+                            'proxy_entries': proxy_entries,
+                            'started_at': t0,
+                            'thread_cpu_ms': (previous_cpu_ms
+                                              + (time.thread_time() - cpu0) * 1000),
+                        }
+                        task_queue.defer(
+                            (email, password), context, DELAYED_RETRY_SECONDS)
+                        deferred_retry = True
+                    elif kind is not None and attempts > args.retry:
+                        retry_reason = why
+                        finalize_retry_exhausted(result)
                 except Exception as exc:                            # noqa: BLE001
                     otp_ms = chk_ms = 0.0
                     otp_cpu = chk_cpu = 0.0
                     result = local_exception_result(exc)
-                    previous = local_retries.get(task_key, 0)
-                    attempts = 1
-                    # 公共头/代理等本地链路异常以前会直接吞成“其他”。现在
-                    # 清掉可能损坏的公共头，换出口后把同一账号放回本线程，
-                    # 最多按 --retry 重试；程序错误仍保留为可诊断的“其他”。
-                    if (result.get('status') == 'timeout' and previous < args.retry
+                    # 本地链路异常也进同一个 3 秒延迟队列；任意空闲
+                    # 线程都可接手，当前线程立即去领其他账号。
+                    if (result.get('status') == 'timeout' and attempts <= args.retry
                             and not stop.is_set()):
-                        local_retries[task_key] = previous + 1
                         device_headers.invalidate(slot)
-                        replacement = proxy
                         used_proxy = local_exception_used_proxy(
                             gsa_started, args.anisette_proxy)
-                        if not used_proxy:
-                            # 直连公共头故障与任务代理无关。像 gsa-console
-                            # 一样延迟重试，并加随机抖动防止1000线程同时重连。
-                            delay = anisette_retry_delay(previous)
-                            mark_worker_stage(tid, 'retry_backoff')
-                            stop.wait(delay)
-                        if ip_pool is not None and used_proxy:
-                            mark_worker_stage(tid, 'retry_ip')
-                            proxy_failed = True
-                            _t_ip = time.perf_counter()
-                            ip_pool.release(tid, proxy, proxy_exp, healthy=False)
-                            replacement, proxy_exp = ip_pool.acquire(tid, wait=20.0)
-                            proxy_failed = False
-                            retry_ip_ms.append(round((time.perf_counter() - _t_ip) * 1000, 1))
-                        elif args.api and used_proxy:
-                            _t_ip = time.perf_counter()
-                            replacement = (fetch_one_ip(args.api) if args.no_precheck
-                                           else fetch_usable_ip(args.api, args.precheck_timeout))
-                            retry_ip_ms.append(round((time.perf_counter() - _t_ip) * 1000, 1))
-                        if replacement is not None:
-                            proxy = replacement
-                            entry = _proxy_host(proxy)
-                            if used_proxy and entry:
-                                proxy_entries.append(entry)
-                            local_proxy_entries[task_key] = proxy_entries
-                            local_retry_ip_ms[task_key] = retry_ip_ms
-                            retry_tasks.append((email, password))
-                            continue
                         if used_proxy:
-                            ip_wait_none = True
-                    local_retries.pop(task_key, None)
-                    local_proxy_entries.pop(task_key, None)
-                    local_retry_ip_ms.pop(task_key, None)
-                if local_retry_count:
-                    attempts += local_retry_count
-                    retry_reason = retry_reason or 'local_http=0'
-                    local_retries.pop(task_key, None)
+                            proxy_failed = True
+                        retry_reason = 'local_http=0'
+                        context = {
+                            'attempts': attempts,
+                            'retry_reason': retry_reason,
+                            'attempt_ms': attempt_ms,
+                            'retry_ip_ms': retry_ip_ms,
+                            'proxy_entries': proxy_entries,
+                            'started_at': t0,
+                            'thread_cpu_ms': (previous_cpu_ms
+                                              + (time.thread_time() - cpu0) * 1000),
+                        }
+                        task_queue.defer(
+                            (email, password), context, DELAYED_RETRY_SECONDS)
+                        deferred_retry = True
+                if deferred_retry:
+                    # 不写结果、不增加 done；立即退出当前坏代理会话，
+                    # 外层重新领代理后继续正常账号。
+                    break
                 elapsed = (time.perf_counter() - t0) * 1000
-                thread_cpu = (time.thread_time() - cpu0) * 1000
+                thread_cpu = previous_cpu_ms + (time.thread_time() - cpu0) * 1000
                 c0_tail = time.thread_time()
                 raw_status = str(result.get('status') or 'error')
                 status = refine_status(result, result_bucket(result))
@@ -1737,10 +1759,14 @@ def main():
                 ip_pool.release(
                     tid, proxy, proxy_exp,
                     healthy=(ok_count > 0 or not proxy_failed))
+            elif proxy_failed:
+                proxy = None
             if served == 0:
-                if not retry_tasks and pending_task_count() <= 0:
+                ready_wait = task_queue.ready_wait()
+                if ready_wait is None:
                     break
-                stop.wait(0.5 + random.uniform(0.0, 0.5))
+                if ready_wait > 0:
+                    stop.wait(min(0.5, ready_wait))
             if device_exhausted:
                 break
         with lock:

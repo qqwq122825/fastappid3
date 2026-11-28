@@ -141,6 +141,7 @@ def merge(jobs, started, expected_total=0, wall_started=None):
                 'device_ready': 0, 'device_registered': 0, 'device_in_use': 0,
                 'device_registering': 0, 'register_errors': 0,
                 'register_error_types': {}, 'retried': 0,
+                'retry_waiting': 0, 'retry_delay_seconds': 3.0,
                 'by_retry': {}, 'budget_hit': 0,
                 'startup': {'phase': 'complete', 'message': '没有待处理账号',
                             'process_ready': 0, 'process_total': 0}}
@@ -157,7 +158,8 @@ def merge(jobs, started, expected_total=0, wall_started=None):
     pool_supplier_states = []
     latency_hist = {}
     otp_hit = otp_fetch = 0
-    retried = budget_hit = 0
+    retried = retry_waiting = budget_hit = 0
+    retry_delay_seconds = 3.0
     by_retry = {}
     device_ready = device_in_use = device_registering = register_errors = 0
     register_error_types = {}
@@ -218,6 +220,9 @@ def merge(jobs, started, expected_total=0, wall_started=None):
         otp_hit += payload.get('otp_hit') or 0
         otp_fetch += payload.get('otp_fetch') or 0
         retried += payload.get('retried') or 0
+        retry_waiting += payload.get('retry_waiting') or 0
+        retry_delay_seconds = float(
+            payload.get('retry_delay_seconds') or retry_delay_seconds)
         budget_hit += payload.get('budget_hit') or 0
         for key, value in (payload.get('by_retry') or {}).items():
             by_retry[key] = by_retry.get(key, 0) + value
@@ -323,7 +328,9 @@ def merge(jobs, started, expected_total=0, wall_started=None):
         'proc_cpu_cores': round(proc_cpu / elapsed, 3) if elapsed else 0,
         'incomplete': incomplete,
         'otp_hit': otp_hit, 'otp_fetch': otp_fetch,
-        'retried': retried, 'by_retry': by_retry, 'budget_hit': budget_hit,
+        'retried': retried, 'retry_waiting': retry_waiting,
+        'retry_delay_seconds': retry_delay_seconds,
+        'by_retry': by_retry, 'budget_hit': budget_hit,
         'device_ready': device_ready,
         'device_registered': device_ready,
         'device_in_use': device_in_use,

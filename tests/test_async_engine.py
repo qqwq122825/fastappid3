@@ -11,7 +11,8 @@ from fastcheck.protocols import gsa_async
 from fastcheck.status import result_bucket
 from gsafast.ippool import IpPool
 from simple_async import _attempt_slice
-from simple import (anisette_concurrency_limit, startup_worker_batches,
+from simple import (DELAYED_RETRY_SECONDS, DelayedRetryQueue,
+                    anisette_concurrency_limit, startup_worker_batches,
                     _new_state_lock, _proxy_host, _shared_device_info,
                     proxy_entry_metrics,
                     finalize_retry_exhausted, retry_kind)
@@ -103,7 +104,7 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('max(1.0, args.anisette_timeout), registered=True', source)
         self.assertIn("results['public_header_retries'] += 1", source)
         self.assertLess(source.index('identity = fetch_otp()'),
-                        source.index('task = retry_tasks.pop() if retry_tasks else take_task()'))
+                        source.index('task, retry_context, was_retry = take_task()'))
 
     def test_web_exposes_one_shared_flow_timeout(self):
         from pathlib import Path
@@ -263,6 +264,33 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
                          proxy_entry_metrics(['gate:1000', 'gate:1000']))
         self.assertEqual((['gate:1000', 'gate:1001'], True, 1),
                          proxy_entry_metrics(['gate:1000', 'gate:1001']))
+
+    def test_delayed_retry_does_not_block_the_next_normal_account(self):
+        now = [100.0]
+        queue = DelayedRetryQueue(
+            [('first', 'pw1'), ('second', 'pw2')], clock=lambda: now[0])
+        first, context, was_retry = queue.take()
+        self.assertEqual(('first', 'pw1'), first)
+        self.assertIsNone(context)
+        self.assertFalse(was_retry)
+        queue.defer(first, {'attempts': 1}, DELAYED_RETRY_SECONDS)
+        second, context, was_retry = queue.take()
+        self.assertEqual(('second', 'pw2'), second)
+        self.assertIsNone(context)
+        self.assertFalse(was_retry)
+        self.assertAlmostEqual(3.0, queue.ready_wait())
+        self.assertEqual((None, None, False), queue.take())
+        now[0] += 3.0
+        retried, context, was_retry = queue.take()
+        self.assertEqual(first, retried)
+        self.assertEqual({'attempts': 1}, context)
+        self.assertTrue(was_retry)
+        self.assertEqual(0, queue.pending())
+
+    def test_retry_waiting_is_visible_in_progress_panel(self):
+        import web
+        self.assertIn('d.retry_waiting', web.PAGE)
+        self.assertIn('秒延迟队列', web.PAGE)
 
     def test_cpu_display_distinguishes_current_from_average(self):
         import web
@@ -560,7 +588,7 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('startup.public_header_waiting', web.PAGE)
         self.assertIn('startup.threads_created', web.PAGE)
         self.assertIn('startup.business_inflight', web.PAGE)
-        self.assertIn('id="versionTag">v2026.11.28.26', web.PAGE)
+        self.assertIn('id="versionTag">v2026.11.28.27', web.PAGE)
         self.assertIn('<div class="v v-green" id="sRate">0</div>', web.PAGE)
         self.assertNotIn('<div class="v sm v-green" id="sRate">0</div>', web.PAGE)
         self.assertNotIn('程序会按需要的数量自动替换 num', web.PAGE)

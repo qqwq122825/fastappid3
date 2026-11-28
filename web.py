@@ -33,7 +33,7 @@ ACCOUNT_STATE = os.path.join(HERE, 'data', 'current-accounts.json')
 TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
-APP_VERSION = '2026.11.28.26'
+APP_VERSION = '2026.11.28.27'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -2541,7 +2541,10 @@ async function tick(){
   const rk = d.by_retry || {};
   const rkText = Object.keys(rk).length
     ? ' · ' + Object.entries(rk).map(([k,v]) => `${k}:${v}`).join(' ') : '';
-  $('mRetry').textContent = `重试 ${num(d.retried)}${rkText}`;
+  $('mRetry').textContent = `重试 ${num(d.retried)}`
+    + (Number(d.retry_waiting) > 0
+      ? ` · 等待 ${num(d.retry_waiting)}（${Number(d.retry_delay_seconds||3).toFixed(0)}秒延迟队列）`
+      : '') + rkText;
   const stages = d.worker_stages || {};
   const sc = stages.current || {};
   const stageOther = ['startup_gate','device_info','header_cache','account_queue','result_write','idle']

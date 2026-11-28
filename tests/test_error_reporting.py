@@ -119,8 +119,10 @@ def test_multiprocess_merge_keeps_retry_counters(tmp_path=None):
             return test_multiprocess_merge_keeps_retry_counters(Path(directory))
     jobs = []
     for index, payload in enumerate((
-        {"done": 2, "retried": 1, "by_retry": {"http=0": 1}, "budget_hit": 0},
+        {"done": 2, "retried": 1, "retry_waiting": 4,
+         "by_retry": {"http=0": 1}, "budget_hit": 0},
         {"done": 3, "retried": 2,
+         "retry_waiting": 7,
          "by_retry": {"http=0": 1, "local_http=0": 1}, "budget_hit": 1},
     )):
         path = tmp_path / f"live-{index}.json"
@@ -128,6 +130,8 @@ def test_multiprocess_merge_keeps_retry_counters(tmp_path=None):
         jobs.append({"live": str(path), "threads": 100, "limit": payload["done"]})
     result = merge(jobs, time.monotonic() - 1, expected_total=5)
     assert result["retried"] == 3
+    assert result["retry_waiting"] == 11
+    assert result["retry_delay_seconds"] == 3.0
     assert result["by_retry"] == {"http=0": 2, "local_http=0": 1}
     assert result["budget_hit"] == 1
 
@@ -403,7 +407,7 @@ def test_missing_device_is_registered_by_the_business_worker():
     producer = source[source.index('    def register_worker_device'):source.index('    def worker(tid):')]
     worker = source[source.index('    def worker(tid):'):source.index("    results['started'] = started")]
     header = source.index('identity = device_headers.take')
-    claim = source.index('task = retry_tasks.pop() if retry_tasks else take_task()')
+    claim = source.index('task, retry_context, was_retry = take_task()')
     assert header < claim
     assert 'record_setup_timeout' not in source
     assert 'reserve_new_worker_slot()' in producer
