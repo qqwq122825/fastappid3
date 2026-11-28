@@ -183,6 +183,15 @@ def _proxy_host(proxy):
         return str(proxy).split('@')[-1]
 
 
+def proxy_entry_metrics(entries):
+    """Summarize successful proxy entry acquisitions without credentials."""
+    labels = [str(entry).strip() for entry in (entries or [])
+              if str(entry).strip()]
+    changes = sum(1 for previous, current in zip(labels, labels[1:])
+                  if previous != current)
+    return labels, bool(changes), changes
+
+
 def load_accounts(path, limit, shuffle=True):
     rows = [l.strip() for l in open(path, encoding='utf-8', errors='replace')
             if l.strip() and '----' in l]
@@ -1319,6 +1328,8 @@ def main():
 
         # ---- 3) 循环验证：每 per_ip 条换 IP，每 otp_reuse 条换公共头 ----
         local_retries = {}
+        local_proxy_entries = {}
+        local_retry_ip_ms = {}
         retry_tasks = []
         with lock:
             bag = results.setdefault('boot_segments', {})
@@ -1399,12 +1410,18 @@ def main():
                 email, password = task
                 task_key = (email, password)
                 local_retry_count = local_retries.get(task_key, 0)
+                proxy_entries = local_proxy_entries.pop(task_key, [])
+                if not proxy_entries:
+                    entry = _proxy_host(proxy)
+                    if entry:
+                        proxy_entries.append(entry)
+                prior_retry_ip_ms = local_retry_ip_ms.pop(task_key, [])
                 t0 = time.perf_counter()
                 cpu0 = time.thread_time()
                 attempts = 0
                 retry_reason = ''
                 attempt_ms = []                 # 每次 gs.check 的实际墙钟耗时
-                retry_ip_ms = []                 # 重试换 IP 时 ip_pool.acquire 的等待耗时
+                retry_ip_ms = prior_retry_ip_ms  # 重试换 IP 时 ip_pool.acquire 的等待耗时
                 ip_wait_none = False             # 重试里是否因为「等不到 IP」而中断
                 gsa_started = False
                 try:
@@ -1446,6 +1463,7 @@ def main():
                             if proxy is None:
                                 ip_wait_none = True
                                 break
+                            proxy_entries.append(_proxy_host(proxy))
                         # 环境异常（-22421）还要顺带换一个公共头
                         if kind == RETRY_ENV:
                             device_headers.invalidate(slot)
@@ -1486,17 +1504,30 @@ def main():
                         if ip_pool is not None and used_proxy:
                             mark_worker_stage(tid, 'retry_ip')
                             proxy_failed = True
+                            _t_ip = time.perf_counter()
                             ip_pool.release(tid, proxy, proxy_exp, healthy=False)
                             replacement, proxy_exp = ip_pool.acquire(tid, wait=20.0)
                             proxy_failed = False
+                            retry_ip_ms.append(round((time.perf_counter() - _t_ip) * 1000, 1))
                         elif args.api and used_proxy:
+                            _t_ip = time.perf_counter()
                             replacement = (fetch_one_ip(args.api) if args.no_precheck
                                            else fetch_usable_ip(args.api, args.precheck_timeout))
+                            retry_ip_ms.append(round((time.perf_counter() - _t_ip) * 1000, 1))
                         if replacement is not None:
                             proxy = replacement
+                            entry = _proxy_host(proxy)
+                            if used_proxy and entry:
+                                proxy_entries.append(entry)
+                            local_proxy_entries[task_key] = proxy_entries
+                            local_retry_ip_ms[task_key] = retry_ip_ms
                             retry_tasks.append((email, password))
                             continue
+                        if used_proxy:
+                            ip_wait_none = True
                     local_retries.pop(task_key, None)
+                    local_proxy_entries.pop(task_key, None)
+                    local_retry_ip_ms.pop(task_key, None)
                 if local_retry_count:
                     attempts += local_retry_count
                     retry_reason = retry_reason or 'local_http=0'
@@ -1578,6 +1609,9 @@ def main():
                             web_rotation_exhausted = True
                             break
                         proxy = replacement
+                        entry = _proxy_host(proxy)
+                        if entry:
+                            proxy_entries.append(entry)
                         proxy_failed = False
                         web_proxy_rotations += 1
                     web_ms = round((time.perf_counter() - wt0) * 1000, 1)
@@ -1591,6 +1625,8 @@ def main():
                     final_status = refine_repair_web_status(status, web, web_trace)
                     overridden = final_status != status
                 device_meta = pool.worker_slot_result_metadata(slot)
+                proxy_entries, proxy_changed, proxy_change_count = \
+                    proxy_entry_metrics(proxy_entries)
                 row = {'tid': tid, 'slot': slot, 'email': email,
                        **device_meta,
                        'device_limit': max(0, int(args.device_max_uses or 0)),
@@ -1607,6 +1643,9 @@ def main():
                        'attempts': attempts, 'retry_reason': retry_reason,
                        'attempt_ms': attempt_ms,
                        'retry_ip_ms': retry_ip_ms, 'ip_wait_none': ip_wait_none,
+                       'proxy_entries': proxy_entries,
+                       'proxy_changed': proxy_changed,
+                       'proxy_change_count': proxy_change_count,
                        'ip_ms': round(ip_ms, 1), 'otp_ms': round(otp_ms, 1),
                        'chk_ms': round(chk_ms, 1), 'gap_ms': round(gap_ms, 2),
                        'web_status': web_status, 'web_ec': web_ec,

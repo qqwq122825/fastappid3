@@ -33,7 +33,7 @@ ACCOUNT_STATE = os.path.join(HERE, 'data', 'current-accounts.json')
 TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
-APP_VERSION = '2026.11.28.25'
+APP_VERSION = '2026.11.28.26'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -1432,10 +1432,16 @@ class Handler(BaseHTTPRequestHandler):
             buf = _io.StringIO()
             w = _csv.writer(buf)
             fields = ('email', 'status', 'attempts', 'http', 'ec', 'ms',
-                      'slot', 'device_id', 'device_uses', 'device_limit', 'detail')
+                      'slot', 'device_id', 'device_uses', 'device_limit', 'detail',
+                      'retry_reason', 'proxy_changed', 'proxy_change_count',
+                      'proxy_entries', 'retry_ip_ms', 'ip_wait_none')
             w.writerow(fields)
             for r in rows:
-                w.writerow([r.get(k, '') for k in fields])
+                w.writerow([
+                    json.dumps(r.get(k), ensure_ascii=False)
+                    if isinstance(r.get(k), (list, dict)) else r.get(k, '')
+                    for k in fields
+                ])
             out = buf.getvalue()
             ctype = 'text/csv; charset=utf-8'
             name = f'export-details-{safe_status}-{exported_at}.csv'
@@ -1988,9 +1994,9 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
             <th style="width:60px">设备</th><th style="width:82px">设备ID</th>
             <th style="width:72px">使用</th><th style="width:70px">HTTP</th>
             <th style="width:80px">业务码</th><th style="width:190px">Web复核</th>
-            <th>原因（Apple 原文）</th>
+            <th>原因（Apple 原文）</th><th style="width:260px">超时详情</th>
           </tr></thead>
-          <tbody id="rows"><tr><td colspan="12" style="text-align:center;color:#9ca3af;padding:24px">
+          <tbody id="rows"><tr><td colspan="13" style="text-align:center;color:#9ca3af;padding:24px">
             还没有结果</td></tr></tbody>
         </table>
       </div>
@@ -2654,7 +2660,35 @@ function rowHtml(r, idx){
     <td style="color:#6b7280;font-size:11.5px;max-width:340px;overflow:hidden;
         text-overflow:ellipsis" title="${esc(r.detail||'')}">
       ${esc(String(r.detail||'--').slice(0,64))}</td>
+    <td style="color:#6b7280;font-size:11.5px;max-width:260px;overflow:hidden;
+        text-overflow:ellipsis"${st === 'timeout'
+          ? ` title="${esc(timeoutDetailText(r, true))}"` : ''}>
+      ${esc(timeoutDetailText(r, false))}</td>
   </tr>`;
+}
+
+function timeoutDetailText(r, full){
+  if((r.status || '') !== 'timeout') return '';
+  const entries = Array.isArray(r.proxy_entries)
+    ? r.proxy_entries.map(String).filter(Boolean) : [];
+  const retries = Math.max(0, Number(r.attempts || 1) - 1);
+  const changeCount = Number(r.proxy_change_count || 0);
+  const acquired = Math.max(0, entries.length - 1);
+  const waits = Array.isArray(r.retry_ip_ms) ? r.retry_ip_ms : [];
+  const parts = [];
+  if(changeCount > 0 || r.proxy_changed){
+    parts.push(`已换入口 ${changeCount || 1} 次`);
+  }else if(acquired > 0){
+    parts.push(`已重取入口 ${acquired} 次，但入口未变`);
+  }else if(r.ip_wait_none){
+    parts.push('未取到新入口');
+  }else{
+    parts.push('未触发换入口');
+  }
+  parts.push(`重试 ${retries} 次`);
+  if(waits.length) parts.push(`取入口 ${waits.map(v=>Math.round(Number(v)||0)+'ms').join('/')}`);
+  if(full && entries.length) parts.push(`入口 ${entries.join(' → ')}`);
+  return parts.join(' · ');
 }
 
 async function loadHistory(want){
@@ -2679,7 +2713,7 @@ function renderRows(){
   const base = useHist ? (HIST ? HIST.rows.length : 0)
                        : ((LAST && LAST.done) || 0);
   $('rows').innerHTML = rec.length ? rec.map((r,i)=>rowHtml(r, base - i)).join('')
-    : `<tr><td colspan="12" style="text-align:center;color:#9ca3af;padding:24px">
+    : `<tr><td colspan="13" style="text-align:center;color:#9ca3af;padding:24px">
         ${useHist ? '这个分类下还没有记录' : '还没有结果'}</td></tr>`;
 }
 

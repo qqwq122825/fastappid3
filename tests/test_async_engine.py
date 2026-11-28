@@ -13,6 +13,7 @@ from gsafast.ippool import IpPool
 from simple_async import _attempt_slice
 from simple import (anisette_concurrency_limit, startup_worker_batches,
                     _new_state_lock, _proxy_host, _shared_device_info,
+                    proxy_entry_metrics,
                     finalize_retry_exhausted, retry_kind)
 
 
@@ -256,6 +257,12 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual('', _proxy_host(None))
         self.assertEqual('127.0.0.1:8080',
                          _proxy_host('http://user:secret@127.0.0.1:8080'))
+
+    def test_proxy_entry_metrics_distinguish_reissue_from_real_entry_change(self):
+        self.assertEqual((['gate:1000', 'gate:1000'], False, 0),
+                         proxy_entry_metrics(['gate:1000', 'gate:1000']))
+        self.assertEqual((['gate:1000', 'gate:1001'], True, 1),
+                         proxy_entry_metrics(['gate:1000', 'gate:1001']))
 
     def test_cpu_display_distinguishes_current_from_average(self):
         import web
@@ -553,7 +560,7 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('startup.public_header_waiting', web.PAGE)
         self.assertIn('startup.threads_created', web.PAGE)
         self.assertIn('startup.business_inflight', web.PAGE)
-        self.assertIn('id="versionTag">v2026.11.28.25', web.PAGE)
+        self.assertIn('id="versionTag">v2026.11.28.26', web.PAGE)
         self.assertIn('<div class="v v-green" id="sRate">0</div>', web.PAGE)
         self.assertNotIn('<div class="v sm v-green" id="sRate">0</div>', web.PAGE)
         self.assertNotIn('程序会按需要的数量自动替换 num', web.PAGE)

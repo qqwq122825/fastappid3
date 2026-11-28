@@ -287,7 +287,7 @@ class ConsoleRequestTests(unittest.TestCase):
             self.assertEqual(3, state['device_registered'])
             self.assertEqual(3, state['device_ready'])
             self.assertEqual(3, state['device_total'])
-            self.assertEqual('2026.11.28.25', state['version'])
+            self.assertEqual('2026.11.28.26', state['version'])
 
     def test_linux_process_group_cpu_sums_parent_and_children(self):
         parent = '1 (parent) S 0 77 0 0 0 0 0 0 0 0 200 100 0 0 0 0 0 0 0 0\n'
@@ -533,7 +533,8 @@ class ConsoleRenderingTests(unittest.TestCase):
         cls.fixture = '<b>fixture</b> & "quoted"'
         row = {key: cls.fixture for key in
                ('email', 'status', 'detail', 'cpu', 'thread_cpu_ms', 'slot', 'http', 'ec')}
-        row.update(ms=1250, attempts=2)
+        row.update(ms=1250, attempts=2, proxy_entries=['gate:1000', 'gate:1001'],
+                   proxy_changed=True, proxy_change_count=1, retry_ip_ms=[12.4])
         # Run the actual inline page script. Browser APIs are inert stubs, and
         # initial fetch calls never resolve; no network or worker is involved.
         script = r'''
@@ -567,7 +568,10 @@ new vm.Script(input.source, {filename: 'web-inline.js'}).runInContext(context);
     text: async () => JSON.stringify({ok:true,total:2})});
   await vm.runInContext('start()', context);
   const reset = vm.runInContext("({filter:$('filter').value,hist:HIST,last:LAST,rows:$('rows').innerHTML,hint:$('tblHint').textContent})", context);
-  console.log(JSON.stringify({row, legacy, error, reset}));
+  const timeoutChanged = vm.runInContext("timeoutDetailText({status:'timeout',attempts:3,proxy_entries:['gate:1000','gate:1001'],proxy_changed:true,proxy_change_count:1,retry_ip_ms:[12.4]},false)", context);
+  const timeoutSame = vm.runInContext("timeoutDetailText({status:'timeout',attempts:2,proxy_entries:['gate:1000','gate:1000'],proxy_changed:false,proxy_change_count:0,retry_ip_ms:[8]},false)", context);
+  const nonTimeout = vm.runInContext("timeoutDetailText({status:'locked'},false)", context);
+  console.log(JSON.stringify({row, legacy, error, reset, timeoutChanged, timeoutSame, nonTimeout}));
 })().catch(error => { console.error(error); process.exitCode = 1; });
 '''
         source = web.PAGE.split('<script>', 1)[1].split('</script>', 1)[0]
@@ -593,6 +597,14 @@ new vm.Script(input.source, {filename: 'web-inline.js'}).runInContext(context);
         for name in ('row', 'legacy'):
             with self.subTest(renderer=name):
                 self.assertIn('1.25', ParsedHTML(self.rendered[name]).text)
+
+    def test_timeout_detail_records_only_real_entry_changes(self):
+        self.assertIn('超时详情', web.PAGE)
+        self.assertIn('colspan="13"', web.PAGE)
+        self.assertIn('已换入口 1 次', self.rendered['timeoutChanged'])
+        self.assertIn('重试 2 次', self.rendered['timeoutChanged'])
+        self.assertIn('入口未变', self.rendered['timeoutSame'])
+        self.assertEqual('', self.rendered['nonTimeout'])
 
     def test_error_text_is_not_interpreted_as_markup(self):
         parsed = ParsedHTML(self.rendered['error'])
