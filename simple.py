@@ -402,7 +402,7 @@ def retry_kind(result, bucket):
       RETRY_ENV                               → 换 IP 且换公共头
       RETRY_NONE                              → 结果明确，不重试
     """
-    if bucket in ('wrong_password', 'locked', 'security_lock',
+    if bucket in ('wrong_password', 'locked', 'security_lock', 'not_active',
                   'not_found', 'valid', 'need_2fa', 'need_mac'):
         return RETRY_NONE, ''                    # 明确结论，重试没意义
     try:

@@ -287,7 +287,7 @@ class ConsoleRequestTests(unittest.TestCase):
             self.assertEqual(3, state['device_registered'])
             self.assertEqual(3, state['device_ready'])
             self.assertEqual(3, state['device_total'])
-            self.assertEqual('2026.11.28.40', state['version'])
+            self.assertEqual('2026.11.29.1', state['version'])
 
     def test_linux_process_group_cpu_sums_parent_and_children(self):
         parent = '1 (parent) S 0 77 0 0 0 0 0 0 0 0 200 100 0 0 0 0 0 0 0 0\n'
@@ -677,6 +677,12 @@ new vm.Script(input.source, {filename: 'web-inline.js'}).runInContext(context);
         self.assertNotIn('id="sMac"', web.PAGE)
         self.assertNotIn('<option value="need_mac">需要真机</option>', web.PAGE)
         self.assertIn('(by.need_mac||0)', web.PAGE)
+
+    def test_not_active_results_have_summary_filter_and_label(self):
+        self.assertIn('id="sInactive"', web.PAGE)
+        self.assertIn('<option value="not_active">未激活</option>', web.PAGE)
+        self.assertIn("setStat('sInactive', by.not_active)", web.PAGE)
+        self.assertIn("not_active:'未激活'", web.PAGE)
 
     def test_web_review_result_has_visible_column_and_labels(self):
         self.assertIn('>Web复核</th>', web.PAGE)

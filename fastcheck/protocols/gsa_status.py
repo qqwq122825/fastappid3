@@ -540,7 +540,9 @@ def classify(ec, em: str) -> tuple[str, str]:
                               "incorrect username or password",
                               "username or password is incorrect")):
         return "wrong_password", em
-    if "not active" in em_l or "request access" in em_l:
+    if "not active" in em_l:
+        return "not_active", em or f"ec={ec}"
+    if "request access" in em_l:
         return "security_lock", em or f"ec={ec}"
     if "locked for security reasons" in em_l:
         return "security_lock", em or f"ec={ec}"

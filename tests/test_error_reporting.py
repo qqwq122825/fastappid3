@@ -124,6 +124,23 @@ def test_exact_apple_reason_does_not_invoke_fuzzy_matcher():
         assert result_bucket(row) == "wrong_password"
 
 
+def test_not_active_apple_reason_has_its_own_terminal_bucket():
+    status_module._cached_apple_reason_bucket.cache_clear()
+    row = {
+        "status": "error",
+        "http": 200,
+        "apple_message": "This Apple Account is not active.",
+    }
+    with patch.object(status_module, "SequenceMatcher",
+                      side_effect=AssertionError("exact reason used fuzzy matcher")):
+        assert result_bucket(row) == "not_active"
+    assert gsa_status.classify(-20970, row["apple_message"])[0] == "not_active"
+    assert retry_kind(row, "not_active")[0] is None
+    counts = status_module.snapshot(1, {"account": row})
+    assert counts["not_active"] == 1
+    assert counts["locked"] == 0
+
+
 def test_unknown_apple_reason_is_cached_after_first_classification():
     status_module._cached_apple_reason_bucket.cache_clear()
     row = {
@@ -565,6 +582,9 @@ def test_unregistered_worker_slot_is_not_leasable(tmp_path=None):
 class ErrorReportingTest(unittest.TestCase):
     def test_exact_reason_uses_fast_path(self):
         test_exact_apple_reason_does_not_invoke_fuzzy_matcher()
+
+    def test_not_active_reason_uses_own_bucket(self):
+        test_not_active_apple_reason_has_its_own_terminal_bucket()
 
     def test_unknown_reason_cache(self):
         test_unknown_apple_reason_is_cached_after_first_classification()

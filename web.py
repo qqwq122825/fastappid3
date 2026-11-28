@@ -35,7 +35,7 @@ TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 TASK_HISTORY_DIR = os.path.join(HERE, 'data', 'task-history')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
-APP_VERSION = '2026.11.28.40'
+APP_VERSION = '2026.11.29.1'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -2525,6 +2525,7 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
           <div class="stat"><div class="k">密码正确</div><div class="v v-green" id="sValid">0</div></div>
           <div class="stat"><div class="k">密码错误</div><div class="v v-red" id="sWrong">0</div></div>
           <div class="stat"><div class="k">锁定</div><div class="v v-amber" id="sLock">0</div></div>
+          <div class="stat"><div class="k">未激活</div><div class="v v-amber" id="sInactive">0</div></div>
           <div class="stat"><div class="k">双重验证</div><div class="v" id="s2fa">0</div></div>
           <div class="stat"><div class="k">不存在</div><div class="v" id="sNF">0</div></div>
           <div class="stat"><div class="k">超时</div><div class="v v-gray" id="sTO">0</div></div>
@@ -2575,6 +2576,7 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
             <option value="valid">密码正确</option>
             <option value="wrong_password">密码错误</option>
             <option value="locked">锁定</option>
+            <option value="not_active">未激活</option>
             <option value="need_2fa">双重验证</option>
             <option value="not_found">不存在</option>
             <option value="timeout">超时</option>
@@ -2709,12 +2711,13 @@ const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({
 const cls = s => !s ? 'b-gray'
   : ['valid'].includes(s) ? 'b-green'
   : ['wrong_password','not_found'].includes(s) ? 'b-red'
-  : ['locked','security_lock','need_2fa','need_mac'].includes(s) ? 'b-amber'
+  : ['locked','security_lock','not_active','need_2fa','need_mac'].includes(s) ? 'b-amber'
   : ['timeout'].includes(s) ? 'b-gray' : 'b-blue';
-const statusLabel = s => ({valid:'密码正确'})[s] || s;
+const statusLabel = s => ({valid:'密码正确',not_active:'未激活'})[s] || s;
 const webStatusLabel = s => ({
   valid:'密码正确',
   security_lock:'锁定', wrong_password:'密码错误', not_found:'不存在',
+  not_active:'未激活',
   need_2fa:'双重验证', needs_setup:'安全设置',
   web_unavailable:'复核不可用', web_timeout:'复核超时', web_error:'复核异常'
 })[s] || s;
@@ -3372,6 +3375,7 @@ async function tick(){
   $('sRate').textContent = (d.rate||0).toFixed(1);
   setStat('sValid', by.valid);
   setStat('sWrong', by.wrong_password); setStat('sLock', by.locked);
+  setStat('sInactive', by.not_active);
   setStat('s2fa', by.need_2fa); setStat('sNF', by.not_found);
   setStat('sTO', by.timeout);
   setStat('sOther', (by.undetermined||0)+(by.error||0)+(by.need_mac||0));
