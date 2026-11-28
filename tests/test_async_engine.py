@@ -397,6 +397,31 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(1, row['web_proxy_rotations'])
             self.assertEqual(1234.5, row['web_ms'])
 
+    def test_filtered_timeout_results_preserve_proxy_retry_trace(self):
+        from pathlib import Path
+        from unittest.mock import patch
+        import web
+        with tempfile.TemporaryDirectory() as directory:
+            result_file = Path(directory) / 'run.jsonl'
+            result_file.write_text(json.dumps({
+                'email': 'timeout@example.invalid', 'status': 'timeout',
+                'http': 503, 'attempts': 5, 'retry_reason': 'http=503',
+                'proxy_changed': True, 'proxy_change_count': 4,
+                'proxy_entries': ['gate:1000', 'gate:1001', 'gate:1002'],
+                'retry_ip_ms': [8.1, 9.2], 'ip_wait_none': False}) + '\n',
+                encoding='utf-8')
+            state = dict(web.STATE, run_out=str(result_file), started_at=1)
+            with patch.object(web, 'STATE', state):
+                result = object.__new__(web.Handler)._results('timeout', 100)
+            row = result['rows'][0]
+            self.assertEqual('http=503', row['retry_reason'])
+            self.assertTrue(row['proxy_changed'])
+            self.assertEqual(4, row['proxy_change_count'])
+            self.assertEqual(['gate:1000', 'gate:1001', 'gate:1002'],
+                             row['proxy_entries'])
+            self.assertEqual([8.1, 9.2], row['retry_ip_ms'])
+            self.assertFalse(row['ip_wait_none'])
+
     def test_result_search_scans_current_run_by_account(self):
         from pathlib import Path
         from unittest.mock import patch
@@ -588,7 +613,7 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('startup.public_header_waiting', web.PAGE)
         self.assertIn('startup.threads_created', web.PAGE)
         self.assertIn('startup.business_inflight', web.PAGE)
-        self.assertIn('id="versionTag">v2026.11.28.27', web.PAGE)
+        self.assertIn('id="versionTag">v2026.11.28.28', web.PAGE)
         self.assertIn('<div class="v v-green" id="sRate">0</div>', web.PAGE)
         self.assertNotIn('<div class="v sm v-green" id="sRate">0</div>', web.PAGE)
         self.assertNotIn('程序会按需要的数量自动替换 num', web.PAGE)

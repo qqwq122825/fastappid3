@@ -33,7 +33,7 @@ ACCOUNT_STATE = os.path.join(HERE, 'data', 'current-accounts.json')
 TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
-APP_VERSION = '2026.11.28.27'
+APP_VERSION = '2026.11.28.28'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -1373,7 +1373,13 @@ class Handler(BaseHTTPRequestHandler):
                                     'web_attempts': r.get('web_attempts'),
                                     'web_proxy_rotations': r.get('web_proxy_rotations'),
                                     'web_rotation_exhausted': r.get('web_rotation_exhausted'),
-                                    'web_ms': r.get('web_ms')})
+                                    'web_ms': r.get('web_ms'),
+                                    'retry_reason': r.get('retry_reason'),
+                                    'proxy_changed': r.get('proxy_changed'),
+                                    'proxy_change_count': r.get('proxy_change_count'),
+                                    'proxy_entries': r.get('proxy_entries'),
+                                    'retry_ip_ms': r.get('retry_ip_ms'),
+                                    'ip_wait_none': r.get('ip_wait_none')})
         rows = list(reversed(out))          # 新的在前
         scoped = bool(own and os.path.exists(own)) or bool(cutoff)
         return {'total': total if scoped else 0,
