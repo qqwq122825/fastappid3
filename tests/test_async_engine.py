@@ -840,7 +840,7 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('startup.public_header_waiting', web.PAGE)
         self.assertIn('startup.threads_created', web.PAGE)
         self.assertIn('startup.business_inflight', web.PAGE)
-        self.assertIn('id="versionTag">v2026.11.28.39', web.PAGE)
+        self.assertIn('id="versionTag">v2026.11.28.40', web.PAGE)
         self.assertIn('<div class="v v-green" id="sRate">0</div>', web.PAGE)
         self.assertNotIn('<div class="v sm v-green" id="sRate">0</div>', web.PAGE)
         self.assertNotIn('程序会按需要的数量自动替换 num', web.PAGE)
@@ -857,8 +857,11 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('restoreTaskSettings(); loadAccounts()', web.PAGE)
         self.assertIn('otp_reuse:+$(\'otpreuse\').value', web.PAGE)
         self.assertIn('id="totalConcurrency" value="800"', web.PAGE)
+        self.assertIn('id="coreCount" value="8"', web.PAGE)
         self.assertIn('type="hidden" id="processes" value="8"', web.PAGE)
         self.assertIn("Math.ceil(requested/p)", web.PAGE)
+        self.assertIn("$('processes').value=String(p)", web.PAGE)
+        self.assertIn("$('coreCount').addEventListener('input', syncConcurrency)", web.PAGE)
         self.assertNotIn('id="modeTag"', web.PAGE)
         self.assertNotIn('id="limit"', web.PAGE)
         self.assertIn('<title>ID 校验</title>', web.PAGE)
@@ -912,6 +915,39 @@ class AsyncEngineTests(unittest.IsolatedAsyncioTestCase):
                          '--register-timeout', '--web-timeout'):
                 self.assertEqual('20.0', command[command.index(flag) + 1])
             self.assertNotIn('--item-timeout', command)
+
+    def test_configured_sixteen_cores_are_not_capped_to_eight(self):
+        from pathlib import Path
+        from unittest.mock import Mock, patch
+        import web
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'data').mkdir()
+            accounts = root / 'accounts.txt'
+            accounts.write_text(''.join(
+                f'user{index}@example.invalid----password\n' for index in range(1000)),
+                encoding='utf-8')
+            live = root / 'data' / 'live.json'
+            proc = Mock(pid=os.getpid())
+            state = dict(web.STATE, log=str(root / 'data' / 'run.log'), proc=None,
+                         take_pending=False)
+            with patch.object(web, 'HERE', directory), \
+                 patch.object(web, 'LIVE', str(live)), \
+                 patch.object(web, 'STATE', state), \
+                 patch.object(web, 'proxy_api', return_value='http://proxy/{num}'), \
+                 patch.object(web, '_count_device_slots', return_value=0), \
+                 patch.object(web, '_write_task_record'), \
+                 patch.object(web, '_write_task_history_record'), \
+                 patch.object(web, 'is_running', return_value=False), \
+                 patch.object(web.subprocess, 'Popen', return_value=proc) as popen:
+                result = web.start_job(str(accounts), 63, 0, processes=16)
+                first = json.loads(live.read_text(encoding='utf-8'))
+            self.assertTrue(result['ok'])
+            self.assertEqual(16, result['processes'])
+            self.assertEqual(1000, result['total_threads'])
+            self.assertEqual(16, first['startup']['process_total'])
+            command = popen.call_args.args[0]
+            self.assertEqual('16', command[command.index('--processes') + 1])
 
     def test_small_account_batches_shrink_processes_and_child_threads(self):
         from argparse import Namespace

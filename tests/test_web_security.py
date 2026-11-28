@@ -287,7 +287,7 @@ class ConsoleRequestTests(unittest.TestCase):
             self.assertEqual(3, state['device_registered'])
             self.assertEqual(3, state['device_ready'])
             self.assertEqual(3, state['device_total'])
-            self.assertEqual('2026.11.28.39', state['version'])
+            self.assertEqual('2026.11.28.40', state['version'])
 
     def test_linux_process_group_cpu_sums_parent_and_children(self):
         parent = '1 (parent) S 0 77 0 0 0 0 0 0 0 0 200 100 0 0 0 0 0 0 0 0\n'
@@ -652,10 +652,14 @@ new vm.Script(input.source, {filename: 'web-inline.js'}).runInContext(context);
     def test_total_concurrency_is_split_across_processes(self):
         self.assertIn('type="hidden" id="processes" value="8"', web.PAGE)
         self.assertIn('id="totalConcurrency" value="800"', web.PAGE)
+        self.assertIn('id="coreCount" value="8"', web.PAGE)
         self.assertIn('id="threads" value="100"', web.PAGE)
         self.assertIn("const t=Math.max(1, Math.ceil(requested/p));", web.PAGE)
+        self.assertIn("$('processes').value=String(p);", web.PAGE)
         self.assertIn("$('threads').value=String(t);", web.PAGE)
         self.assertIn("$('totalConcurrency').addEventListener('input', syncConcurrency)", web.PAGE)
+        self.assertIn("$('coreCount').addEventListener('input', syncConcurrency)", web.PAGE)
+        self.assertIn('id="concurrencySplit"', web.PAGE)
         self.assertNotIn('id="rechint"', web.PAGE)
 
     def test_result_rows_show_device_identity_and_usage(self):

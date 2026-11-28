@@ -35,7 +35,7 @@ TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 TASK_HISTORY_DIR = os.path.join(HERE, 'data', 'task-history')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
-APP_VERSION = '2026.11.28.39'
+APP_VERSION = '2026.11.28.40'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -1429,7 +1429,7 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
                         - int(account_info.get('format_error') or 0))
     total = min(limit, account_total) if limit else account_total
     os.makedirs(os.path.dirname(LIVE), exist_ok=True)
-    processes = max(1, min(int(processes or 1), 8))
+    processes = max(1, min(int(processes or 1), 64))
     # 账号少于配置并发时，不启动空转进程，也不让代理池、设备池按
     # 800 之类的名义并发预热。每个进程最多承载 threads 个账号；
     # 最后一批不足时由 run_mp 再把该子进程的线程数缩到实际条数。
@@ -1543,7 +1543,7 @@ def start_job(accounts, threads, limit, processes=1, verify_web=False,
         # 工作进程已经启动；摘要写入失败不能把成功的启动伪装成失败。
         pass
     _TASK_HISTORY_CACHE.update(task_id='', signature=None, written_at=0.0)
-    total_threads = threads * processes
+    total_threads = min(total, threads * processes)
     return {'ok': True, 'pid': proc.pid, 'threads': threads, 'processes': processes,
             'limit': limit, 'total': total, 'total_threads': total_threads}
 
@@ -2449,10 +2449,16 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
       </div>
 
       <div class="field">
-        <label>线程数（总并发）</label>
-        <input type="number" id="totalConcurrency" value="800" min="1" max="16000" placeholder="例如 800">
+        <label>并发分配</label>
+        <div class="row2">
+          <div><input type="number" id="totalConcurrency" value="800" min="1" max="16000" placeholder="例如 1000">
+            <div class="hint">线程数（总并发）</div></div>
+          <div><input type="number" id="coreCount" value="8" min="1" max="64" placeholder="例如 8">
+            <div class="hint">核心数（进程数）</div></div>
+        </div>
         <input type="hidden" id="processes" value="8">
         <input type="hidden" id="threads" value="100">
+        <div class="hint" id="concurrencySplit">800 ÷ 8 = 每进程 100 线程</div>
       </div>
 
       <div class="field">
@@ -2995,7 +3001,7 @@ async function post(url, body){
 const DEVICE_MAX_USES_KEY = 'gsa.device_max_uses';
 const TASK_SETTINGS_KEY = 'gsa.task_settings.v1';
 const TASK_NUMBER_FIELDS = {
-  totalConcurrency:[1,16000], perip:[1,50], ttl:[10,600],
+  totalConcurrency:[1,16000], coreCount:[1,64], perip:[1,50], ttl:[10,600],
   otpreuse:[0,50], retry:[0,5], timeout:[3,120], deviceMaxUses:[0,100000]
 };
 const TASK_CHECK_FIELDS = ['vweb','asproxy'];
@@ -3107,15 +3113,20 @@ $('stop').onclick = stop;
 $('refresh').onclick = () => { shownAccounts=null; tick(); };
 $('clearDevices').onclick = clearDevices;
 
-/* ---- 总并发按固定 8 进程均分 ---- */
+/* ---- 总并发按用户填写的核心数（进程数）均分 ---- */
 function syncConcurrency(){
-  const p=Math.max(1, Math.min(8, Number.parseInt($('processes').value,10)||1));
+  const p=Math.max(1, Math.min(64, Number.parseInt($('coreCount').value,10)||1));
   const requested=Math.max(1, Math.min(16000,
     Number.parseInt($('totalConcurrency').value,10)||1));
   const t=Math.max(1, Math.ceil(requested/p));
+  $('processes').value=String(p);
   $('threads').value=String(t);
+  const exact = requested % p === 0 ? '=' : '≈';
+  $('concurrencySplit').textContent = `${requested} ÷ ${p} ${exact} 每进程 ${t} 线程` +
+    (exact === '≈' ? '（向上取整，最后进程自动收尾）' : '');
 }
 $('totalConcurrency').addEventListener('input', syncConcurrency);
+$('coreCount').addEventListener('input', syncConcurrency);
 syncConcurrency();
 for(const id of Object.keys(TASK_NUMBER_FIELDS)){
   $(id).addEventListener('change', saveTaskSettings);
