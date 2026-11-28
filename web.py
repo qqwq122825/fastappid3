@@ -33,7 +33,7 @@ ACCOUNT_STATE = os.path.join(HERE, 'data', 'current-accounts.json')
 TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
-APP_VERSION = '2026.11.28.22'
+APP_VERSION = '2026.11.28.23'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -377,6 +377,58 @@ def select_account_file(file_id):
     info = dict(analyse_accounts(path))
     info.update(selected=True, file_id=_account_file_id(path))
     return info
+
+
+def delete_account_file(file_id):
+    """Delete one cached upload and safely move selection to a fallback."""
+    if is_running():
+        return {'error': '任务运行中，请停止后再删除历史文件'}
+    path = _resolve_account_file_id(file_id)
+    if not path:
+        return {'error': '历史账号文件不存在或已被移除'}
+    uploads = os.path.realpath(UPLOAD_DIR)
+    try:
+        is_upload = os.path.commonpath((path, uploads)) == uploads
+    except ValueError:
+        is_upload = False
+    if not is_upload or path == os.path.realpath(DEFAULT_ACCOUNTS):
+        return {'error': '系统默认账号文件不能删除'}
+
+    deleted_name = re.sub(r'^\d{9,}-', '', os.path.basename(path))
+    try:
+        os.remove(path)
+    except OSError as exc:
+        return {'error': f'删除失败: {exc}'}
+
+    selected = (STATE.get('pending_accounts') if STATE.get('take_pending')
+                else STATE.get('accounts'))
+    if selected and os.path.realpath(selected) == path:
+        try:
+            remaining = [os.path.realpath(os.path.join(UPLOAD_DIR, name))
+                         for name in os.listdir(UPLOAD_DIR)]
+            remaining = [item for item in remaining
+                         if _persistent_account_path(item) and os.path.isfile(item)]
+        except OSError:
+            remaining = []
+        fallback = (max(remaining, key=os.path.getmtime) if remaining
+                    else os.path.realpath(DEFAULT_ACCOUNTS))
+        STATE['accounts'] = fallback
+        STATE['pending_accounts'] = None
+        STATE['take_pending'] = False
+        if os.path.isfile(fallback):
+            _remember_accounts(fallback)
+        else:
+            try:
+                os.remove(ACCOUNT_STATE)
+            except FileNotFoundError:
+                pass
+
+    current = (STATE.get('pending_accounts') if STATE.get('take_pending')
+               else STATE.get('accounts')) or DEFAULT_ACCOUNTS
+    info = (dict(analyse_accounts(current)) if os.path.isfile(current)
+            else {'name': '', 'total': 0})
+    return {'ok': True, 'deleted': deleted_name,
+            'selected': _account_file_id(current), 'accounts': info}
 
 
 def _cookie_token():
@@ -1515,6 +1567,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({'error': '请先输入密码', 'need_login': True})
         if self.path.startswith('/api/upload'):
             return self._json(self._upload(payload))
+        if self.path.startswith('/api/delete-account-file'):
+            with _LOCK:
+                return self._json(delete_account_file(payload.get('id')))
         if self.path.startswith('/api/select-account-file'):
             return self._json(select_account_file(payload.get('id')))
         if self.path.startswith('/api/start'):
@@ -1634,6 +1689,10 @@ width:100%;border:1px solid var(--line);border-radius:8px;padding:8px 10px;
 font-size:13px;background:#fff;color:var(--fg);font-variant-numeric:tabular-nums}
 input:focus,select:focus{outline:2px solid #bfdbfe;border-color:var(--blue)}
 .row2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.account-history{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;
+align-items:center;margin-bottom:8px}
+.account-history select{min-width:0}
+.account-history .btn{padding:8px 10px}
 .drop{border:1.5px dashed var(--line);border-radius:8px;padding:16px;text-align:center;
 color:var(--dim);font-size:12px;cursor:pointer;transition:.15s}
 .drop:hover,.drop.on{border-color:var(--blue);background:#f8fbff;color:var(--blue)}
@@ -1740,9 +1799,13 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
 
       <div class="field">
         <label>账号文件 <b id="accName">未选择</b></label>
-        <select id="accountHistory" style="margin-bottom:8px">
-          <option value="">选择服务器历史文件</option>
-        </select>
+        <div class="account-history">
+          <select id="accountHistory">
+            <option value="">选择服务器历史文件</option>
+          </select>
+          <button class="btn danger-outline" id="deleteAccountFile" disabled
+            title="删除当前选中的服务器缓存文件">删除所选</button>
+        </div>
         <div class="drop" id="drop">点击或拖入 .txt（账号----密码）</div>
         <input type="file" id="file" accept=".txt,.csv" style="display:none">
         <div class="hint" id="accInfo"></div>
@@ -2063,6 +2126,12 @@ function renderAccounts(a){
     + (a.format_error ? ` · 格式异常 ${a.format_error}` : '');
 }
 
+function syncAccountDeleteButton(){
+  const select = $('accountHistory');
+  const id = select.value;
+  $('deleteAccountFile').disabled = select.disabled || !id || id === '__default__';
+}
+
 async function loadAccountHistory(){
   try{
     const data = await (await fetch('/api/account-files?t='+Date.now())).json();
@@ -2076,11 +2145,14 @@ async function loadAccountHistory(){
     select.innerHTML = options.join('');
     select.value = data.selected || '';
     select.disabled = Boolean(data.running);
+    select.dataset.running = data.running ? '1' : '0';
+    syncAccountDeleteButton();
   }catch(e){}
 }
 
 $('accountHistory').addEventListener('change', async e => {
   const id = e.target.value;
+  syncAccountDeleteButton();
   if(!id) return;
   const result = await post('/api/select-account-file', {id});
   if(result.error){
@@ -2094,6 +2166,28 @@ $('accountHistory').addEventListener('change', async e => {
   $('accInfo').style.color = 'var(--green)';
   $('hint').textContent = `已选择服务器文件：${result.name}`;
   $('hint').style.color = 'var(--green)';
+});
+
+$('deleteAccountFile').addEventListener('click', async () => {
+  const select = $('accountHistory');
+  const id = select.value;
+  const label = select.options[select.selectedIndex]?.textContent || '所选文件';
+  if(!id || id === '__default__') return;
+  if(!confirm(`确定删除服务器历史文件？\n\n${label}\n\n已产生的校验结果不会被删除。`)) return;
+  $('deleteAccountFile').disabled = true;
+  const result = await post('/api/delete-account-file', {id});
+  if(result.error){
+    $('accInfo').textContent = result.error;
+    $('accInfo').style.color = 'var(--red)';
+    await loadAccountHistory();
+    return;
+  }
+  if(result.accounts) renderAccounts(result.accounts);
+  shownAccounts = result.accounts?.path || shownAccounts;
+  $('accInfo').style.color = 'var(--green)';
+  $('hint').textContent = `已删除历史文件：${result.deleted}`;
+  $('hint').style.color = 'var(--green)';
+  await loadAccountHistory();
 });
 
 /* ---- 启停 ---- */
@@ -2399,6 +2493,8 @@ async function tick(){
     $('start').disabled = d.running;
     $('stop').disabled = !d.running;
     $('accountHistory').disabled = d.running;
+    $('accountHistory').dataset.running = d.running ? '1' : '0';
+    syncAccountDeleteButton();
   }
   $('modeHint').textContent = startupActive
     ? (startup.message || '正在初始化')

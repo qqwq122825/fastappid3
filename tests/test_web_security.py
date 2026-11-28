@@ -287,7 +287,7 @@ class ConsoleRequestTests(unittest.TestCase):
             self.assertEqual(3, state['device_registered'])
             self.assertEqual(3, state['device_ready'])
             self.assertEqual(3, state['device_total'])
-            self.assertEqual('2026.11.28.22', state['version'])
+            self.assertEqual('2026.11.28.23', state['version'])
 
     def test_linux_process_group_cpu_sums_parent_and_children(self):
         parent = '1 (parent) S 0 77 0 0 0 0 0 0 0 0 200 100 0 0 0 0 0 0 0 0\n'
@@ -369,6 +369,58 @@ class ConsoleRequestTests(unittest.TestCase):
                 self.assertIsNone(web._resolve_account_file_id('../fixture.txt'))
                 with patch.object(web, 'is_running', return_value=True):
                     self.assertIn('任务运行中', web.select_account_file('fixture.txt')['error'])
+
+    def test_cached_account_delete_removes_selected_and_picks_newest_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            uploads = os.path.join(directory, 'uploads')
+            os.makedirs(uploads)
+            old = os.path.join(uploads, '1790000000-old.txt')
+            selected = os.path.join(uploads, '1790000100-selected.txt')
+            for path, account in ((old, 'old@example.com'),
+                                  (selected, 'selected@example.com')):
+                with open(path, 'w', encoding='utf-8') as handle:
+                    handle.write(f'{account}----password\n')
+            os.utime(old, (1790000000, 1790000000))
+            os.utime(selected, (1790000100, 1790000100))
+            state_file = os.path.join(directory, 'current-accounts.json')
+            state = dict(web.STATE)
+            state.update(accounts=selected, pending_accounts=None,
+                         take_pending=False)
+            with patch.object(web, 'UPLOAD_DIR', uploads), \
+                 patch.object(web, 'DEFAULT_ACCOUNTS',
+                              os.path.join(directory, 'accounts.txt')), \
+                 patch.object(web, 'ACCOUNT_STATE', state_file), \
+                 patch.object(web, 'STATE', state), \
+                 patch.object(web, 'is_running', return_value=False):
+                result = web.delete_account_file(os.path.basename(selected))
+            self.assertTrue(result['ok'])
+            self.assertFalse(os.path.exists(selected))
+            self.assertEqual(os.path.realpath(old), state['accounts'])
+            self.assertEqual('1790000000-old.txt', result['selected'])
+            with open(state_file, encoding='utf-8') as handle:
+                self.assertEqual(os.path.realpath(old), json.load(handle)['accounts'])
+
+    def test_cached_account_delete_rejects_default_traversal_and_running(self):
+        with tempfile.TemporaryDirectory() as directory:
+            uploads = os.path.join(directory, 'uploads')
+            os.makedirs(uploads)
+            default = os.path.join(directory, 'accounts.txt')
+            cached = os.path.join(uploads, 'fixture.txt')
+            for path in (default, cached):
+                with open(path, 'w', encoding='utf-8') as handle:
+                    handle.write('fixture@example.com----password\n')
+            with patch.object(web, 'UPLOAD_DIR', uploads), \
+                 patch.object(web, 'DEFAULT_ACCOUNTS', default):
+                with patch.object(web, 'is_running', return_value=False):
+                    self.assertIn('不能删除',
+                                  web.delete_account_file('__default__')['error'])
+                    self.assertIn('不存在',
+                                  web.delete_account_file('../fixture.txt')['error'])
+                with patch.object(web, 'is_running', return_value=True):
+                    self.assertIn('任务运行中',
+                                  web.delete_account_file('fixture.txt')['error'])
+            self.assertTrue(os.path.exists(default))
+            self.assertTrue(os.path.exists(cached))
 
     def test_idle_upload_is_cached_and_selected_immediately(self):
         with tempfile.TemporaryDirectory() as directory:
