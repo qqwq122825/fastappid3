@@ -33,7 +33,7 @@ ACCOUNT_STATE = os.path.join(HERE, 'data', 'current-accounts.json')
 TASK_STATE = os.path.join(HERE, 'data', 'task-process.json')
 DEVICE_ROOT = os.path.join(HERE, 'data', 'devices-simple')
 DEVICE_ORIGIN = 'https://new.ani.sidestore.io'
-APP_VERSION = '2026.11.28.19'
+APP_VERSION = '2026.11.28.20'
 
 
 NUM_RE = re.compile(r'([?&]num=)\d+')
@@ -1591,6 +1591,15 @@ font-feature-settings:"tnum" 1,"lnum" 1}
 .prog .bar>i{display:block;height:100%;width:0;background:var(--blue);transition:width .4s}
 .prog .meta{display:flex;justify-content:space-between;font-size:12px;color:var(--dim);
 margin-top:7px;font-family:inherit;font-variant-numeric:tabular-nums}
+.pool-meta{display:grid;grid-template-columns:minmax(170px,.7fr) minmax(0,2fr)
+minmax(230px,1fr);column-gap:24px;row-gap:8px;align-items:start;
+padding:12px 0 6px;border-top:1px solid var(--line);font-size:12px;
+line-height:1.75;color:var(--dim)}
+.pool-meta>span{min-width:0;overflow-wrap:anywhere}
+@media(max-width:1200px){.pool-meta{grid-template-columns:1fr 1fr}
+.pool-meta #mIpPool{grid-column:1/-1;grid-row:2}}
+@media(max-width:760px){.pool-meta{grid-template-columns:1fr}
+.pool-meta #mIpPool{grid-column:auto;grid-row:auto}}
 .startup{display:none;margin-bottom:12px;padding:10px 12px;border:1px solid #bfdbfe;
 background:#eff6ff;border-radius:8px;color:#1e3a8a;font-size:12px;line-height:1.7}
 .startup.show{display:block}.startup b{font-size:13px}.startup .items{display:flex;
@@ -1744,8 +1753,7 @@ align-items:center;justify-content:center;backdrop-filter:blur(2px)}
           <span id="mRetry">重试 --</span>
           <span id="mEta">--</span>
         </div>
-        <div class="meta" style="display:flex;justify-content:space-between;
-             padding:10px 0 2px;border-top:1px solid var(--line);font-size:12px;color:var(--dim)">
+        <div class="pool-meta">
           <span id="mDevices">设备池 已注册 -- / 使用中 -- / 注册中 --</span>
           <span id="mIpPool">IP池 库存 -- / 低水位 -- / 目标 --</span>
           <span id="mRegErr">注册换代理 --</span>
